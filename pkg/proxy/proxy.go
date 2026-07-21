@@ -21,6 +21,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
@@ -32,6 +33,10 @@ import (
 const (
 	UserHeaderClientIPKey = "Remote-Client-IP"
 	timestampLayout       = "2006-01-02T15:04:05-0700"
+
+	// ADRefreshPath is the path an authenticated user can POST to in order to
+	// trigger a rebuild of the Active Directory user to group mapping.
+	ADRefreshPath = "/kube-oidc-proxy/ad/refresh"
 )
 
 var (
@@ -53,6 +58,27 @@ type Config struct {
 
 type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
 
+// groupAugmenter is the source of the groups a request is impersonated with
+// when the groups of the token are not to be trusted.
+type groupAugmenter interface {
+	// Groups returns the groups held by the given user, and whether the user
+	// is known to the backend at all.
+	Groups(username string) ([]string, bool)
+
+	// FallbackToTokenGroups reports whether an unknown user keeps the groups
+	// of their token.
+	FallbackToTokenGroups() bool
+
+	// Run builds the initial mapping and keeps it refreshed until stopCh is
+	// closed.
+	Run(stopCh <-chan struct{}) error
+
+	// Refresh rebuilds the mapping on demand.
+	Refresh() error
+
+	Stats() *ad.Stats
+}
+
 type Proxy struct {
 	oidcRequestAuther     *bearertoken.Authenticator
 	tokenAuther           authenticator.Token
@@ -60,6 +86,9 @@ type Proxy struct {
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview
 	secureServingInfo     *server.SecureServingInfo
 	auditor               *audit.Audit
+
+	// adDirectory is nil unless Active Directory group augmentation is enabled.
+	adDirectory groupAugmenter
 
 	restConfig            *rest.Config
 	clientTransport       http.RoundTripper
@@ -85,6 +114,7 @@ func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
 func New(restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
+	adOptions *options.ADOptions,
 	tokenReviewer *tokenreview.TokenReview,
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
 	ssinfo *server.SecureServingInfo,
@@ -131,7 +161,7 @@ func New(restConfig *rest.Config,
 		return nil, err
 	}
 
-	return &Proxy{
+	p := &Proxy{
 		restConfig:            restConfig,
 		hooks:                 hooks.New(),
 		tokenReviewer:         tokenReviewer,
@@ -141,7 +171,25 @@ func New(restConfig *rest.Config,
 		oidcRequestAuther:     bearertoken.New(tokenAuther),
 		tokenAuther:           tokenAuther,
 		auditor:               auditor,
-	}, nil
+	}
+
+	// Set up the Active Directory backend that the groups of a request are
+	// augmented from, if enabled.
+	if adOptions != nil && adOptions.Enabled {
+		adConfig, err := adOptions.Config(oidcOptions.UsernamePrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		adDirectory, err := ad.New(adConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		p.adDirectory = adDirectory
+	}
+
+	return p, nil
 }
 
 func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
@@ -199,6 +247,14 @@ func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan stru
 	// Run auditor
 	if err := p.auditor.Run(stopCh); err != nil {
 		return nil, nil, err
+	}
+
+	// Build the initial user -> group mapping before serving any requests,
+	// then keep it refreshed in the background.
+	if p.adDirectory != nil {
+		if err := p.adDirectory.Run(stopCh); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// securely serve using serving config

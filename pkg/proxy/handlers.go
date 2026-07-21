@@ -22,6 +22,7 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	// Set up proxy handlers
 	handler = p.auditor.WithRequest(handler)
 	handler = p.withImpersonateRequest(handler)
+	handler = p.withADRefresh(handler)
 	handler = p.withAuthenticateRequest(handler)
 
 	// Add the auditor backend as a shutdown hook
@@ -85,6 +86,64 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 	})
 }
 
+// withADRefresh serves the endpoint that triggers a rebuild of the Active
+// Directory user to group mapping. It sits after authentication in the chain,
+// so only authenticated users can trigger a refresh. The path is not a valid
+// API server path, so it can never shadow a request meant for Kubernetes.
+func (p *Proxy) withADRefresh(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if p.adDirectory == nil || req.URL.Path != ADRefreshPath {
+			handler.ServeHTTP(rw, req)
+			return
+		}
+
+		if req.Method != http.MethodPost {
+			rw.Header().Set("Allow", http.MethodPost)
+			http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var remoteAddr string
+		req, remoteAddr = context.RemoteAddr(req)
+
+		klog.V(2).Infof("Active Directory refresh requested (%s)", remoteAddr)
+
+		if err := p.adDirectory.Refresh(); err != nil {
+			klog.Errorf("failed to refresh Active Directory mapping (%s): %s", remoteAddr, err)
+			http.Error(rw, "Failed to refresh Active Directory mapping", http.StatusInternalServerError)
+			return
+		}
+
+		rw.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(rw).Encode(p.adDirectory.Stats()); err != nil {
+			klog.Errorf("failed to write Active Directory refresh response (%s): %s", remoteAddr, err)
+		}
+	})
+}
+
+// augmentGroups replaces the groups of the given user with the groups they
+// hold in the Active Directory backend.
+func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
+	groups, ok := p.adDirectory.Groups(u.GetName())
+	if !ok {
+		if p.adDirectory.FallbackToTokenGroups() {
+			klog.V(4).Infof("user %q not found in Active Directory, falling back to token groups (%s)",
+				u.GetName(), remoteAddr)
+			return u
+		}
+
+		klog.V(4).Infof("user %q not found in Active Directory, dropping token groups (%s)",
+			u.GetName(), remoteAddr)
+	}
+
+	return &authuser.DefaultInfo{
+		Name:   u.GetName(),
+		UID:    u.GetUID(),
+		Groups: groups,
+		Extra:  u.GetExtra(),
+	}
+}
+
 // withImpersonateRequest adds the impersonation request handler to the chain.
 func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -114,6 +173,13 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		if !ok || len(user.GetName()) == 0 {
 			p.handleError(rw, req, errNoName)
 			return
+		}
+
+		// Keep the name from the token but take the groups from the directory.
+		// This happens before the impersonation check below so that the
+		// authorization decision is made against the directory groups too.
+		if p.adDirectory != nil {
+			user = p.augmentGroups(user, remoteAddr)
 		}
 
 		userForContext := user

@@ -23,6 +23,7 @@ type Options struct {
 	Audit              *AuditOptions
 	Client             *ClientOptions
 	Misc               *MiscOptions
+	AD                 *ADOptions
 
 	nfs *cliflag.NamedFlagSets
 }
@@ -38,6 +39,7 @@ func New() *Options {
 		Audit:              NewAuditOptions(nfs),
 		Client:             NewClientOptions(nfs),
 		Misc:               NewMiscOptions(nfs),
+		AD:                 NewADOptions(nfs),
 
 		nfs: nfs,
 	}
@@ -85,6 +87,14 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 
 	if err := o.Audit.Validate(); len(err) > 0 {
 		errs = append(errs, err...)
+	}
+
+	if err := o.AD.Validate(); len(err) > 0 {
+		errs = append(errs, err...)
+	}
+
+	if o.App.DisableImpersonation && o.AD.Enabled {
+		errs = append(errs, errors.New("cannot augment groups from Active Directory when impersonation disabled"))
 	}
 
 	if o.App.DisableImpersonation &&
