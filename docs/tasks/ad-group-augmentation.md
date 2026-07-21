@@ -58,6 +58,7 @@ To enable augmentation, include the following flags:
 | `--ad-group-name-attribute` | `cn` | Attribute of a group entry to use as the group name. |
 | `--ad-group-prefix` | | Prefix prepended to every group name from the directory. |
 | `--ad-refresh-interval` | `10m` | How often the mapping is rebuilt. |
+| `--ad-refresh-users` | | Users allowed to trigger a refresh. If not set, any authenticated user may. |
 | `--ad-fallback-to-token-groups` | `false` | Fall back to the groups of the JWT for users not found in the directory. |
 
 Group augmentation relies on impersonation, so it cannot be combined with
@@ -98,3 +99,14 @@ an unauthenticated caller cannot trigger a rebuild. Refreshes are serialised, so
 concurrent calls cannot fan out into concurrent searches of the directory. The
 path is not a valid API server path, so it never shadows a request destined for
 Kubernetes.
+
+By default any authenticated user may trigger a refresh. To restrict this to a
+set of users, pass `--ad-refresh-users`:
+
+```
+--ad-refresh-users=alice@example.net,bob@example.net
+```
+
+Names are matched case insensitively, and may be given either as they appear in
+the JWT or without the `--oidc-username-prefix`. A user who is not in the list
+receives a `403`.

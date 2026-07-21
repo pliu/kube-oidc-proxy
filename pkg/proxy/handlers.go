@@ -106,7 +106,23 @@ func (p *Proxy) withADRefresh(handler http.Handler) http.Handler {
 		var remoteAddr string
 		req, remoteAddr = context.RemoteAddr(req)
 
-		klog.V(2).Infof("Active Directory refresh requested (%s)", remoteAddr)
+		// A request that authenticated by token passthrough carries no user,
+		// so there is nobody to check against the allowed users.
+		requester, ok := genericapirequest.UserFrom(req.Context())
+		if !ok || len(requester.GetName()) == 0 {
+			p.handleError(rw, req, errNoName)
+			return
+		}
+
+		if !p.adDirectory.CanRefresh(requester.GetName()) {
+			klog.V(2).Infof("user %q is not allowed to trigger an Active Directory refresh (%s)",
+				requester.GetName(), remoteAddr)
+			http.Error(rw, "Not allowed to trigger an Active Directory refresh", http.StatusForbidden)
+			return
+		}
+
+		klog.V(2).Infof("Active Directory refresh requested by %q (%s)",
+			requester.GetName(), remoteAddr)
 
 		if err := p.adDirectory.Refresh(); err != nil {
 			klog.Errorf("failed to refresh Active Directory mapping (%s): %s", remoteAddr, err)

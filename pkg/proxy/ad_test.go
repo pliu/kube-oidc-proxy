@@ -23,8 +23,26 @@ type fakeAugmenter struct {
 	mapping  map[string][]string
 	fallback bool
 
+	// refreshUsers is the set of users allowed to trigger a refresh. Empty
+	// allows everyone, as the real directory does.
+	refreshUsers []string
+
 	refreshErr   error
 	refreshCount int
+}
+
+func (f *fakeAugmenter) CanRefresh(username string) bool {
+	if len(f.refreshUsers) == 0 {
+		return true
+	}
+
+	for _, allowed := range f.refreshUsers {
+		if allowed == username {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
@@ -171,6 +189,64 @@ func TestADRefreshEndpoint(t *testing.T) {
 
 	if stats.Users != 1 {
 		t.Errorf("expected stats of 1 user, got %d", stats.Users)
+	}
+}
+
+func TestADRefreshEndpointAllowedUsers(t *testing.T) {
+	tests := map[string]struct {
+		refreshUsers []string
+		requester    string
+
+		expCode      int
+		expRefreshes int
+	}{
+		"any authenticated user may refresh when no users are configured": {
+			refreshUsers: nil,
+			requester:    "alice@example.net",
+			expCode:      http.StatusOK,
+			expRefreshes: 1,
+		},
+		"an allowed user may refresh": {
+			refreshUsers: []string{"alice@example.net", "bob@example.net"},
+			requester:    "bob@example.net",
+			expCode:      http.StatusOK,
+			expRefreshes: 1,
+		},
+		"a user not in the allowed users is forbidden": {
+			refreshUsers: []string{"alice@example.net"},
+			requester:    "eve@example.net",
+			expCode:      http.StatusForbidden,
+			expRefreshes: 0,
+		},
+		"a user not in a single entry allowed list is forbidden": {
+			refreshUsers: []string{"alice@example.net"},
+			requester:    "alice@example.net.evil",
+			expCode:      http.StatusForbidden,
+			expRefreshes: 0,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			defer p.ctrl.Finish()
+
+			directory := &fakeAugmenter{refreshUsers: test.refreshUsers}
+			p.adDirectory = directory
+
+			resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+				&user.DefaultInfo{Name: test.requester})
+
+			if resp.StatusCode != test.expCode {
+				t.Errorf("got unexpected response code, exp=%d got=%d",
+					test.expCode, resp.StatusCode)
+			}
+
+			if directory.refreshCount != test.expRefreshes {
+				t.Errorf("expected %d refreshes, got %d",
+					test.expRefreshes, directory.refreshCount)
+			}
+		})
 	}
 }
 

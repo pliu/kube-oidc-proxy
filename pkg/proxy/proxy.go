@@ -73,6 +73,9 @@ type groupAugmenter interface {
 	// closed.
 	Run(stopCh <-chan struct{}) error
 
+	// CanRefresh reports whether the given user may trigger a refresh.
+	CanRefresh(username string) bool
+
 	// Refresh rebuilds the mapping on demand.
 	Refresh() error
 

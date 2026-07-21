@@ -418,3 +418,68 @@ func TestGroupsCannotBeAppendedTo(t *testing.T) {
 		t.Errorf("expected the mapping to be unaffected, got %v", after)
 	}
 }
+
+func TestCanRefresh(t *testing.T) {
+	tests := map[string]struct {
+		refreshUsers   []string
+		usernamePrefix string
+
+		username string
+		exp      bool
+	}{
+		"no configured users allows anyone": {
+			refreshUsers: nil,
+			username:     "alice@example.net",
+			exp:          true,
+		},
+		"an empty configured list allows anyone": {
+			refreshUsers: []string{},
+			username:     "alice@example.net",
+			exp:          true,
+		},
+		"a configured user is allowed": {
+			refreshUsers: []string{"alice@example.net", "bob@example.net"},
+			username:     "bob@example.net",
+			exp:          true,
+		},
+		"an unconfigured user is not allowed": {
+			refreshUsers: []string{"alice@example.net"},
+			username:     "eve@example.net",
+			exp:          false,
+		},
+		"matching is case insensitive": {
+			refreshUsers: []string{"Alice@Example.net"},
+			username:     "alice@example.net",
+			exp:          true,
+		},
+		"a user given without the username prefix is allowed": {
+			refreshUsers:   []string{"alice@example.net"},
+			usernamePrefix: "oidc:",
+			username:       "oidc:alice@example.net",
+			exp:            true,
+		},
+		"a user given with the username prefix is allowed": {
+			refreshUsers:   []string{"oidc:alice@example.net"},
+			usernamePrefix: "oidc:",
+			username:       "oidc:alice@example.net",
+			exp:            true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig()
+			config.RefreshUsers = test.refreshUsers
+			config.UsernamePrefix = test.usernamePrefix
+
+			d, err := New(config)
+			if err != nil {
+				t.Fatalf("unexpected error building directory: %s", err)
+			}
+
+			if got := d.CanRefresh(test.username); got != test.exp {
+				t.Errorf("expected CanRefresh(%q)=%t, got %t", test.username, test.exp, got)
+			}
+		})
+	}
+}

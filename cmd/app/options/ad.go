@@ -36,6 +36,7 @@ type ADOptions struct {
 
 	RefreshInterval       time.Duration
 	FallbackToTokenGroups bool
+	RefreshUsers          []string
 }
 
 func NewADOptions(nfs *cliflag.NamedFlagSets) *ADOptions {
@@ -103,6 +104,12 @@ func (a *ADOptions) AddFlags(fs *pflag.FlagSet) *ADOptions {
 
 	fs.DurationVar(&a.RefreshInterval, "ad-refresh-interval", time.Minute*10,
 		"How often the user to group mapping is rebuilt from the directory.")
+
+	fs.StringSliceVar(&a.RefreshUsers, "ad-refresh-users", a.RefreshUsers,
+		"Users allowed to trigger a refresh of the user to group mapping. Names "+
+			"are matched case insensitively, with or without the "+
+			"--oidc-username-prefix. If not set, any authenticated user may "+
+			"trigger a refresh.")
 
 	fs.BoolVar(&a.FallbackToTokenGroups, "ad-fallback-to-token-groups", a.FallbackToTokenGroups,
 		"If a user of a request cannot be found in the directory, fall back to the "+
@@ -175,6 +182,7 @@ func (a *ADOptions) Config(usernamePrefix string) (*ad.Config, error) {
 
 		RefreshInterval:       a.RefreshInterval,
 		FallbackToTokenGroups: a.FallbackToTokenGroups,
+		RefreshUsers:          a.RefreshUsers,
 
 		UsernamePrefix: usernamePrefix,
 	}, nil

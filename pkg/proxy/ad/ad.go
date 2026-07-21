@@ -58,6 +58,10 @@ type Config struct {
 	RefreshInterval       time.Duration
 	FallbackToTokenGroups bool
 
+	// RefreshUsers is the set of users allowed to trigger a refresh. If empty,
+	// any authenticated user may trigger one.
+	RefreshUsers []string
+
 	// UsernamePrefix is the OIDC username prefix. It is stripped from the
 	// username of a request before looking it up in the directory, so that
 	// the directory can be keyed on the raw attribute value.
@@ -94,6 +98,10 @@ type Directory struct {
 	// refresh endpoint cannot fan out into a burst of directory searches.
 	refreshMu sync.Mutex
 
+	// refreshUsers holds the lower cased names of the users allowed to trigger
+	// a refresh. Empty means any authenticated user may.
+	refreshUsers map[string]struct{}
+
 	dial func(url string) (conn, error)
 }
 
@@ -113,9 +121,15 @@ func New(config *Config) (*Directory, error) {
 		return nil, err
 	}
 
+	refreshUsers := make(map[string]struct{}, len(config.RefreshUsers))
+	for _, username := range config.RefreshUsers {
+		refreshUsers[strings.ToLower(username)] = struct{}{}
+	}
+
 	d := &Directory{
-		config:    config,
-		tlsConfig: tlsConfig,
+		config:       config,
+		tlsConfig:    tlsConfig,
+		refreshUsers: refreshUsers,
 	}
 	d.dial = d.dialLDAP
 
@@ -202,6 +216,29 @@ func (d *Directory) Groups(username string) ([]string, bool) {
 	}
 
 	return nil, false
+}
+
+// CanRefresh reports whether the given user is allowed to trigger a refresh.
+// With no allowed users configured, any user may - the endpoint already sits
+// behind authentication.
+func (d *Directory) CanRefresh(username string) bool {
+	if len(d.refreshUsers) == 0 {
+		return true
+	}
+
+	if _, ok := d.refreshUsers[strings.ToLower(username)]; ok {
+		return true
+	}
+
+	// Allow the allowed users to be given either as they appear in the token
+	// or without the OIDC username prefix, matching how users are looked up in
+	// the directory.
+	if p := d.config.UsernamePrefix; p != "" && strings.HasPrefix(username, p) {
+		_, ok := d.refreshUsers[strings.ToLower(strings.TrimPrefix(username, p))]
+		return ok
+	}
+
+	return false
 }
 
 // FallbackToTokenGroups reports whether users missing from the directory keep
