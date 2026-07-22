@@ -1,0 +1,361 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
+package proxy
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"sort"
+	"testing"
+
+	"go.uber.org/mock/gomock"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad"
+)
+
+// fakeAugmenter stands in for a live Active Directory backend.
+type fakeAugmenter struct {
+	mapping  map[string][]string
+	fallback bool
+
+	// refreshUsers is the set of users allowed to trigger a refresh. Empty
+	// allows everyone, as the real directory does.
+	refreshUsers []string
+
+	refreshErr   error
+	refreshCount int
+}
+
+func (f *fakeAugmenter) CanRefresh(username string) bool {
+	if len(f.refreshUsers) == 0 {
+		return true
+	}
+
+	for _, allowed := range f.refreshUsers {
+		if allowed == username {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
+	groups, ok := f.mapping[username]
+	return groups, ok
+}
+
+func (f *fakeAugmenter) FallbackToTokenGroups() bool { return f.fallback }
+
+func (f *fakeAugmenter) Run(stopCh <-chan struct{}) error { return nil }
+
+func (f *fakeAugmenter) Refresh() error {
+	f.refreshCount++
+	return f.refreshErr
+}
+
+func (f *fakeAugmenter) Stats() *ad.Stats {
+	return &ad.Stats{Users: len(f.mapping)}
+}
+
+// serveWithAD runs a request that authenticates as tokenUser through the full
+// handler chain, with the given directory in place.
+func serveWithAD(t *testing.T, p *fakeProxy, req *http.Request, tokenUser user.Info) *http.Response {
+	t.Helper()
+
+	if tokenUser != nil {
+		p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(
+			&authenticator.Response{User: tokenUser}, true, nil)
+	}
+
+	handler := p.withHandlers(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if _, err := p.RoundTrip(req); err != nil {
+			t.Errorf("unexpected error: %s", err)
+		}
+	}))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	return w.Result()
+}
+
+func newADRequest(path string, method string) *http.Request {
+	u := new(url.URL)
+	u.Path = path
+
+	return &http.Request{
+		Method: method,
+		URL:    u,
+		Header: http.Header{"Authorization": []string{"bearer fake-token"}},
+	}
+}
+
+func TestAugmentedGroupsAreImpersonated(t *testing.T) {
+	tests := map[string]struct {
+		mapping  map[string][]string
+		fallback bool
+
+		tokenUser *user.DefaultInfo
+		expGroup  []string
+	}{
+		"directory groups replace the groups of the token": {
+			mapping:   map[string][]string{"alice@example.net": {"admins", "devs"}},
+			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
+			expGroup:  []string{"admins", "devs", user.AllAuthenticated},
+		},
+		"a known user in no directory groups keeps none of their token groups": {
+			mapping:   map[string][]string{"alice@example.net": {}},
+			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
+			expGroup:  []string{user.AllAuthenticated},
+		},
+		"an unknown user is given no groups by default": {
+			mapping:   map[string][]string{"bob@example.net": {"admins"}},
+			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
+			expGroup:  []string{user.AllAuthenticated},
+		},
+		"an unknown user keeps their token groups when falling back": {
+			mapping:   map[string][]string{"bob@example.net": {"admins"}},
+			fallback:  true,
+			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
+			expGroup:  []string{"from-token", user.AllAuthenticated},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			defer p.ctrl.Finish()
+
+			p.adDirectory = &fakeAugmenter{mapping: test.mapping, fallback: test.fallback}
+
+			p.fakeRT.expUser = test.tokenUser.GetName()
+			p.fakeRT.expGroup = test.expGroup
+
+			resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet), test.tokenUser)
+
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got unexpected response code, exp=%d got=%d",
+					http.StatusOK, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// With no directory configured the groups of the token must be used as before.
+func TestGroupsUnchangedWhenADDisabled(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	p.fakeRT.expUser = "alice@example.net"
+	p.fakeRT.expGroup = []string{"from-token", user.AllAuthenticated}
+
+	resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet),
+		&user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestADRefreshEndpoint(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+	p.adDirectory = directory
+
+	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+		&user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
+	}
+
+	if directory.refreshCount != 1 {
+		t.Errorf("expected exactly one refresh, got %d", directory.refreshCount)
+	}
+
+	var stats ad.Stats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode response: %s", err)
+	}
+
+	if stats.Users != 1 {
+		t.Errorf("expected stats of 1 user, got %d", stats.Users)
+	}
+}
+
+func TestADRefreshEndpointAllowedUsers(t *testing.T) {
+	tests := map[string]struct {
+		refreshUsers []string
+		requester    string
+
+		expCode      int
+		expRefreshes int
+	}{
+		"any authenticated user may refresh when no users are configured": {
+			refreshUsers: nil,
+			requester:    "alice@example.net",
+			expCode:      http.StatusOK,
+			expRefreshes: 1,
+		},
+		"an allowed user may refresh": {
+			refreshUsers: []string{"alice@example.net", "bob@example.net"},
+			requester:    "bob@example.net",
+			expCode:      http.StatusOK,
+			expRefreshes: 1,
+		},
+		"a user not in the allowed users is forbidden": {
+			refreshUsers: []string{"alice@example.net"},
+			requester:    "eve@example.net",
+			expCode:      http.StatusForbidden,
+			expRefreshes: 0,
+		},
+		"a user not in a single entry allowed list is forbidden": {
+			refreshUsers: []string{"alice@example.net"},
+			requester:    "alice@example.net.evil",
+			expCode:      http.StatusForbidden,
+			expRefreshes: 0,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			defer p.ctrl.Finish()
+
+			directory := &fakeAugmenter{refreshUsers: test.refreshUsers}
+			p.adDirectory = directory
+
+			resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+				&user.DefaultInfo{Name: test.requester})
+
+			if resp.StatusCode != test.expCode {
+				t.Errorf("got unexpected response code, exp=%d got=%d",
+					test.expCode, resp.StatusCode)
+			}
+
+			if directory.refreshCount != test.expRefreshes {
+				t.Errorf("expected %d refreshes, got %d",
+					test.expRefreshes, directory.refreshCount)
+			}
+		})
+	}
+}
+
+// The endpoint sits behind authentication, so an unauthenticated request must
+// not be able to trigger a refresh.
+func TestADRefreshEndpointRequiresAuthentication(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{}
+	p.adDirectory = directory
+
+	req := newADRequest(ADRefreshPath, http.MethodPost)
+	req.Header = http.Header{}
+
+	resp := serveWithAD(t, p, req, nil)
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusUnauthorized, resp.StatusCode)
+	}
+
+	if directory.refreshCount != 0 {
+		t.Errorf("expected no refresh, got %d", directory.refreshCount)
+	}
+}
+
+func TestADRefreshEndpointRejectsGET(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{}
+	p.adDirectory = directory
+
+	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodGet),
+		&user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusMethodNotAllowed, resp.StatusCode)
+	}
+
+	if directory.refreshCount != 0 {
+		t.Errorf("expected no refresh, got %d", directory.refreshCount)
+	}
+}
+
+func TestADRefreshEndpointReportsFailure(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	p.adDirectory = &fakeAugmenter{refreshErr: errors.New("directory is down")}
+
+	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+		&user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusInternalServerError, resp.StatusCode)
+	}
+}
+
+// The refresh path is not a valid API server path, but a request to a path
+// that merely looks like it must still be proxied.
+func TestADRefreshPathIsNotProxied(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	p.adDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+
+	p.fakeRT.expUser = "alice@example.net"
+	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
+
+	resp := serveWithAD(t, p, newADRequest(ADRefreshPath+"/subpath", http.MethodPost),
+		&user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusOK, resp.StatusCode)
+	}
+}
+
+// Guard the assumption the fakeRT comparison relies on.
+func TestAugmentGroupsPreservesIdentity(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	p.adDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+
+	in := &user.DefaultInfo{
+		Name:   "alice@example.net",
+		UID:    "uid-1",
+		Groups: []string{"from-token"},
+		Extra:  map[string][]string{"foo": {"bar"}},
+	}
+
+	out := p.augmentGroups(in, "fakeAddr")
+
+	if out.GetName() != in.GetName() || out.GetUID() != in.GetUID() {
+		t.Errorf("expected name and uid to be preserved, got %q/%q", out.GetName(), out.GetUID())
+	}
+
+	if !reflect.DeepEqual(out.GetExtra(), in.GetExtra()) {
+		t.Errorf("expected extra to be preserved, got %v", out.GetExtra())
+	}
+
+	groups := out.GetGroups()
+	sort.Strings(groups)
+	if !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected groups [admins], got %v", groups)
+	}
+}
