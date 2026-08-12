@@ -1,11 +1,16 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
 
-// Package ad augments the groups of an authenticated user with the groups
-// they are a member of in an Active Directory (or any LDAP v3) backend.
+// Package ad augments the groups of an authenticated user with the groups they
+// are a member of in one or more Active Directory (or any LDAP v3) backends.
 //
-// The full user -> group mapping is built up front and held in memory. It is
-// rebuilt on an interval, or on demand, and swapped in atomically so that
-// in flight requests always read a complete, consistent mapping.
+// The full user -> group mapping is built up front from every configured
+// backend and merged into one, held in memory. It is rebuilt on an interval,
+// or on demand, and swapped in atomically so that in flight requests always
+// read a complete, consistent mapping.
+//
+// The built mapping can also be persisted, so that a proxy restarted while the
+// directories are unreachable serves the last mapping it built rather than
+// stripping every user of their groups.
 package ad
 
 import (
@@ -14,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +27,8 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 	"k8s.io/klog/v2"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
 )
 
 const (
@@ -30,45 +38,22 @@ const (
 
 	// memberOfAttribute holds the DNs of the groups an entry belongs to.
 	memberOfAttribute = "memberOf"
+
+	// cacheTimeout bounds a read or write of the persisted mapping, so that an
+	// unresponsive store cannot hold up a refresh indefinitely.
+	cacheTimeout = time.Second * 30
+
+	// SourceDirectory and SourceCache describe where the mapping currently
+	// being served came from.
+	SourceDirectory = "directory"
+	SourceCache     = "cache"
 )
 
-var (
-	ErrNoURL             = errors.New("no Active Directory URL configured")
-	ErrNoUserSearchBase  = errors.New("no Active Directory user search base configured")
-	ErrNoGroupSearchBase = errors.New("no Active Directory group search base configured")
-)
+// ErrNoBackends is returned when there is no directory to build a mapping
+// from. Every other configuration problem is reported by Config.Validate.
+var ErrNoBackends = errors.New("no Active Directory backends configured")
 
-type Config struct {
-	URLs                  []string
-	BindDN                string
-	BindPassword          string
-	CAFile                string
-	InsecureSkipTLSVerify bool
-	StartTLS              bool
-
-	UserSearchBases   []string
-	UserFilter        string
-	UsernameAttribute string
-
-	GroupSearchBases   []string
-	GroupFilter        string
-	GroupNameAttribute string
-	GroupPrefix        string
-
-	RefreshInterval       time.Duration
-	FallbackToTokenGroups bool
-
-	// RefreshUsers is the set of users allowed to trigger a refresh. If empty,
-	// any authenticated user may trigger one.
-	RefreshUsers []string
-
-	// UsernamePrefix is the OIDC username prefix. It is stripped from the
-	// username of a request before looking it up in the directory, so that
-	// the directory can be keyed on the raw attribute value.
-	UsernamePrefix string
-}
-
-// conn is the subset of *ldap.Conn used by the Directory, so that the search
+// conn is the subset of *ldap.Conn used by a backend, so that the search
 // behaviour can be exercised without a live directory.
 type conn interface {
 	StartTLS(*tls.Config) error
@@ -83,11 +68,32 @@ type Stats struct {
 	Groups      int       `json:"groups"`
 	LastRefresh time.Time `json:"lastRefresh"`
 	Duration    string    `json:"duration"`
+
+	// Source is where the active mapping came from: the directories
+	// themselves, or the persisted cache after a failed startup refresh.
+	Source string `json:"source,omitempty"`
+
+	Backends []BackendStats `json:"backends,omitempty"`
+}
+
+// BackendStats describes what one backend contributed to the mapping.
+type BackendStats struct {
+	Name     string `json:"name"`
+	Users    int    `json:"users"`
+	Groups   int    `json:"groups"`
+	Duration string `json:"duration"`
 }
 
 type Directory struct {
-	config    *Config
-	tlsConfig *tls.Config
+	config   *Config
+	backends []*backend
+
+	// cache persists the built mapping. Nil when persistence is disabled.
+	cache cache.Store
+
+	// mappingHash identifies the configuration the mapping is built from, so
+	// that a mapping persisted under a different configuration is not served.
+	mappingHash string
 
 	// mapping is the active username -> groups mapping. It is only ever
 	// replaced, never mutated, so readers need no locking.
@@ -101,24 +107,51 @@ type Directory struct {
 	// refreshUsers holds the lower cased names of the users allowed to trigger
 	// a refresh. Empty means any authenticated user may.
 	refreshUsers map[string]struct{}
+}
+
+// backend is one directory the mapping is built from.
+type backend struct {
+	config    *BackendConfig
+	tlsConfig *tls.Config
+
+	// bindPassword is resolved up front, so that a refresh does not depend on
+	// a file that may have gone away since startup.
+	bindPassword string
+
+	// lastUsers and lastGroups are what this backend returned at the last
+	// refresh that was accepted, so that a backend which still answers but has
+	// stopped returning anything can be told apart from one that was always
+	// empty. Written only by the refresh path, which Refresh serialises, and
+	// by restore before the first refresh.
+	lastUsers  int
+	lastGroups int
 
 	dial func(url string) (conn, error)
 }
 
-func New(config *Config) (*Directory, error) {
-	if len(config.URLs) == 0 {
-		return nil, ErrNoURL
-	}
-	if len(config.UserSearchBases) == 0 {
-		return nil, ErrNoUserSearchBase
-	}
-	if len(config.GroupSearchBases) == 0 {
-		return nil, ErrNoGroupSearchBase
+// New builds a Directory from a validated configuration. The store may be nil,
+// in which case the mapping is not persisted.
+func New(config *Config, store cache.Store) (*Directory, error) {
+	if config == nil || len(config.Backends) == 0 {
+		return nil, ErrNoBackends
 	}
 
-	tlsConfig, err := tlsConfigFor(config)
-	if err != nil {
+	// Defaulting here as well as when a config file is read holds a config
+	// built in code to the same shape as one read from disk.
+	config.SetDefaults()
+
+	if err := config.Validate(); err != nil {
 		return nil, err
+	}
+
+	backends := make([]*backend, 0, len(config.Backends))
+	for _, backendConfig := range config.Backends {
+		b, err := newBackend(backendConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		backends = append(backends, b)
 	}
 
 	refreshUsers := make(map[string]struct{}, len(config.RefreshUsers))
@@ -128,10 +161,11 @@ func New(config *Config) (*Directory, error) {
 
 	d := &Directory{
 		config:       config,
-		tlsConfig:    tlsConfig,
+		backends:     backends,
+		cache:        store,
+		mappingHash:  config.mappingHash(),
 		refreshUsers: refreshUsers,
 	}
-	d.dial = d.dialLDAP
 
 	empty := make(map[string][]string)
 	d.mapping.Store(&empty)
@@ -140,16 +174,51 @@ func New(config *Config) (*Directory, error) {
 	return d, nil
 }
 
+// newBackend prepares a backend to be searched. The configuration has already
+// been validated by New, so all that is left is the work that can fail against
+// the filesystem: the trust bundle and the bind password.
+func newBackend(config *BackendConfig) (*backend, error) {
+	tlsConfig, err := tlsConfigFor(config)
+	if err != nil {
+		return nil, err
+	}
+
+	bindPassword, err := config.bindPasswordFor()
+	if err != nil {
+		return nil, err
+	}
+
+	b := &backend{
+		config:       config,
+		tlsConfig:    tlsConfig,
+		bindPassword: bindPassword,
+	}
+	b.dial = b.dialLDAP
+
+	return b, nil
+}
+
 // Run builds the initial mapping and then keeps it refreshed until stopCh is
-// closed. The initial refresh is synchronous: starting to serve requests with
-// an empty mapping would silently strip every user of their groups.
+// closed.
+//
+// The initial refresh is synchronous: starting to serve requests with an empty
+// mapping would silently strip every user of their groups. A persisted mapping
+// is loaded first so that it can stand in if that refresh fails, and only when
+// there is no mapping to fall back on does a failure stop the proxy starting.
 func (d *Directory) Run(stopCh <-chan struct{}) error {
+	restored := d.restore()
+
 	if err := d.Refresh(); err != nil {
-		return fmt.Errorf("failed to build initial Active Directory mapping: %s", err)
+		if !restored {
+			return fmt.Errorf("failed to build initial Active Directory mapping: %s", err)
+		}
+
+		klog.Errorf("failed to build initial Active Directory mapping, serving the mapping persisted in %s: %s",
+			d.cache, err)
 	}
 
 	go func() {
-		ticker := time.NewTicker(d.config.RefreshInterval)
+		ticker := time.NewTicker(d.config.RefreshInterval.Duration())
 		defer ticker.Stop()
 
 		for {
@@ -160,7 +229,7 @@ func (d *Directory) Run(stopCh <-chan struct{}) error {
 			case <-ticker.C:
 				if err := d.Refresh(); err != nil {
 					// Keep serving the previous mapping rather than failing
-					// every request while the directory is unreachable.
+					// every request while a directory is unreachable.
 					klog.Errorf("failed to refresh Active Directory mapping, keeping previous mapping: %s", err)
 				}
 			}
@@ -170,15 +239,15 @@ func (d *Directory) Run(stopCh <-chan struct{}) error {
 	return nil
 }
 
-// Refresh rebuilds the user -> group mapping and atomically swaps it in. The
-// previous mapping is left in place if the rebuild fails.
+// Refresh rebuilds the user -> group mapping from every backend and atomically
+// swaps it in. The previous mapping is left in place if the rebuild fails.
 func (d *Directory) Refresh() error {
 	d.refreshMu.Lock()
 	defer d.refreshMu.Unlock()
 
 	start := time.Now()
 
-	mapping, groups, err := d.build()
+	mapping, groups, backendStats, err := d.build()
 	if err != nil {
 		return err
 	}
@@ -189,18 +258,22 @@ func (d *Directory) Refresh() error {
 		Groups:      groups,
 		LastRefresh: start,
 		Duration:    time.Since(start).String(),
+		Source:      SourceDirectory,
+		Backends:    backendStats,
 	})
 
-	klog.V(2).Infof("refreshed Active Directory mapping: %d users, %d groups (%s)",
-		len(mapping), groups, time.Since(start))
+	klog.V(2).Infof("refreshed Active Directory mapping from %d backends: %d users, %d groups (%s)",
+		len(d.backends), len(mapping), groups, time.Since(start))
+
+	d.persist(mapping, groups, start, backendStats)
 
 	return nil
 }
 
 // Groups returns the directory groups of the given username. The second return
-// value reports whether the user was found in the directory at all - a user
-// that exists but is in none of the configured groups returns an empty slice
-// and true.
+// value reports whether the user was found in any backend at all - a user that
+// exists but is in none of the configured groups returns an empty slice and
+// true.
 func (d *Directory) Groups(username string) ([]string, bool) {
 	mapping := *d.mapping.Load()
 
@@ -241,8 +314,8 @@ func (d *Directory) CanRefresh(username string) bool {
 	return false
 }
 
-// FallbackToTokenGroups reports whether users missing from the directory keep
-// the groups from their token.
+// FallbackToTokenGroups reports whether users missing from every directory
+// keep the groups from their token.
 func (d *Directory) FallbackToTokenGroups() bool {
 	return d.config.FallbackToTokenGroups
 }
@@ -251,10 +324,96 @@ func (d *Directory) Stats() *Stats {
 	return d.stats.Load()
 }
 
-// build searches the directory and returns a username -> groups mapping,
-// along with the number of distinct groups that were considered.
-func (d *Directory) build() (map[string][]string, int, error) {
-	c, err := d.connect()
+// build searches every backend and returns the merged username -> groups
+// mapping, along with the number of distinct groups that were considered.
+//
+// A backend that cannot be searched, or that has stopped returning anything at
+// all, fails the whole refresh. Merging what the healthy backends returned
+// would quietly drop the groups a user holds in the other one, which is worse
+// than serving a mapping that is a refresh interval out of date.
+func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
+	mapping := make(map[string][]string)
+	stats := make([]BackendStats, 0, len(d.backends))
+
+	var groups int
+
+	for _, b := range d.backends {
+		start := time.Now()
+
+		built, builtGroups, err := b.build()
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
+		}
+
+		if err := b.observe(len(built), builtGroups); err != nil {
+			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
+		}
+
+		merge(mapping, built)
+		groups += builtGroups
+
+		stats = append(stats, BackendStats{
+			Name:     b.config.Name,
+			Users:    len(built),
+			Groups:   builtGroups,
+			Duration: time.Since(start).String(),
+		})
+
+		klog.V(4).Infof("built Active Directory mapping from backend %q: %d users, %d groups (%s)",
+			b.config.Name, len(built), builtGroups, time.Since(start))
+	}
+
+	finalise(mapping)
+
+	return mapping, groups, stats, nil
+}
+
+// merge folds the mapping of one backend into the combined mapping. A user
+// held in more than one directory ends up with the union of their groups.
+func merge(into, from map[string][]string) {
+	for username, groups := range from {
+		existing, ok := into[username]
+		if !ok {
+			into[username] = groups
+			continue
+		}
+
+		// Two directories can name the same group, and a user must not be
+		// impersonated as a member of it twice.
+		seen := make(map[string]struct{}, len(existing))
+		for _, group := range existing {
+			seen[group] = struct{}{}
+		}
+
+		for _, group := range groups {
+			if _, duplicate := seen[group]; duplicate {
+				continue
+			}
+
+			seen[group] = struct{}{}
+			existing = append(existing, group)
+		}
+
+		into[username] = existing
+	}
+}
+
+// finalise sorts the groups of every user, so that the mapping does not depend
+// on the order the backends happened to return, and clips each slice to its
+// length. The mapping is shared by every request, so a caller appending to the
+// groups of a user then gets a copy rather than writing into spare capacity
+// that other requests can see.
+func finalise(mapping map[string][]string) {
+	for username, groups := range mapping {
+		sort.Strings(groups)
+		mapping[username] = groups[:len(groups):len(groups)]
+	}
+}
+
+// build searches this backend and returns a username -> groups mapping, along
+// with the number of distinct groups that were considered.
+func (b *backend) build() (map[string][]string, int, error) {
+	c, err := b.connect()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -262,12 +421,12 @@ func (d *Directory) build() (map[string][]string, int, error) {
 
 	// Only groups that live under one of the configured search bases are
 	// pulled, so the mapping is restricted to the intended part of the tree.
-	groupNames, err := d.searchGroups(c)
+	groupNames, err := b.searchGroups(c)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	mapping, err := d.searchUsers(c, groupNames)
+	mapping, err := b.searchUsers(c, groupNames)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -275,14 +434,43 @@ func (d *Directory) build() (map[string][]string, int, error) {
 	return mapping, len(groupNames), nil
 }
 
+// observe records what a backend returned, rejecting one that has stopped
+// returning anything at all.
+//
+// A search that comes back empty is not an error at the protocol level, so
+// without this a backend that answers but finds nothing is merged in as a
+// backend that contributes nothing: a bind account that loses its read on the
+// user OU, or a search base renamed out from under the configuration, silently
+// strips every user of that directory of their groups. Treating the collapse
+// as a failure keeps the last good mapping serving instead, which is the same
+// choice made for a backend that cannot be reached at all.
+//
+// Only a fall to zero is caught, not a directory that merely shrinks - any
+// threshold short of that would be a guess at how much churn is normal. A
+// directory that has legitimately been emptied is accepted once the proxy is
+// restarted and its persisted mapping removed.
+func (b *backend) observe(users, groups int) error {
+	switch {
+	case b.lastUsers > 0 && users == 0:
+		return fmt.Errorf("returned no users, having returned %d at the last refresh", b.lastUsers)
+
+	case b.lastGroups > 0 && groups == 0:
+		return fmt.Errorf("returned no groups, having returned %d at the last refresh", b.lastGroups)
+	}
+
+	b.lastUsers, b.lastGroups = users, groups
+
+	return nil
+}
+
 // searchGroups returns a mapping of normalised group DN -> group name for
 // every group under the configured group search bases.
-func (d *Directory) searchGroups(c conn) (map[string]string, error) {
+func (b *backend) searchGroups(c conn) (map[string]string, error) {
 	groupNames := make(map[string]string)
 
-	for _, base := range d.config.GroupSearchBases {
+	for _, base := range b.config.GroupSearchBases {
 		req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
-			0, 0, false, d.config.GroupFilter, []string{d.config.GroupNameAttribute}, nil)
+			0, 0, false, b.config.GroupFilter, []string{b.config.GroupNameAttribute}, nil)
 
 		res, err := c.SearchWithPaging(req, pageSize)
 		if err != nil {
@@ -290,13 +478,13 @@ func (d *Directory) searchGroups(c conn) (map[string]string, error) {
 		}
 
 		for _, entry := range res.Entries {
-			name := entry.GetAttributeValue(d.config.GroupNameAttribute)
+			name := entry.GetAttributeValue(b.config.GroupNameAttribute)
 			if name == "" {
-				klog.V(4).Infof("skipping group %q with no %q attribute", entry.DN, d.config.GroupNameAttribute)
+				klog.V(4).Infof("skipping group %q with no %q attribute", entry.DN, b.config.GroupNameAttribute)
 				continue
 			}
 
-			groupNames[normaliseDN(entry.DN)] = d.config.GroupPrefix + name
+			groupNames[normaliseDN(entry.DN)] = b.config.GroupPrefix + name
 		}
 	}
 
@@ -305,13 +493,13 @@ func (d *Directory) searchGroups(c conn) (map[string]string, error) {
 
 // searchUsers returns a mapping of lower cased username -> group names, using
 // the memberOf attribute of each user filtered down to the known groups.
-func (d *Directory) searchUsers(c conn, groupNames map[string]string) (map[string][]string, error) {
+func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string][]string, error) {
 	mapping := make(map[string][]string)
 
-	for _, base := range d.config.UserSearchBases {
+	for _, base := range b.config.UserSearchBases {
 		req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
-			0, 0, false, d.config.UserFilter,
-			[]string{d.config.UsernameAttribute, memberOfAttribute}, nil)
+			0, 0, false, b.config.UserFilter,
+			[]string{b.config.UsernameAttribute, memberOfAttribute}, nil)
 
 		res, err := c.SearchWithPaging(req, pageSize)
 		if err != nil {
@@ -319,9 +507,9 @@ func (d *Directory) searchUsers(c conn, groupNames map[string]string) (map[strin
 		}
 
 		for _, entry := range res.Entries {
-			username := entry.GetAttributeValue(d.config.UsernameAttribute)
+			username := entry.GetAttributeValue(b.config.UsernameAttribute)
 			if username == "" {
-				klog.V(4).Infof("skipping user %q with no %q attribute", entry.DN, d.config.UsernameAttribute)
+				klog.V(4).Infof("skipping user %q with no %q attribute", entry.DN, b.config.UsernameAttribute)
 				continue
 			}
 
@@ -332,10 +520,7 @@ func (d *Directory) searchUsers(c conn, groupNames map[string]string) (map[strin
 				}
 			}
 
-			// The mapping is shared by every request, so clip the slice to its
-			// length: a caller appending to it then gets a copy rather than
-			// writing into spare capacity that other requests can see.
-			mapping[strings.ToLower(username)] = groups[:len(groups):len(groups)]
+			mapping[strings.ToLower(username)] = groups
 		}
 	}
 
@@ -344,18 +529,18 @@ func (d *Directory) searchUsers(c conn, groupNames map[string]string) (map[strin
 
 // connect dials the configured URLs in order, returning the first connection
 // that can be established and bound.
-func (d *Directory) connect() (conn, error) {
+func (b *backend) connect() (conn, error) {
 	var errs []string
 
-	for _, url := range d.config.URLs {
-		c, err := d.dial(url)
+	for _, url := range b.config.URLs {
+		c, err := b.dial(url)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", url, err))
 			continue
 		}
 
-		if d.config.StartTLS {
-			if err := c.StartTLS(d.tlsConfig); err != nil {
+		if b.config.StartTLS {
+			if err := c.StartTLS(b.tlsConfig); err != nil {
 				c.Close()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS failed: %s", url, err))
 				continue
@@ -363,8 +548,8 @@ func (d *Directory) connect() (conn, error) {
 		}
 
 		// An empty bind DN leaves the connection anonymous.
-		if d.config.BindDN != "" {
-			if err := c.Bind(d.config.BindDN, d.config.BindPassword); err != nil {
+		if b.config.BindDN != "" {
+			if err := c.Bind(b.config.BindDN, b.bindPassword); err != nil {
 				c.Close()
 				errs = append(errs, fmt.Sprintf("%s: bind failed: %s", url, err))
 				continue
@@ -374,14 +559,14 @@ func (d *Directory) connect() (conn, error) {
 		return c, nil
 	}
 
-	return nil, fmt.Errorf("unable to connect to any Active Directory server [%s]", strings.Join(errs, ", "))
+	return nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
 }
 
-func (d *Directory) dialLDAP(url string) (conn, error) {
-	return ldap.DialURL(url, ldap.DialWithTLSConfig(d.tlsConfig))
+func (b *backend) dialLDAP(url string) (conn, error) {
+	return ldap.DialURL(url, ldap.DialWithTLSConfig(b.tlsConfig))
 }
 
-func tlsConfigFor(config *Config) (*tls.Config, error) {
+func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: config.InsecureSkipTLSVerify,
 	}
@@ -392,12 +577,12 @@ func tlsConfigFor(config *Config) (*tls.Config, error) {
 
 	ca, err := os.ReadFile(config.CAFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Active Directory CA file %q: %s", config.CAFile, err)
+		return nil, fmt.Errorf("backend %q: failed to read caFile %q: %s", config.Name, config.CAFile, err)
 	}
 
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(ca) {
-		return nil, fmt.Errorf("no certificates found in Active Directory CA file %q", config.CAFile)
+		return nil, fmt.Errorf("backend %q: no certificates found in caFile %q", config.Name, config.CAFile)
 	}
 	tlsConfig.RootCAs = pool
 

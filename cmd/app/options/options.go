@@ -93,7 +93,7 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 		errs = append(errs, err...)
 	}
 
-	if o.App.DisableImpersonation && o.AD.Enabled {
+	if o.App.DisableImpersonation && o.AD.Enabled() {
 		errs = append(errs, errors.New("cannot augment groups from Active Directory when impersonation disabled"))
 	}
 

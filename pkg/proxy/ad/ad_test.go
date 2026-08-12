@@ -2,15 +2,22 @@
 package ad
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
 )
 
 type fakeConn struct {
@@ -54,44 +61,94 @@ func entry(dn string, attrs map[string][]string) *ldap.Entry {
 	return e
 }
 
-func testConfig() *Config {
-	return &Config{
-		URLs:               []string{"ldaps://ad.example.net:636"},
+func testBackend(name string) *BackendConfig {
+	return &BackendConfig{
+		Name:               name,
+		URLs:               []string{"ldaps://" + name + ".example.net:636"},
 		BindDN:             "CN=svc,DC=example,DC=net",
 		BindPassword:       "password",
 		UserSearchBases:    []string{"OU=Users,DC=example,DC=net"},
-		UserFilter:         "(objectClass=user)",
-		UsernameAttribute:  "userPrincipalName",
+		UserFilter:         DefaultUserFilter,
+		UsernameAttribute:  DefaultUsernameAttribute,
 		GroupSearchBases:   []string{"OU=Groups,DC=example,DC=net"},
-		GroupFilter:        "(objectClass=group)",
-		GroupNameAttribute: "cn",
-		RefreshInterval:    time.Minute * 10,
+		GroupFilter:        DefaultGroupFilter,
+		GroupNameAttribute: DefaultGroupNameAttribute,
 	}
 }
 
-// newTestDirectory returns a Directory that searches the given fake connection
-// rather than a real server.
-func newTestDirectory(t *testing.T, config *Config, c conn) *Directory {
+func testConfig(backends ...*BackendConfig) *Config {
+	if len(backends) == 0 {
+		backends = []*BackendConfig{testBackend("ad")}
+	}
+
+	return &Config{
+		Backends:        backends,
+		RefreshInterval: NewDuration(time.Minute * 10),
+	}
+}
+
+// newTestDirectory returns a Directory whose backends search the given fake
+// connections, in order, rather than a real server.
+func newTestDirectory(t *testing.T, config *Config, conns ...conn) *Directory {
 	t.Helper()
 
-	d, err := New(config)
+	d, err := New(config, nil)
 	if err != nil {
 		t.Fatalf("unexpected error building directory: %s", err)
 	}
 
-	d.dial = func(string) (conn, error) { return c, nil }
+	if len(conns) != len(d.backends) {
+		t.Fatalf("test gave %d connections for %d backends", len(conns), len(d.backends))
+	}
+
+	for i, c := range conns {
+		d.backends[i].dial = func(string) (conn, error) { return c, nil }
+	}
 
 	return d
 }
 
+// connWithUsers returns a fake connection holding one group per name in groups
+// and one user per key in users, membered into the named groups.
+func connWithUsers(groups []string, users map[string][]string) *fakeConn {
+	c := &fakeConn{entries: map[string][]*ldap.Entry{}}
+
+	for _, group := range groups {
+		c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+			entry("CN="+group+",OU=Groups,DC=example,DC=net", map[string][]string{"cn": {group}}))
+	}
+
+	for username, memberOf := range users {
+		dns := make([]string, 0, len(memberOf))
+		for _, group := range memberOf {
+			dns = append(dns, "CN="+group+",OU=Groups,DC=example,DC=net")
+		}
+
+		c.entries["OU=Users,DC=example,DC=net"] = append(c.entries["OU=Users,DC=example,DC=net"],
+			entry("CN="+username+",OU=Users,DC=example,DC=net", map[string][]string{
+				"userPrincipalName": {username},
+				"memberOf":          dns,
+			}))
+	}
+
+	return c
+}
+
 func TestNewValidatesConfig(t *testing.T) {
 	tests := map[string]struct {
-		mutate   func(*Config)
-		expError error
+		mutate func(*Config)
+		expErr string
 	}{
-		"no URL":               {func(c *Config) { c.URLs = nil }, ErrNoURL},
-		"no user search base":  {func(c *Config) { c.UserSearchBases = nil }, ErrNoUserSearchBase},
-		"no group search base": {func(c *Config) { c.GroupSearchBases = nil }, ErrNoGroupSearchBase},
+		"no backends":             {func(c *Config) { c.Backends = nil }, "no Active Directory backends configured"},
+		"no name":                 {func(c *Config) { c.Backends[0].Name = "" }, "name must be set"},
+		"no URL":                  {func(c *Config) { c.Backends[0].URLs = nil }, "at least one url must be set"},
+		"no user search base":     {func(c *Config) { c.Backends[0].UserSearchBases = nil }, "at least one userSearchBase must be set"},
+		"no group search base":    {func(c *Config) { c.Backends[0].GroupSearchBases = nil }, "at least one groupSearchBase must be set"},
+		"a zero refresh interval": {func(c *Config) { c.RefreshInterval = NewDuration(0) }, "refreshInterval must be a positive duration"},
+		"duplicate names": {
+			func(c *Config) { c.Backends = append(c.Backends, testBackend("ad")) },
+			"duplicate backend name",
+		},
 	}
 
 	for name, test := range tests {
@@ -99,8 +156,13 @@ func TestNewValidatesConfig(t *testing.T) {
 			config := testConfig()
 			test.mutate(config)
 
-			if _, err := New(config); !errors.Is(err, test.expError) {
-				t.Errorf("expected error %v, got %v", test.expError, err)
+			_, err := New(config, nil)
+			if err == nil {
+				t.Fatalf("expected an error containing %q, got none", test.expErr)
+			}
+
+			if !strings.Contains(err.Error(), test.expErr) {
+				t.Errorf("expected an error containing %q, got %q", test.expErr, err)
 			}
 		})
 	}
@@ -160,15 +222,218 @@ func TestRefreshBuildsMapping(t *testing.T) {
 				t.Errorf("expected found=%t, got %t", test.expFound, ok)
 			}
 
-			sort.Strings(groups)
 			if !reflect.DeepEqual(groups, test.expGroups) {
 				t.Errorf("expected groups %v, got %v", test.expGroups, groups)
 			}
 		})
 	}
 
-	if stats := d.Stats(); stats.Users != 2 || stats.Groups != 2 {
+	stats := d.Stats()
+	if stats.Users != 2 || stats.Groups != 2 {
 		t.Errorf("expected stats of 2 users and 2 groups, got %d and %d", stats.Users, stats.Groups)
+	}
+	if stats.Source != SourceDirectory {
+		t.Errorf("expected the mapping to be sourced from %q, got %q", SourceDirectory, stats.Source)
+	}
+	if len(stats.Backends) != 1 || stats.Backends[0].Name != "ad" || stats.Backends[0].Users != 2 {
+		t.Errorf("expected per backend stats for 2 users of backend \"ad\", got %+v", stats.Backends)
+	}
+}
+
+// A user held in more than one directory holds the union of their groups.
+func TestRefreshMergesBackends(t *testing.T) {
+	first := connWithUsers([]string{"admins", "shared"}, map[string][]string{
+		"alice@example.net": {"admins", "shared"},
+		"bob@example.net":   {"admins"},
+	})
+
+	second := connWithUsers([]string{"contractors", "shared"}, map[string][]string{
+		"alice@example.net": {"contractors", "shared"},
+		"carol@example.net": {"contractors"},
+	})
+
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), first, second)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	tests := map[string]struct {
+		username  string
+		expGroups []string
+	}{
+		"a user in both backends holds the union of their groups": {
+			"alice@example.net", []string{"admins", "contractors", "shared"},
+		},
+		"a user in only the first backend keeps their groups": {
+			"bob@example.net", []string{"admins"},
+		},
+		"a user in only the second backend keeps their groups": {
+			"carol@example.net", []string{"contractors"},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			groups, ok := d.Groups(test.username)
+			if !ok {
+				t.Fatalf("expected %q to be found", test.username)
+			}
+
+			if !reflect.DeepEqual(groups, test.expGroups) {
+				t.Errorf("expected groups %v, got %v", test.expGroups, groups)
+			}
+		})
+	}
+
+	if stats := d.Stats(); stats.Users != 3 || len(stats.Backends) != 2 {
+		t.Errorf("expected 3 merged users across 2 backends, got %d users and %+v", stats.Users, stats.Backends)
+	}
+}
+
+// Group prefixes are how two directories that name their groups the same way
+// are kept apart.
+func TestRefreshMergesBackendsWithPrefixes(t *testing.T) {
+	first := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	second := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	firstBackend, secondBackend := testBackend("first"), testBackend("second")
+	firstBackend.GroupPrefix = "first:"
+	secondBackend.GroupPrefix = "second:"
+
+	d := newTestDirectory(t, testConfig(firstBackend, secondBackend), first, second)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, _ := d.Groups("alice@example.net")
+	if !reflect.DeepEqual(groups, []string{"first:admins", "second:admins"}) {
+		t.Errorf("expected both prefixed groups, got %v", groups)
+	}
+}
+
+// Merging only what the reachable backends returned would quietly drop the
+// groups a user holds in the unreachable one.
+func TestRefreshFailsWhenABackendIsDown(t *testing.T) {
+	first := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	second := connWithUsers([]string{"contractors"}, map[string][]string{"alice@example.net": {"contractors"}})
+
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), first, second)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	second.searchErr = errors.New("directory is down")
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing with a broken backend")
+	}
+	if !strings.Contains(err.Error(), `backend "second"`) {
+		t.Errorf("expected the error to name the broken backend, got %q", err)
+	}
+
+	// The previous, complete mapping must still be the one being served.
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins", "contractors"}) {
+		t.Errorf("expected the previous merged mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A backend whose searches still succeed but find nobody would otherwise merge
+// in as a backend that contributes nothing, silently stripping every user of
+// that directory of their groups.
+func TestRefreshFailsWhenABackendStopsReturningUsers(t *testing.T) {
+	first := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	second := connWithUsers([]string{"contractors"}, map[string][]string{"bob@example.net": {"contractors"}})
+
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), first, second)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// What a bind account that has lost its read on the user OU looks like:
+	// the search succeeds, it just finds nobody.
+	second.entries["OU=Users,DC=example,DC=net"] = nil
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing with a backend that returned no users")
+	}
+	if !strings.Contains(err.Error(), `backend "second": returned no users`) {
+		t.Errorf("expected the error to name the emptied backend, got %q", err)
+	}
+
+	if groups, ok := d.Groups("bob@example.net"); !ok || !reflect.DeepEqual(groups, []string{"contractors"}) {
+		t.Errorf("expected the previous mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// Losing the groups leaves the users in place, each of them with nothing.
+func TestRefreshFailsWhenABackendStopsReturningGroups(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	c.entries["OU=Groups,DC=example,DC=net"] = nil
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing with a backend that returned no groups")
+	}
+	if !strings.Contains(err.Error(), "returned no groups") {
+		t.Errorf("expected the error to say what was empty, got %q", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the previous mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A backend that has never returned anything is a configuration to fix, not a
+// mapping to protect. Failing on it would leave the proxy unable to start.
+func TestRefreshAcceptsABackendThatWasAlwaysEmpty(t *testing.T) {
+	d := newTestDirectory(t, testConfig(), &fakeConn{entries: map[string][]*ldap.Entry{}})
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing an empty directory: %s", err)
+	}
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing an empty directory again: %s", err)
+	}
+}
+
+// Users leave, and any threshold short of a collapse to nothing would be a
+// guess at how much churn is normal.
+func TestRefreshAcceptsABackendThatShrinks(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{
+		"alice@example.net": {"admins"},
+		"bob@example.net":   {"admins"},
+		"carol@example.net": {"admins"},
+	})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	c.entries["OU=Users,DC=example,DC=net"] = c.entries["OU=Users,DC=example,DC=net"][:1]
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("expected a shrinking directory to be accepted, got %s", err)
+	}
+
+	if users := d.Stats().Users; users != 1 {
+		t.Errorf("expected the smaller mapping to have been swapped in, got %d users", users)
 	}
 }
 
@@ -200,22 +465,12 @@ func TestRefreshMatchesDNsLoosely(t *testing.T) {
 }
 
 func TestRefreshAppliesGroupPrefix(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
-		"OU=Groups,DC=example,DC=net": {
-			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
-		},
-		"OU=Users,DC=example,DC=net": {
-			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
-				"userPrincipalName": {"alice@example.net"},
-				"memberOf":          {"CN=admins,OU=Groups,DC=example,DC=net"},
-			}),
-		},
-	}}
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
-	config := testConfig()
-	config.GroupPrefix = "ad:"
+	backend := testBackend("ad")
+	backend.GroupPrefix = "ad:"
 
-	d := newTestDirectory(t, config, c)
+	d := newTestDirectory(t, testConfig(backend), c)
 
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
@@ -230,17 +485,7 @@ func TestRefreshAppliesGroupPrefix(t *testing.T) {
 // The username of a request carries the OIDC username prefix, the directory
 // does not.
 func TestGroupsStripsUsernamePrefix(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
-		"OU=Groups,DC=example,DC=net": {
-			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
-		},
-		"OU=Users,DC=example,DC=net": {
-			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
-				"userPrincipalName": {"alice@example.net"},
-				"memberOf":          {"CN=admins,OU=Groups,DC=example,DC=net"},
-			}),
-		},
-	}}
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
 	config := testConfig()
 	config.UsernamePrefix = "oidc:"
@@ -259,17 +504,7 @@ func TestGroupsStripsUsernamePrefix(t *testing.T) {
 
 // A failed refresh must leave the previously built mapping serving requests.
 func TestFailedRefreshKeepsPreviousMapping(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
-		"OU=Groups,DC=example,DC=net": {
-			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
-		},
-		"OU=Users,DC=example,DC=net": {
-			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
-				"userPrincipalName": {"alice@example.net"},
-				"memberOf":          {"CN=admins,OU=Groups,DC=example,DC=net"},
-			}),
-		},
-	}}
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
 	d := newTestDirectory(t, testConfig(), c)
 
@@ -291,17 +526,17 @@ func TestFailedRefreshKeepsPreviousMapping(t *testing.T) {
 
 func TestConnectFailsOverBetweenURLs(t *testing.T) {
 	config := testConfig()
-	config.URLs = []string{"ldaps://down.example.net:636", "ldaps://up.example.net:636"}
+	config.Backends[0].URLs = []string{"ldaps://down.example.net:636", "ldaps://up.example.net:636"}
 
 	c := &fakeConn{}
 
-	d, err := New(config)
+	d, err := New(config, nil)
 	if err != nil {
 		t.Fatalf("unexpected error building directory: %s", err)
 	}
 
 	var dialled []string
-	d.dial = func(url string) (conn, error) {
+	d.backends[0].dial = func(url string) (conn, error) {
 		dialled = append(dialled, url)
 		if url == "ldaps://down.example.net:636" {
 			return nil, errors.New("connection refused")
@@ -309,31 +544,21 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 		return c, nil
 	}
 
-	got, err := d.connect()
+	got, err := d.backends[0].connect()
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
 	if got != conn(c) {
 		t.Error("expected the second URL to be used")
 	}
-	if !reflect.DeepEqual(dialled, config.URLs) {
+	if !reflect.DeepEqual(dialled, config.Backends[0].URLs) {
 		t.Errorf("expected both URLs to be dialled in order, got %v", dialled)
 	}
 }
 
 // Readers must always see a complete mapping, never a partially built one.
 func TestConcurrentRefreshAndLookup(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
-		"OU=Groups,DC=example,DC=net": {
-			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
-		},
-		"OU=Users,DC=example,DC=net": {
-			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
-				"userPrincipalName": {"alice@example.net"},
-				"memberOf":          {"CN=admins,OU=Groups,DC=example,DC=net"},
-			}),
-		},
-	}}
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
 	d := newTestDirectory(t, testConfig(), c)
 	if err := d.Refresh(); err != nil {
@@ -372,48 +597,34 @@ func TestConcurrentRefreshAndLookup(t *testing.T) {
 // The mapping is shared by every request, so a caller appending to the groups
 // of a user must not be able to write into it.
 func TestGroupsCannotBeAppendedTo(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
-		"OU=Groups,DC=example,DC=net": {
-			entry("CN=a,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"a"}}),
-			entry("CN=b,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"b"}}),
-			entry("CN=c,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"c"}}),
-		},
-		"OU=Users,DC=example,DC=net": {
-			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
-				"userPrincipalName": {"alice@example.net"},
-				"memberOf": {
-					"CN=a,OU=Groups,DC=example,DC=net",
-					"CN=b,OU=Groups,DC=example,DC=net",
-					"CN=c,OU=Groups,DC=example,DC=net",
-				},
-			}),
-		},
-	}}
+	// Merged from two backends, since merging is where spare capacity would
+	// otherwise creep into the slices.
+	first := connWithUsers([]string{"a", "b"}, map[string][]string{"alice@example.net": {"a", "b"}})
+	second := connWithUsers([]string{"c"}, map[string][]string{"alice@example.net": {"c"}})
 
-	d := newTestDirectory(t, testConfig(), c)
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), first, second)
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
 	}
 
 	// Two requests appending to the groups of the same user, as the
 	// impersonation handler does with system:authenticated.
-	first, _ := d.Groups("alice@example.net")
-	second, _ := d.Groups("alice@example.net")
+	firstGroups, _ := d.Groups("alice@example.net")
+	secondGroups, _ := d.Groups("alice@example.net")
 
-	firstGroups := append(first, "first")
-	secondGroups := append(second, "second")
+	appendedFirst := append(firstGroups, "first")
+	appendedSecond := append(secondGroups, "second")
 
 	// Spare capacity in the shared slice would have the second append
 	// overwrite the value the first one wrote.
-	if got := firstGroups[len(firstGroups)-1]; got != "first" {
+	if got := appendedFirst[len(appendedFirst)-1]; got != "first" {
 		t.Errorf("expected the appends to be independent, got %q", got)
 	}
-	if got := secondGroups[len(secondGroups)-1]; got != "second" {
+	if got := appendedSecond[len(appendedSecond)-1]; got != "second" {
 		t.Errorf("expected the appends to be independent, got %q", got)
 	}
 
 	after, _ := d.Groups("alice@example.net")
-	sort.Strings(after)
 	if !reflect.DeepEqual(after, []string{"a", "b", "c"}) {
 		t.Errorf("expected the mapping to be unaffected, got %v", after)
 	}
@@ -472,13 +683,438 @@ func TestCanRefresh(t *testing.T) {
 			config.RefreshUsers = test.refreshUsers
 			config.UsernamePrefix = test.usernamePrefix
 
-			d, err := New(config)
+			d, err := New(config, nil)
 			if err != nil {
 				t.Fatalf("unexpected error building directory: %s", err)
 			}
 
 			if got := d.CanRefresh(test.username); got != test.exp {
 				t.Errorf("expected CanRefresh(%q)=%t, got %t", test.username, test.exp, got)
+			}
+		})
+	}
+}
+
+func TestMergeDeduplicatesGroups(t *testing.T) {
+	into := map[string][]string{
+		"alice@example.net": {"admins", "shared"},
+	}
+
+	merge(into, map[string][]string{
+		"alice@example.net": {"shared", "contractors"},
+		"bob@example.net":   {"devs"},
+	})
+
+	finalise(into)
+
+	exp := map[string][]string{
+		"alice@example.net": {"admins", "contractors", "shared"},
+		"bob@example.net":   {"devs"},
+	}
+
+	if !reflect.DeepEqual(into, exp) {
+		t.Errorf("expected merged mapping %v, got %v", exp, into)
+	}
+}
+
+func TestFinaliseSortsGroups(t *testing.T) {
+	mapping := map[string][]string{"alice@example.net": {"c", "a", "b"}}
+
+	finalise(mapping)
+
+	if got := mapping["alice@example.net"]; !sort.StringsAreSorted(got) {
+		t.Errorf("expected sorted groups, got %v", got)
+	}
+}
+
+// memoryStore is a cache.Store that keeps the payload in memory.
+type memoryStore struct {
+	data []byte
+
+	loadErr error
+	saveErr error
+
+	saves int
+}
+
+func (m *memoryStore) Load(_ context.Context) ([]byte, error) {
+	if m.loadErr != nil {
+		return nil, m.loadErr
+	}
+	if m.data == nil {
+		return nil, cache.ErrNotFound
+	}
+	return m.data, nil
+}
+
+func (m *memoryStore) Save(_ context.Context, data []byte) error {
+	m.saves++
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	m.data = data
+	return nil
+}
+
+func (m *memoryStore) String() string { return "memory" }
+
+func TestRefreshPersistsMapping(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if store.saves != 1 {
+		t.Fatalf("expected the mapping to have been persisted once, got %d saves", store.saves)
+	}
+
+	snapshot := new(Snapshot)
+	if err := json.Unmarshal(store.data, snapshot); err != nil {
+		t.Fatalf("unexpected error decoding the persisted mapping: %s", err)
+	}
+
+	if snapshot.Version != snapshotVersion {
+		t.Errorf("expected version %d, got %d", snapshotVersion, snapshot.Version)
+	}
+	if !reflect.DeepEqual(snapshot.Users, map[string][]string{"alice@example.net": {"admins"}}) {
+		t.Errorf("expected the mapping to have been persisted, got %v", snapshot.Users)
+	}
+	if snapshot.BuiltAt.IsZero() {
+		t.Error("expected the persisted mapping to record when it was built")
+	}
+
+	if !reflect.DeepEqual(snapshot.Backends, []SnapshotBackend{{Name: "ad", Users: 1, Groups: 1}}) {
+		t.Errorf("expected what each backend contributed to be persisted, got %v", snapshot.Backends)
+	}
+}
+
+// The guard against an emptied backend has to survive the restart the
+// persisted mapping exists for: a proxy coming back up while a directory has
+// quietly stopped answering must not accept the degraded mapping, nor persist
+// it over the good one.
+func TestRunFailsARestoredBackendThatStopsReturningUsers(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	before, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	before.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := before.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// The directory still answers after the restart, it just finds nobody.
+	c.entries["OU=Users,DC=example,DC=net"] = nil
+
+	after, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	after.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := after.Run(stopCh); err != nil {
+		t.Fatalf("expected the persisted mapping to keep startup going, got %s", err)
+	}
+
+	groups, ok := after.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the persisted mapping to be served, got %v (found=%t)", groups, ok)
+	}
+
+	if store.saves != 1 {
+		t.Errorf("expected the degraded mapping not to have been persisted, got %d saves", store.saves)
+	}
+}
+
+// A failure to persist must not fail a refresh that otherwise worked.
+func TestRefreshSucceedsWhenPersistingFails(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := &memoryStore{saveErr: errors.New("store is down")}
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Errorf("expected a refresh that could not be persisted to succeed, got %s", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the mapping to be served, got %v (found=%t)", groups, ok)
+	}
+}
+
+// The point of persisting the mapping: a proxy that comes back up while every
+// directory is unreachable still serves the last mapping it built.
+func TestRunServesPersistedMappingWhenTheDirectoryIsDown(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	// The proxy before the restart, which built and persisted a mapping.
+	before, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	before.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := before.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// The proxy after the restart, which cannot reach the directory at all.
+	after, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	after.backends[0].dial = func(string) (conn, error) { return nil, errors.New("connection refused") }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := after.Run(stopCh); err != nil {
+		t.Fatalf("expected the persisted mapping to keep startup going, got %s", err)
+	}
+
+	groups, ok := after.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the persisted mapping to be served, got %v (found=%t)", groups, ok)
+	}
+
+	if stats := after.Stats(); stats.Source != SourceCache {
+		t.Errorf("expected the mapping to be sourced from %q, got %q", SourceCache, stats.Source)
+	}
+}
+
+// The same restart, through the file store rather than a test double, so that
+// what is actually written to disk is what is actually read back.
+func TestRunServesTheMappingPersistedToAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "mapping.json")
+
+	store, err := cache.NewFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error building store: %s", err)
+	}
+
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	config := testConfig()
+	config.Cache = &CacheConfig{Type: CacheTypeFile, File: &FileCacheConfig{Path: path}}
+
+	before, err := New(config, store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	before.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := before.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected the mapping to have been written to disk: %s", err)
+	}
+
+	after, err := New(config, store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	after.backends[0].dial = func(string) (conn, error) { return nil, errors.New("connection refused") }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := after.Run(stopCh); err != nil {
+		t.Fatalf("expected the persisted mapping to keep startup going, got %s", err)
+	}
+
+	groups, ok := after.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the mapping written to disk to be served, got %v (found=%t)", groups, ok)
+	}
+}
+
+// With nothing persisted to fall back on, a proxy that cannot build a mapping
+// must not start: serving an empty mapping strips every user of their groups.
+func TestRunFailsWithNoMappingToFallBackOn(t *testing.T) {
+	d, err := New(testConfig(), new(memoryStore))
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return nil, errors.New("connection refused") }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := d.Run(stopCh); err == nil {
+		t.Fatal("expected startup to fail with no mapping to fall back on")
+	}
+}
+
+// A directory that is reachable at startup must win over what was persisted.
+func TestRunPrefersTheDirectoryOverThePersistedMapping(t *testing.T) {
+	store := new(memoryStore)
+
+	stale := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	before, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	before.backends[0].dial = func(string) (conn, error) { return stale, nil }
+
+	if err := before.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// Alice has since been moved out of the admins group.
+	current := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {}})
+
+	after, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	after.backends[0].dial = func(string) (conn, error) { return current, nil }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := after.Run(stopCh); err != nil {
+		t.Fatalf("unexpected error running: %s", err)
+	}
+
+	if groups, _ := after.Groups("alice@example.net"); len(groups) != 0 {
+		t.Errorf("expected the mapping from the directory to win, got %v", groups)
+	}
+
+	if stats := after.Stats(); stats.Source != SourceDirectory {
+		t.Errorf("expected the mapping to be sourced from %q, got %q", SourceDirectory, stats.Source)
+	}
+}
+
+func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
+	config := testConfig()
+
+	d, err := New(config, nil)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+
+	good := Snapshot{
+		Version:     snapshotVersion,
+		MappingHash: config.mappingHash(),
+		BuiltAt:     time.Now(),
+		Users:       map[string][]string{"alice@example.net": {"admins"}},
+	}
+
+	otherConfig := testConfig()
+	otherConfig.Backends[0].GroupSearchBases = []string{"OU=Other,DC=example,DC=net"}
+
+	tests := map[string]struct {
+		mutate func(*Snapshot)
+		maxAge time.Duration
+		expErr string
+	}{
+		"a snapshot of another version": {
+			mutate: func(s *Snapshot) { s.Version = snapshotVersion + 1 },
+			expErr: "version",
+		},
+		"a snapshot of another configuration": {
+			mutate: func(s *Snapshot) { s.MappingHash = otherConfig.mappingHash() },
+			expErr: "different backend configuration",
+		},
+		"a snapshot with no users": {
+			mutate: func(s *Snapshot) { s.Users = nil },
+			expErr: "holds no users",
+		},
+		"a snapshot older than the configured maximum age": {
+			mutate: func(s *Snapshot) { s.BuiltAt = time.Now().Add(-time.Hour) },
+			maxAge: time.Minute,
+			expErr: "maxAge",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			snapshot := good
+			test.mutate(&snapshot)
+
+			data, err := json.Marshal(&snapshot)
+			if err != nil {
+				t.Fatalf("unexpected error encoding snapshot: %s", err)
+			}
+
+			d.config.Cache = &CacheConfig{Type: CacheTypeNone, MaxAge: Duration(test.maxAge)}
+
+			if _, err := d.decodeSnapshot(data); err == nil {
+				t.Errorf("expected an error containing %q, got none", test.expErr)
+			} else if !strings.Contains(err.Error(), test.expErr) {
+				t.Errorf("expected an error containing %q, got %q", test.expErr, err)
+			}
+		})
+	}
+
+	// The unmutated snapshot must still be accepted, so that the cases above
+	// are failing for the reason they claim.
+	d.config.Cache = nil
+
+	data, err := json.Marshal(&good)
+	if err != nil {
+		t.Fatalf("unexpected error encoding snapshot: %s", err)
+	}
+
+	if _, err := d.decodeSnapshot(data); err != nil {
+		t.Errorf("expected a good snapshot to be accepted, got %s", err)
+	}
+}
+
+// A mapping built from a directory whose layout has since been reconfigured
+// describes groups the proxy is no longer meant to hand out.
+func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
+	base := testConfig()
+
+	tests := map[string]struct {
+		mutate    func(*Config)
+		expChange bool
+	}{
+		"a changed group search base": {
+			func(c *Config) { c.Backends[0].GroupSearchBases = []string{"OU=Other,DC=example,DC=net"} }, true,
+		},
+		"a changed group prefix":  {func(c *Config) { c.Backends[0].GroupPrefix = "ad:" }, true},
+		"a changed user filter":   {func(c *Config) { c.Backends[0].UserFilter = "(objectClass=person)" }, true},
+		"an added backend":        {func(c *Config) { c.Backends = append(c.Backends, testBackend("second")) }, true},
+		"a rotated password":      {func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},
+		"a changed url":           {func(c *Config) { c.Backends[0].URLs = []string{"ldaps://other.example.net:636"} }, false},
+		"a changed refresh":       {func(c *Config) { c.RefreshInterval = NewDuration(time.Hour) }, false},
+		"a changed cache setting": {func(c *Config) { c.Cache = &CacheConfig{Type: CacheTypeNone} }, false},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig()
+			test.mutate(config)
+
+			if changed := config.mappingHash() != base.mappingHash(); changed != test.expChange {
+				t.Errorf("expected the hash to change=%t, got %t", test.expChange, changed)
 			}
 		})
 	}

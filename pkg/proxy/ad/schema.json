@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jetstack/kube-oidc-proxy/schemas/ad-config.v1.json",
+  "title": "kube-oidc-proxy Active Directory configuration",
+  "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["backends"],
+  "properties": {
+    "backends": {
+      "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/backend" }
+    },
+    "refreshInterval": {
+      "description": "How often the mapping is rebuilt from the directories.",
+      "$ref": "#/$defs/duration",
+      "default": "10m"
+    },
+    "fallbackToTokenGroups": {
+      "description": "Whether a user that is in none of the directories keeps the groups of their token. By default such a user is given no groups.",
+      "type": "boolean",
+      "default": false
+    },
+    "refreshUsers": {
+      "description": "Users allowed to trigger a refresh of the mapping. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may trigger one.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "cache": {
+      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup.",
+      "$ref": "#/$defs/cache"
+    }
+  },
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))*$",
+      "examples": ["30s", "10m", "1h30m"]
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "urls", "userSearchBases", "groupSearchBases"],
+      "properties": {
+        "name": {
+          "description": "Name of the backend. Used in logs, statistics and errors, and must be unique.",
+          "type": "string",
+          "minLength": 1
+        },
+        "urls": {
+          "description": "URL(s) of this directory. Tried in order until one can be connected to and bound.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^ldaps?://" }
+        },
+        "bindDN": {
+          "description": "DN to bind to the directory as. If unset, an anonymous bind is used.",
+          "type": "string",
+          "minLength": 1
+        },
+        "bindPassword": {
+          "description": "Password to bind with. Prefer bindPasswordFile to keep the password out of the config file.",
+          "type": "string"
+        },
+        "bindPasswordFile": {
+          "description": "File holding the password to bind with.",
+          "type": "string",
+          "minLength": 1
+        },
+        "caFile": {
+          "description": "PEM encoded certificate authority bundle used to verify the serving certificate of this directory. Defaults to the host trust store.",
+          "type": "string",
+          "minLength": 1
+        },
+        "insecureSkipTLSVerify": {
+          "description": "Do not verify the serving certificate of this directory. Insecure, and intended for testing only.",
+          "type": "boolean",
+          "default": false
+        },
+        "startTLS": {
+          "description": "Issue a StartTLS request after connecting. Used with an 'ldap://' URL to upgrade the connection to TLS.",
+          "type": "boolean",
+          "default": false
+        },
+        "userSearchBases": {
+          "description": "Base DN(s) to search for users under.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "userFilter": {
+          "description": "LDAP filter selecting user entries.",
+          "type": "string",
+          "minLength": 1,
+          "default": "(objectClass=user)"
+        },
+        "usernameAttribute": {
+          "description": "Attribute of a user entry holding the name that matches the username of the token. Matched case insensitively.",
+          "type": "string",
+          "minLength": 1,
+          "default": "userPrincipalName"
+        },
+        "groupSearchBases": {
+          "description": "Base DN(s) to search for groups under. Only groups found under these bases are mapped onto users.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "groupFilter": {
+          "description": "LDAP filter selecting group entries.",
+          "type": "string",
+          "minLength": 1,
+          "default": "(objectClass=group)"
+        },
+        "groupNameAttribute": {
+          "description": "Attribute of a group entry to use as the group name.",
+          "type": "string",
+          "minLength": 1,
+          "default": "cn"
+        },
+        "groupPrefix": {
+          "description": "Prefix prepended to every group name pulled from this directory. Use it to keep the groups of two directories apart.",
+          "type": "string"
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "description": "How the mapping is persisted. 'none' disables persistence.",
+          "enum": ["none", "file", "kubernetesSecret"]
+        },
+        "maxAge": {
+          "description": "How old a persisted mapping may be and still be served at startup. If unset, a persisted mapping is served however old it is.",
+          "$ref": "#/$defs/duration"
+        },
+        "file": {
+          "description": "Configuration of the 'file' store. Required when type is 'file'.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": {
+              "description": "Path the mapping is written to. The parent directory is created if needed, and the file is written atomically.",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "kubernetesSecret": {
+          "description": "Configuration of the 'kubernetesSecret' store. Required when type is 'kubernetesSecret'.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {
+              "description": "Name of the Secret the mapping is written to. It is created if it does not exist.",
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            },
+            "namespace": {
+              "description": "Namespace of the Secret. Defaults to the namespace the proxy is running in.",
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "key": {
+              "description": "Key within the Secret holding the mapping.",
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[-._a-zA-Z0-9]+$",
+              "default": "mapping.json.gz"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "file" } }, "required": ["type"] },
+          "then": { "required": ["file"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "kubernetesSecret" } }, "required": ["type"] },
+          "then": { "required": ["kubernetesSecret"] }
+        }
+      ]
+    }
+  }
+}

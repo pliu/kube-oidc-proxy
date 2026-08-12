@@ -12,6 +12,7 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/probe"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/util"
@@ -105,8 +106,31 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
+			// Set up the Active Directory backends that the groups of a request
+			// are augmented from, if configured. Left nil when they are not, so
+			// that the proxy keeps taking groups from the token.
+			var adDirectory proxy.GroupAugmenter
+			if opts.AD.Enabled() {
+				adConfig, err := opts.AD.Config(opts.OIDCAuthentication.UsernamePrefix)
+				if err != nil {
+					return err
+				}
+
+				// The store the built mapping is persisted to. Nil when the
+				// configuration does not ask for it to be persisted.
+				adCache, err := ad.NewCacheStore(adConfig.Cache, kubeclient)
+				if err != nil {
+					return err
+				}
+
+				adDirectory, err = ad.New(adConfig, adCache)
+				if err != nil {
+					return err
+				}
+			}
+
 			// Initialise proxy with OIDC token authenticator
-			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit, opts.AD,
+			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit, adDirectory,
 				tokenReviewer, subectAccessReviewer, secureServingInfo, proxyConfig)
 			if err != nil {
 				return err

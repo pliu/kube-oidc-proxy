@@ -58,9 +58,9 @@ type Config struct {
 
 type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
 
-// groupAugmenter is the source of the groups a request is impersonated with
+// GroupAugmenter is the source of the groups a request is impersonated with
 // when the groups of the token are not to be trusted.
-type groupAugmenter interface {
+type GroupAugmenter interface {
 	// Groups returns the groups held by the given user, and whether the user
 	// is known to the backend at all.
 	Groups(username string) ([]string, bool)
@@ -91,7 +91,7 @@ type Proxy struct {
 	auditor               *audit.Audit
 
 	// adDirectory is nil unless Active Directory group augmentation is enabled.
-	adDirectory groupAugmenter
+	adDirectory GroupAugmenter
 
 	restConfig            *rest.Config
 	clientTransport       http.RoundTripper
@@ -117,7 +117,7 @@ func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
 func New(restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
-	adOptions *options.ADOptions,
+	adDirectory GroupAugmenter,
 	tokenReviewer *tokenreview.TokenReview,
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
 	ssinfo *server.SecureServingInfo,
@@ -174,22 +174,8 @@ func New(restConfig *rest.Config,
 		oidcRequestAuther:     bearertoken.New(tokenAuther),
 		tokenAuther:           tokenAuther,
 		auditor:               auditor,
-	}
-
-	// Set up the Active Directory backend that the groups of a request are
-	// augmented from, if enabled.
-	if adOptions != nil && adOptions.Enabled {
-		adConfig, err := adOptions.Config(oidcOptions.UsernamePrefix)
-		if err != nil {
-			return nil, err
-		}
-
-		adDirectory, err := ad.New(adConfig)
-		if err != nil {
-			return nil, err
-		}
-
-		p.adDirectory = adDirectory
+		// Nil unless Active Directory group augmentation is configured.
+		adDirectory: adDirectory,
 	}
 
 	return p, nil
