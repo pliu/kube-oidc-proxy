@@ -1,7 +1,8 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
 
-// Package ad augments the groups of an authenticated user with the groups they
-// are a member of in one or more Active Directory (or any LDAP v3) backends.
+// Package ldap augments the groups of an authenticated user with the groups
+// they are a member of in one or more LDAP v3 directories - Active Directory,
+// or anything else that exposes a memberOf attribute.
 //
 // The full user -> group mapping is built up front from every configured
 // backend and merged into one, held in memory. It is rebuilt on an interval,
@@ -11,7 +12,7 @@
 // The built mapping can also be persisted, so that a proxy restarted while the
 // directories are unreachable serves the last mapping it built rather than
 // stripping every user of their groups.
-package ad
+package ldap
 
 import (
 	"crypto/tls"
@@ -25,10 +26,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-ldap/ldap/v3"
+	goldap "github.com/go-ldap/ldap/v3"
 	"k8s.io/klog/v2"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
 const (
@@ -51,14 +52,14 @@ const (
 
 // ErrNoBackends is returned when there is no directory to build a mapping
 // from. Every other configuration problem is reported by Config.Validate.
-var ErrNoBackends = errors.New("no Active Directory backends configured")
+var ErrNoBackends = errors.New("no LDAP backends configured")
 
-// conn is the subset of *ldap.Conn used by a backend, so that the search
+// conn is the subset of *goldap.Conn used by a backend, so that the search
 // behaviour can be exercised without a live directory.
 type conn interface {
 	StartTLS(*tls.Config) error
 	Bind(username, password string) error
-	SearchWithPaging(req *ldap.SearchRequest, pagingSize uint32) (*ldap.SearchResult, error)
+	SearchWithPaging(req *goldap.SearchRequest, pagingSize uint32) (*goldap.SearchResult, error)
 	Close() error
 }
 
@@ -210,10 +211,10 @@ func (d *Directory) Run(stopCh <-chan struct{}) error {
 
 	if err := d.Refresh(); err != nil {
 		if !restored {
-			return fmt.Errorf("failed to build initial Active Directory mapping: %s", err)
+			return fmt.Errorf("failed to build initial LDAP mapping: %s", err)
 		}
 
-		klog.Errorf("failed to build initial Active Directory mapping, serving the mapping persisted in %s: %s",
+		klog.Errorf("failed to build initial LDAP mapping, serving the mapping persisted in %s: %s",
 			d.cache, err)
 	}
 
@@ -230,7 +231,7 @@ func (d *Directory) Run(stopCh <-chan struct{}) error {
 				if err := d.Refresh(); err != nil {
 					// Keep serving the previous mapping rather than failing
 					// every request while a directory is unreachable.
-					klog.Errorf("failed to refresh Active Directory mapping, keeping previous mapping: %s", err)
+					klog.Errorf("failed to refresh LDAP mapping, keeping previous mapping: %s", err)
 				}
 			}
 		}
@@ -262,7 +263,7 @@ func (d *Directory) Refresh() error {
 		Backends:    backendStats,
 	})
 
-	klog.V(2).Infof("refreshed Active Directory mapping from %d backends: %d users, %d groups (%s)",
+	klog.V(2).Infof("refreshed LDAP mapping from %d backends: %d users, %d groups (%s)",
 		len(d.backends), len(mapping), groups, time.Since(start))
 
 	d.persist(mapping, groups, start, backendStats)
@@ -359,7 +360,7 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 			Duration: time.Since(start).String(),
 		})
 
-		klog.V(4).Infof("built Active Directory mapping from backend %q: %d users, %d groups (%s)",
+		klog.V(4).Infof("built LDAP mapping from backend %q: %d users, %d groups (%s)",
 			b.config.Name, len(built), builtGroups, time.Since(start))
 	}
 
@@ -469,7 +470,7 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 	groupNames := make(map[string]string)
 
 	for _, base := range b.config.GroupSearchBases {
-		req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
 			0, 0, false, b.config.GroupFilter, []string{b.config.GroupNameAttribute}, nil)
 
 		res, err := c.SearchWithPaging(req, pageSize)
@@ -497,7 +498,7 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 	mapping := make(map[string][]string)
 
 	for _, base := range b.config.UserSearchBases {
-		req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
 			0, 0, false, b.config.UserFilter,
 			[]string{b.config.UsernameAttribute, memberOfAttribute}, nil)
 
@@ -563,7 +564,7 @@ func (b *backend) connect() (conn, error) {
 }
 
 func (b *backend) dialLDAP(url string) (conn, error) {
-	return ldap.DialURL(url, ldap.DialWithTLSConfig(b.tlsConfig))
+	return goldap.DialURL(url, goldap.DialWithTLSConfig(b.tlsConfig))
 }
 
 func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {

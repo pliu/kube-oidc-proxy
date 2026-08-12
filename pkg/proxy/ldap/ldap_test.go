@@ -1,5 +1,5 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package ad
+package ldap
 
 import (
 	"context"
@@ -15,14 +15,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-ldap/ldap/v3"
+	goldap "github.com/go-ldap/ldap/v3"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
 type fakeConn struct {
 	// entries maps a search base to the entries returned for it.
-	entries map[string][]*ldap.Entry
+	entries map[string][]*goldap.Entry
 
 	searchErr error
 	bindErr   error
@@ -41,11 +41,11 @@ func (f *fakeConn) Bind(username, password string) error {
 	return nil
 }
 
-func (f *fakeConn) SearchWithPaging(req *ldap.SearchRequest, pagingSize uint32) (*ldap.SearchResult, error) {
+func (f *fakeConn) SearchWithPaging(req *goldap.SearchRequest, pagingSize uint32) (*goldap.SearchResult, error) {
 	if f.searchErr != nil {
 		return nil, f.searchErr
 	}
-	return &ldap.SearchResult{Entries: f.entries[req.BaseDN]}, nil
+	return &goldap.SearchResult{Entries: f.entries[req.BaseDN]}, nil
 }
 
 func (f *fakeConn) Close() error {
@@ -53,10 +53,10 @@ func (f *fakeConn) Close() error {
 	return nil
 }
 
-func entry(dn string, attrs map[string][]string) *ldap.Entry {
-	e := &ldap.Entry{DN: dn}
+func entry(dn string, attrs map[string][]string) *goldap.Entry {
+	e := &goldap.Entry{DN: dn}
 	for name, values := range attrs {
-		e.Attributes = append(e.Attributes, &ldap.EntryAttribute{Name: name, Values: values})
+		e.Attributes = append(e.Attributes, &goldap.EntryAttribute{Name: name, Values: values})
 	}
 	return e
 }
@@ -78,7 +78,7 @@ func testBackend(name string) *BackendConfig {
 
 func testConfig(backends ...*BackendConfig) *Config {
 	if len(backends) == 0 {
-		backends = []*BackendConfig{testBackend("ad")}
+		backends = []*BackendConfig{testBackend("ldap")}
 	}
 
 	return &Config{
@@ -111,7 +111,7 @@ func newTestDirectory(t *testing.T, config *Config, conns ...conn) *Directory {
 // connWithUsers returns a fake connection holding one group per name in groups
 // and one user per key in users, membered into the named groups.
 func connWithUsers(groups []string, users map[string][]string) *fakeConn {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{}}
+	c := &fakeConn{entries: map[string][]*goldap.Entry{}}
 
 	for _, group := range groups {
 		c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
@@ -139,14 +139,14 @@ func TestNewValidatesConfig(t *testing.T) {
 		mutate func(*Config)
 		expErr string
 	}{
-		"no backends":             {func(c *Config) { c.Backends = nil }, "no Active Directory backends configured"},
+		"no backends":             {func(c *Config) { c.Backends = nil }, "no LDAP backends configured"},
 		"no name":                 {func(c *Config) { c.Backends[0].Name = "" }, "name must be set"},
 		"no URL":                  {func(c *Config) { c.Backends[0].URLs = nil }, "at least one url must be set"},
 		"no user search base":     {func(c *Config) { c.Backends[0].UserSearchBases = nil }, "at least one userSearchBase must be set"},
 		"no group search base":    {func(c *Config) { c.Backends[0].GroupSearchBases = nil }, "at least one groupSearchBase must be set"},
 		"a zero refresh interval": {func(c *Config) { c.RefreshInterval = NewDuration(0) }, "refreshInterval must be a positive duration"},
 		"duplicate names": {
-			func(c *Config) { c.Backends = append(c.Backends, testBackend("ad")) },
+			func(c *Config) { c.Backends = append(c.Backends, testBackend("ldap")) },
 			"duplicate backend name",
 		},
 	}
@@ -169,7 +169,7 @@ func TestNewValidatesConfig(t *testing.T) {
 }
 
 func TestRefreshBuildsMapping(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
+	c := &fakeConn{entries: map[string][]*goldap.Entry{
 		"OU=Groups,DC=example,DC=net": {
 			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
 			entry("CN=devs,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"devs"}}),
@@ -235,8 +235,8 @@ func TestRefreshBuildsMapping(t *testing.T) {
 	if stats.Source != SourceDirectory {
 		t.Errorf("expected the mapping to be sourced from %q, got %q", SourceDirectory, stats.Source)
 	}
-	if len(stats.Backends) != 1 || stats.Backends[0].Name != "ad" || stats.Backends[0].Users != 2 {
-		t.Errorf("expected per backend stats for 2 users of backend \"ad\", got %+v", stats.Backends)
+	if len(stats.Backends) != 1 || stats.Backends[0].Name != "ldap" || stats.Backends[0].Users != 2 {
+		t.Errorf("expected per backend stats for 2 users of backend \"ldap\", got %+v", stats.Backends)
 	}
 }
 
@@ -400,7 +400,7 @@ func TestRefreshFailsWhenABackendStopsReturningGroups(t *testing.T) {
 // A backend that has never returned anything is a configuration to fix, not a
 // mapping to protect. Failing on it would leave the proxy unable to start.
 func TestRefreshAcceptsABackendThatWasAlwaysEmpty(t *testing.T) {
-	d := newTestDirectory(t, testConfig(), &fakeConn{entries: map[string][]*ldap.Entry{}})
+	d := newTestDirectory(t, testConfig(), &fakeConn{entries: map[string][]*goldap.Entry{}})
 
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing an empty directory: %s", err)
@@ -440,7 +440,7 @@ func TestRefreshAcceptsABackendThatShrinks(t *testing.T) {
 // The group and memberOf attributes are not guaranteed to agree on the case or
 // spacing of a DN.
 func TestRefreshMatchesDNsLoosely(t *testing.T) {
-	c := &fakeConn{entries: map[string][]*ldap.Entry{
+	c := &fakeConn{entries: map[string][]*goldap.Entry{
 		"OU=Groups,DC=example,DC=net": {
 			entry("CN=admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
 		},
@@ -467,8 +467,8 @@ func TestRefreshMatchesDNsLoosely(t *testing.T) {
 func TestRefreshAppliesGroupPrefix(t *testing.T) {
 	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
-	backend := testBackend("ad")
-	backend.GroupPrefix = "ad:"
+	backend := testBackend("ldap")
+	backend.GroupPrefix = "ldap:"
 
 	d := newTestDirectory(t, testConfig(backend), c)
 
@@ -477,8 +477,8 @@ func TestRefreshAppliesGroupPrefix(t *testing.T) {
 	}
 
 	groups, _ := d.Groups("alice@example.net")
-	if !reflect.DeepEqual(groups, []string{"ad:admins"}) {
-		t.Errorf("expected groups [ad:admins], got %v", groups)
+	if !reflect.DeepEqual(groups, []string{"ldap:admins"}) {
+		t.Errorf("expected groups [ldap:admins], got %v", groups)
 	}
 }
 
@@ -792,7 +792,7 @@ func TestRefreshPersistsMapping(t *testing.T) {
 		t.Error("expected the persisted mapping to record when it was built")
 	}
 
-	if !reflect.DeepEqual(snapshot.Backends, []SnapshotBackend{{Name: "ad", Users: 1, Groups: 1}}) {
+	if !reflect.DeepEqual(snapshot.Backends, []SnapshotBackend{{Name: "ldap", Users: 1, Groups: 1}}) {
 		t.Errorf("expected what each backend contributed to be persisted, got %v", snapshot.Backends)
 	}
 }
@@ -1099,7 +1099,7 @@ func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
 		"a changed group search base": {
 			func(c *Config) { c.Backends[0].GroupSearchBases = []string{"OU=Other,DC=example,DC=net"} }, true,
 		},
-		"a changed group prefix":  {func(c *Config) { c.Backends[0].GroupPrefix = "ad:" }, true},
+		"a changed group prefix":  {func(c *Config) { c.Backends[0].GroupPrefix = "ldap:" }, true},
 		"a changed user filter":   {func(c *Config) { c.Backends[0].UserFilter = "(objectClass=person)" }, true},
 		"an added backend":        {func(c *Config) { c.Backends = append(c.Backends, testBackend("second")) }, true},
 		"a rotated password":      {func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},

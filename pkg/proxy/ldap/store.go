@@ -1,12 +1,12 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package ad
+package ldap
 
 import (
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
 // NewCacheStore builds the store the mapping is persisted to. It returns a nil

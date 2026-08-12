@@ -1,4 +1,4 @@
-# Active Directory Group Augmentation
+# LDAP Group Augmentation
 
 By default, kube-oidc-proxy takes both the user name and the groups of a request
 from the JWT presented by the user. Some identity providers issue tokens that do
@@ -6,9 +6,10 @@ not carry group claims at all, or carry a truncated set of them (Azure AD, for
 example, replaces the `groups` claim with a link once a user is a member of more
 than a few groups).
 
-kube-oidc-proxy can instead pull the groups from one or more Active Directory
-(or any LDAP v3) backends. When enabled, the user name of a request is still
-taken from the JWT, but the groups are taken from the directories.
+kube-oidc-proxy can instead pull the groups from one or more LDAP v3 directories
+- Active Directory, or OpenLDAP with the `memberof` overlay, or anything else
+that exposes a `memberOf` attribute. When enabled, the user name of a request is
+still taken from the JWT, but the groups are taken from the directories.
 
 ## How it works
 
@@ -42,7 +43,7 @@ at the previous rebuild fails the rebuild instead, and the previous mapping keep
 serving:
 
 ```
-failed to refresh Active Directory mapping, keeping previous mapping: backend "corp": returned no users, having returned 1401 at the last refresh
+failed to refresh LDAP mapping, keeping previous mapping: backend "corp": returned no users, having returned 1401 at the last refresh
 ```
 
 Only a fall to nothing is caught, not a directory that merely shrinks - any
@@ -62,11 +63,11 @@ Augmentation is configured by a JSON file rather than by flags, since it
 describes a list of backends. Point the proxy at one with a single flag:
 
 ```
---ad-config-file=/etc/kube-oidc-proxy/ad.json
+--ldap-config-file=/etc/kube-oidc-proxy/ldap.json
 ```
 
 Setting the flag is what enables augmentation. The file is checked against a
-[JSON schema](../../pkg/proxy/ad/schema.json) at startup, and the proxy refuses
+[JSON schema](../../pkg/proxy/ldap/schema.json) at startup, and the proxy refuses
 to start if it does not match - a misspelled property is an error rather than a
 silently ignored line.
 
@@ -77,9 +78,9 @@ A minimal configuration:
   "backends": [
     {
       "name": "corp",
-      "urls": ["ldaps://ad.example.net:636"],
+      "urls": ["ldaps://ldap.example.net:636"],
       "bindDN": "CN=kube-oidc-proxy,OU=Service Accounts,DC=example,DC=net",
-      "bindPasswordFile": "/etc/kube-oidc-proxy/ad-password",
+      "bindPasswordFile": "/etc/kube-oidc-proxy/ldap-password",
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
@@ -94,10 +95,10 @@ And one using every field, two directories and a persisted mapping:
   "backends": [
     {
       "name": "corp",
-      "urls": ["ldaps://ad-1.example.net:636", "ldaps://ad-2.example.net:636"],
+      "urls": ["ldaps://ldap-1.example.net:636", "ldaps://ldap-2.example.net:636"],
       "bindDN": "CN=kube-oidc-proxy,OU=Service Accounts,DC=example,DC=net",
-      "bindPasswordFile": "/etc/kube-oidc-proxy/ad-password",
-      "caFile": "/etc/kube-oidc-proxy/ad-ca.pem",
+      "bindPasswordFile": "/etc/kube-oidc-proxy/ldap-password",
+      "caFile": "/etc/kube-oidc-proxy/ldap-ca.pem",
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "userFilter": "(objectClass=user)",
       "usernameAttribute": "userPrincipalName",
@@ -124,7 +125,7 @@ And one using every field, two directories and a persisted mapping:
     "type": "kubernetesSecret",
     "maxAge": "24h",
     "kubernetesSecret": {
-      "name": "kube-oidc-proxy-ad-mapping"
+      "name": "kube-oidc-proxy-ldap-mapping"
     }
   }
 }
@@ -222,7 +223,7 @@ password or changing a URL does not discard it.
 ### `file`
 
 ```json
-"cache": {"type": "file", "file": {"path": "/var/lib/kube-oidc-proxy/ad-mapping.json"}}
+"cache": {"type": "file", "file": {"path": "/var/lib/kube-oidc-proxy/ldap-mapping.json"}}
 ```
 
 The file is written atomically, with mode `0600`, and its parent directory is
@@ -233,7 +234,7 @@ cache exists for.
 ### `kubernetesSecret`
 
 ```json
-"cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "kube-oidc-proxy-ad-mapping"}}
+"cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "kube-oidc-proxy-ldap-mapping"}}
 ```
 
 The Secret is created if it does not exist, and only the configured key is
@@ -251,7 +252,7 @@ This needs RBAC beyond what the proxy otherwise uses, scoped to the one Secret:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: kube-oidc-proxy-ad-mapping
+  name: kube-oidc-proxy-ldap-mapping
   namespace: kube-oidc-proxy
 rules:
 - apiGroups: [""]
@@ -259,7 +260,7 @@ rules:
   verbs: ["create"]
 - apiGroups: [""]
   resources: ["secrets"]
-  resourceNames: ["kube-oidc-proxy-ad-mapping"]
+  resourceNames: ["kube-oidc-proxy-ldap-mapping"]
   verbs: ["get", "update"]
 ```
 
@@ -274,7 +275,7 @@ to the refresh endpoint on the proxy:
 
 ```
 $ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
-    https://kube-oidc-proxy.example.net/kube-oidc-proxy/ad/refresh
+    https://kube-oidc-proxy.example.net/kube-oidc-proxy/ldap/refresh
 {"users":1423,"groups":97,"lastRefresh":"2021-11-25T01:05:17Z","duration":"1.82s","source":"directory","backends":[{"name":"corp","users":1401,"groups":91,"duration":"1.74s"},{"name":"partners","users":22,"groups":6,"duration":"0.08s"}]}
 ```
 

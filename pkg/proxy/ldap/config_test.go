@@ -1,5 +1,5 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package ad
+package ldap
 
 import (
 	"encoding/json"
@@ -15,7 +15,7 @@ const minimalConfig = `{
   "backends": [
     {
       "name": "corp",
-      "urls": ["ldaps://ad.example.net:636"],
+      "urls": ["ldaps://ldap.example.net:636"],
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
@@ -62,7 +62,7 @@ func TestParseConfigReadsEveryField(t *testing.T) {
       "urls": ["ldaps://one.example.net:636", "ldaps://two.example.net:636"],
       "bindDN": "CN=svc,DC=example,DC=net",
       "bindPassword": "password",
-      "caFile": "/etc/kube-oidc-proxy/ad-ca.pem",
+      "caFile": "/etc/kube-oidc-proxy/ldap-ca.pem",
       "startTLS": true,
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "userFilter": "(objectClass=person)",
@@ -87,7 +87,7 @@ func TestParseConfigReadsEveryField(t *testing.T) {
   "cache": {
     "type": "kubernetesSecret",
     "maxAge": "24h",
-    "kubernetesSecret": {"name": "ad-mapping", "namespace": "kube-oidc-proxy"}
+    "kubernetesSecret": {"name": "ldap-mapping", "namespace": "kube-oidc-proxy"}
   }
 }`
 
@@ -147,60 +147,60 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			"refreshIntervals",
 		},
 		"a misspelled backend property": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBase": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
 			"userSearchBase",
 		},
 		"a backend with no name": {
-			`{"backends": [{"urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
 			"name",
 		},
 		"a url of the wrong scheme": {
-			`{"backends": [{"name": "corp", "urls": ["https://ad.example.net"],
+			`{"backends": [{"name": "corp", "urls": ["https://ldap.example.net"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
 			"pattern",
 		},
 		"a duration of the wrong shape": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "refreshInterval": "10 minutes"}`,
 			"pattern",
 		},
 		"a refresh interval given as a number": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "refreshInterval": 600}`,
 			"string",
 		},
 		"an unknown cache type": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "redis"}}`,
 			"must be one of",
 		},
 		"a file cache with no file block": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "file"}}`,
 			"file",
 		},
 		"a Secret cache with no kubernetesSecret block": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "kubernetesSecret"}}`,
 			"kubernetesSecret",
 		},
 		"a Secret name that is not a valid object name": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "Not A Name"}}}`,
@@ -240,7 +240,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			"duplicate backend name",
 		},
 		"both a bind password and a bind password file": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "bindDN": "CN=svc,DC=example,DC=net",
 			  "bindPassword": "password", "bindPasswordFile": "/etc/password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
@@ -248,21 +248,21 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			"cannot set both bindPassword and bindPasswordFile",
 		},
 		"a bind password with no bind DN": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "bindPassword": "password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
 			"without a bindDN",
 		},
 		"both a CA file and skipped verification": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "caFile": "/etc/ca.pem", "insecureSkipTLSVerify": true,
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
 			"cannot set both caFile and insecureSkipTLSVerify",
 		},
 		"a refresh interval of zero": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ad.example.net:636"],
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "refreshInterval": "0s"}`,
@@ -286,7 +286,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 
 func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "ad.json")
+	path := filepath.Join(dir, "ldap.json")
 
 	if err := os.WriteFile(path, []byte(minimalConfig), 0600); err != nil {
 		t.Fatalf("unexpected error writing config: %s", err)

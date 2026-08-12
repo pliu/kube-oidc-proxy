@@ -15,10 +15,10 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 )
 
-// fakeAugmenter stands in for a live Active Directory backend.
+// fakeAugmenter stands in for a live LDAP backend.
 type fakeAugmenter struct {
 	mapping  map[string][]string
 	fallback bool
@@ -59,8 +59,8 @@ func (f *fakeAugmenter) Refresh() error {
 	return f.refreshErr
 }
 
-func (f *fakeAugmenter) Stats() *ad.Stats {
-	return &ad.Stats{Users: len(f.mapping)}
+func (f *fakeAugmenter) Stats() *ldap.Stats {
+	return &ldap.Stats{Users: len(f.mapping)}
 }
 
 // serveWithAD runs a request that authenticates as tokenUser through the full
@@ -132,7 +132,7 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 			p := newTestProxy(t)
 			defer p.ctrl.Finish()
 
-			p.adDirectory = &fakeAugmenter{mapping: test.mapping, fallback: test.fallback}
+			p.ldapDirectory = &fakeAugmenter{mapping: test.mapping, fallback: test.fallback}
 
 			p.fakeRT.expUser = test.tokenUser.GetName()
 			p.fakeRT.expGroup = test.expGroup
@@ -148,7 +148,7 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 }
 
 // With no directory configured the groups of the token must be used as before.
-func TestGroupsUnchangedWhenADDisabled(t *testing.T) {
+func TestGroupsUnchangedWhenLDAPDisabled(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
@@ -164,14 +164,14 @@ func TestGroupsUnchangedWhenADDisabled(t *testing.T) {
 	}
 }
 
-func TestADRefreshEndpoint(t *testing.T) {
+func TestLDAPRefreshEndpoint(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
 	directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
-	p.adDirectory = directory
+	p.ldapDirectory = directory
 
-	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
@@ -182,7 +182,7 @@ func TestADRefreshEndpoint(t *testing.T) {
 		t.Errorf("expected exactly one refresh, got %d", directory.refreshCount)
 	}
 
-	var stats ad.Stats
+	var stats ldap.Stats
 	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
 		t.Fatalf("failed to decode response: %s", err)
 	}
@@ -192,7 +192,7 @@ func TestADRefreshEndpoint(t *testing.T) {
 	}
 }
 
-func TestADRefreshEndpointAllowedUsers(t *testing.T) {
+func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 	tests := map[string]struct {
 		refreshUsers []string
 		requester    string
@@ -232,9 +232,9 @@ func TestADRefreshEndpointAllowedUsers(t *testing.T) {
 			defer p.ctrl.Finish()
 
 			directory := &fakeAugmenter{refreshUsers: test.refreshUsers}
-			p.adDirectory = directory
+			p.ldapDirectory = directory
 
-			resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+			resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
 				&user.DefaultInfo{Name: test.requester})
 
 			if resp.StatusCode != test.expCode {
@@ -252,14 +252,14 @@ func TestADRefreshEndpointAllowedUsers(t *testing.T) {
 
 // The endpoint sits behind authentication, so an unauthenticated request must
 // not be able to trigger a refresh.
-func TestADRefreshEndpointRequiresAuthentication(t *testing.T) {
+func TestLDAPRefreshEndpointRequiresAuthentication(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
 	directory := &fakeAugmenter{}
-	p.adDirectory = directory
+	p.ldapDirectory = directory
 
-	req := newADRequest(ADRefreshPath, http.MethodPost)
+	req := newADRequest(LDAPRefreshPath, http.MethodPost)
 	req.Header = http.Header{}
 
 	resp := serveWithAD(t, p, req, nil)
@@ -274,14 +274,14 @@ func TestADRefreshEndpointRequiresAuthentication(t *testing.T) {
 	}
 }
 
-func TestADRefreshEndpointRejectsGET(t *testing.T) {
+func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
 	directory := &fakeAugmenter{}
-	p.adDirectory = directory
+	p.ldapDirectory = directory
 
-	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodGet),
+	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodGet),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -294,13 +294,13 @@ func TestADRefreshEndpointRejectsGET(t *testing.T) {
 	}
 }
 
-func TestADRefreshEndpointReportsFailure(t *testing.T) {
+func TestLDAPRefreshEndpointReportsFailure(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
-	p.adDirectory = &fakeAugmenter{refreshErr: errors.New("directory is down")}
+	p.ldapDirectory = &fakeAugmenter{refreshErr: errors.New("directory is down")}
 
-	resp := serveWithAD(t, p, newADRequest(ADRefreshPath, http.MethodPost),
+	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusInternalServerError {
@@ -311,16 +311,16 @@ func TestADRefreshEndpointReportsFailure(t *testing.T) {
 
 // The refresh path is not a valid API server path, but a request to a path
 // that merely looks like it must still be proxied.
-func TestADRefreshPathIsNotProxied(t *testing.T) {
+func TestLDAPRefreshPathIsNotProxied(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
-	p.adDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
 
-	resp := serveWithAD(t, p, newADRequest(ADRefreshPath+"/subpath", http.MethodPost),
+	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath+"/subpath", http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
@@ -334,7 +334,7 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
 
-	p.adDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 
 	in := &user.DefaultInfo{
 		Name:   "alice@example.net",

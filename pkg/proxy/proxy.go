@@ -21,10 +21,10 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
@@ -34,9 +34,9 @@ const (
 	UserHeaderClientIPKey = "Remote-Client-IP"
 	timestampLayout       = "2006-01-02T15:04:05-0700"
 
-	// ADRefreshPath is the path an authenticated user can POST to in order to
-	// trigger a rebuild of the Active Directory user to group mapping.
-	ADRefreshPath = "/kube-oidc-proxy/ad/refresh"
+	// LDAPRefreshPath is the path an authenticated user can POST to in order to
+	// trigger a rebuild of the LDAP user to group mapping.
+	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
 )
 
 var (
@@ -79,7 +79,7 @@ type GroupAugmenter interface {
 	// Refresh rebuilds the mapping on demand.
 	Refresh() error
 
-	Stats() *ad.Stats
+	Stats() *ldap.Stats
 }
 
 type Proxy struct {
@@ -90,8 +90,8 @@ type Proxy struct {
 	secureServingInfo     *server.SecureServingInfo
 	auditor               *audit.Audit
 
-	// adDirectory is nil unless Active Directory group augmentation is enabled.
-	adDirectory GroupAugmenter
+	// ldapDirectory is nil unless LDAP group augmentation is enabled.
+	ldapDirectory GroupAugmenter
 
 	restConfig            *rest.Config
 	clientTransport       http.RoundTripper
@@ -117,7 +117,7 @@ func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
 func New(restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
-	adDirectory GroupAugmenter,
+	ldapDirectory GroupAugmenter,
 	tokenReviewer *tokenreview.TokenReview,
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
 	ssinfo *server.SecureServingInfo,
@@ -174,8 +174,8 @@ func New(restConfig *rest.Config,
 		oidcRequestAuther:     bearertoken.New(tokenAuther),
 		tokenAuther:           tokenAuther,
 		auditor:               auditor,
-		// Nil unless Active Directory group augmentation is configured.
-		adDirectory: adDirectory,
+		// Nil unless LDAP group augmentation is configured.
+		ldapDirectory: ldapDirectory,
 	}
 
 	return p, nil
@@ -240,8 +240,8 @@ func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan stru
 
 	// Build the initial user -> group mapping before serving any requests,
 	// then keep it refreshed in the background.
-	if p.adDirectory != nil {
-		if err := p.adDirectory.Run(stopCh); err != nil {
+	if p.ldapDirectory != nil {
+		if err := p.ldapDirectory.Run(stopCh); err != nil {
 			return nil, nil, err
 		}
 	}

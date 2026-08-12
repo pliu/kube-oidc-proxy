@@ -22,7 +22,7 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	// Set up proxy handlers
 	handler = p.auditor.WithRequest(handler)
 	handler = p.withImpersonateRequest(handler)
-	handler = p.withADRefresh(handler)
+	handler = p.withLDAPRefresh(handler)
 	handler = p.withAuthenticateRequest(handler)
 
 	// Add the auditor backend as a shutdown hook
@@ -86,13 +86,13 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 	})
 }
 
-// withADRefresh serves the endpoint that triggers a rebuild of the Active
-// Directory user to group mapping. It sits after authentication in the chain,
+// withLDAPRefresh serves the endpoint that triggers a rebuild of the LDAP user
+// to group mapping. It sits after authentication in the chain,
 // so only authenticated users can trigger a refresh. The path is not a valid
 // API server path, so it can never shadow a request meant for Kubernetes.
-func (p *Proxy) withADRefresh(handler http.Handler) http.Handler {
+func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if p.adDirectory == nil || req.URL.Path != ADRefreshPath {
+		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath {
 			handler.ServeHTTP(rw, req)
 			return
 		}
@@ -114,41 +114,41 @@ func (p *Proxy) withADRefresh(handler http.Handler) http.Handler {
 			return
 		}
 
-		if !p.adDirectory.CanRefresh(requester.GetName()) {
-			klog.V(2).Infof("user %q is not allowed to trigger an Active Directory refresh (%s)",
+		if !p.ldapDirectory.CanRefresh(requester.GetName()) {
+			klog.V(2).Infof("user %q is not allowed to trigger an LDAP refresh (%s)",
 				requester.GetName(), remoteAddr)
-			http.Error(rw, "Not allowed to trigger an Active Directory refresh", http.StatusForbidden)
+			http.Error(rw, "Not allowed to trigger an LDAP refresh", http.StatusForbidden)
 			return
 		}
 
-		klog.V(2).Infof("Active Directory refresh requested by %q (%s)",
+		klog.V(2).Infof("LDAP refresh requested by %q (%s)",
 			requester.GetName(), remoteAddr)
 
-		if err := p.adDirectory.Refresh(); err != nil {
-			klog.Errorf("failed to refresh Active Directory mapping (%s): %s", remoteAddr, err)
-			http.Error(rw, "Failed to refresh Active Directory mapping", http.StatusInternalServerError)
+		if err := p.ldapDirectory.Refresh(); err != nil {
+			klog.Errorf("failed to refresh LDAP mapping (%s): %s", remoteAddr, err)
+			http.Error(rw, "Failed to refresh LDAP mapping", http.StatusInternalServerError)
 			return
 		}
 
 		rw.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(rw).Encode(p.adDirectory.Stats()); err != nil {
-			klog.Errorf("failed to write Active Directory refresh response (%s): %s", remoteAddr, err)
+		if err := json.NewEncoder(rw).Encode(p.ldapDirectory.Stats()); err != nil {
+			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)
 		}
 	})
 }
 
 // augmentGroups replaces the groups of the given user with the groups they
-// hold in the Active Directory backend.
+// hold in the LDAP directories.
 func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
-	groups, ok := p.adDirectory.Groups(u.GetName())
+	groups, ok := p.ldapDirectory.Groups(u.GetName())
 	if !ok {
-		if p.adDirectory.FallbackToTokenGroups() {
-			klog.V(4).Infof("user %q not found in Active Directory, falling back to token groups (%s)",
+		if p.ldapDirectory.FallbackToTokenGroups() {
+			klog.V(4).Infof("user %q not found in LDAP, falling back to token groups (%s)",
 				u.GetName(), remoteAddr)
 			return u
 		}
 
-		klog.V(4).Infof("user %q not found in Active Directory, dropping token groups (%s)",
+		klog.V(4).Infof("user %q not found in LDAP, dropping token groups (%s)",
 			u.GetName(), remoteAddr)
 	}
 
@@ -194,7 +194,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// Keep the name from the token but take the groups from the directory.
 		// This happens before the impersonation check below so that the
 		// authorization decision is made against the directory groups too.
-		if p.adDirectory != nil {
+		if p.ldapDirectory != nil {
 			user = p.augmentGroups(user, remoteAddr)
 		}
 

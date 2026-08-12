@@ -22,7 +22,7 @@ func testSecretStore(t *testing.T, objects ...runtime.Object) (*Secret, *fake.Cl
 
 	client := fake.NewSimpleClientset(objects...)
 
-	store, err := NewSecret(client, "kube-oidc-proxy", "ad-mapping", "mapping.json.gz")
+	store, err := NewSecret(client, "kube-oidc-proxy", "ldap-mapping", "mapping.json.gz")
 	if err != nil {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
@@ -52,7 +52,7 @@ func TestSecretRoundTrips(t *testing.T) {
 
 	// The Secret must have been created rather than the save failing.
 	secret, err := client.CoreV1().Secrets("kube-oidc-proxy").Get(
-		context.Background(), "ad-mapping", metav1.GetOptions{})
+		context.Background(), "ldap-mapping", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error getting the Secret: %s", err)
 	}
@@ -84,7 +84,7 @@ func TestSecretRoundTrips(t *testing.T) {
 // The proxy must not stamp on the other keys of a Secret it shares.
 func TestSecretSaveKeepsOtherKeys(t *testing.T) {
 	store, client := testSecretStore(t, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "ad-mapping", Namespace: "kube-oidc-proxy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ldap-mapping", Namespace: "kube-oidc-proxy"},
 		Data:       map[string][]byte{"unrelated": []byte("keep me")},
 	})
 
@@ -93,7 +93,7 @@ func TestSecretSaveKeepsOtherKeys(t *testing.T) {
 	}
 
 	secret, err := client.CoreV1().Secrets("kube-oidc-proxy").Get(
-		context.Background(), "ad-mapping", metav1.GetOptions{})
+		context.Background(), "ldap-mapping", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error getting the Secret: %s", err)
 	}
@@ -105,7 +105,7 @@ func TestSecretSaveKeepsOtherKeys(t *testing.T) {
 
 func TestSecretLoadTreatsAMissingKeyAsNothingPersisted(t *testing.T) {
 	store, _ := testSecretStore(t, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "ad-mapping", Namespace: "kube-oidc-proxy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ldap-mapping", Namespace: "kube-oidc-proxy"},
 		Data:       map[string][]byte{"unrelated": []byte("keep me")},
 	})
 
@@ -118,7 +118,7 @@ func TestSecretLoadTreatsAMissingKeyAsNothingPersisted(t *testing.T) {
 // going to be gzipped.
 func TestSecretLoadToleratesAnUncompressedPayload(t *testing.T) {
 	store, _ := testSecretStore(t, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "ad-mapping", Namespace: "kube-oidc-proxy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ldap-mapping", Namespace: "kube-oidc-proxy"},
 		Data:       map[string][]byte{"mapping.json.gz": []byte(`{"version":1}`)},
 	})
 
@@ -136,7 +136,7 @@ func TestSecretLoadToleratesAnUncompressedPayload(t *testing.T) {
 // conflict is expected rather than exceptional.
 func TestSecretSaveRetriesOnConflict(t *testing.T) {
 	store, client := testSecretStore(t, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "ad-mapping", Namespace: "kube-oidc-proxy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ldap-mapping", Namespace: "kube-oidc-proxy"},
 	})
 
 	var updates int
@@ -144,7 +144,7 @@ func TestSecretSaveRetriesOnConflict(t *testing.T) {
 		updates++
 		if updates == 1 {
 			return true, nil, apierrors.NewConflict(
-				corev1.Resource("secrets"), "ad-mapping", errors.New("the object has been modified"))
+				corev1.Resource("secrets"), "ldap-mapping", errors.New("the object has been modified"))
 		}
 
 		return false, nil, nil
@@ -180,11 +180,11 @@ func TestSecretSaveHandlesALostCreateRace(t *testing.T) {
 			// tracker is written directly: going back through the client here
 			// would deadlock against the lock the reactor is running under.
 			if err := client.Tracker().Add(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
-				Name: "ad-mapping", Namespace: "kube-oidc-proxy"}}); err != nil {
+				Name: "ldap-mapping", Namespace: "kube-oidc-proxy"}}); err != nil {
 				return true, nil, err
 			}
 
-			return true, nil, apierrors.NewAlreadyExists(corev1.Resource("secrets"), "ad-mapping")
+			return true, nil, apierrors.NewAlreadyExists(corev1.Resource("secrets"), "ldap-mapping")
 		}
 
 		return false, nil, nil
@@ -233,9 +233,9 @@ func TestNewSecretValidatesItsArguments(t *testing.T) {
 		namespace, name, key string
 		expErr               string
 	}{
-		"no client": {nil, "kube-oidc-proxy", "ad-mapping", "mapping.json.gz", "no Kubernetes client"},
+		"no client": {nil, "kube-oidc-proxy", "ldap-mapping", "mapping.json.gz", "no Kubernetes client"},
 		"no name":   {client, "kube-oidc-proxy", "", "mapping.json.gz", "no name configured"},
-		"no key":    {client, "kube-oidc-proxy", "ad-mapping", "", "no key configured"},
+		"no key":    {client, "kube-oidc-proxy", "ldap-mapping", "", "no key configured"},
 	}
 
 	for name, test := range tests {
@@ -265,7 +265,7 @@ func TestNewSecretValidatesItsArguments(t *testing.T) {
 func TestNewSecretDefaultsTheNamespace(t *testing.T) {
 	t.Setenv(namespaceEnvVar, "from-the-environment")
 
-	store, err := NewSecret(fake.NewSimpleClientset(), "", "ad-mapping", "mapping.json.gz")
+	store, err := NewSecret(fake.NewSimpleClientset(), "", "ldap-mapping", "mapping.json.gz")
 	if err != nil {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
@@ -274,7 +274,7 @@ func TestNewSecretDefaultsTheNamespace(t *testing.T) {
 		t.Errorf("expected the namespace to be taken from $%s, got %q", namespaceEnvVar, store.namespace)
 	}
 
-	if !strings.Contains(store.String(), "from-the-environment/ad-mapping") {
+	if !strings.Contains(store.String(), "from-the-environment/ldap-mapping") {
 		t.Errorf("expected the store to describe itself, got %q", store.String())
 	}
 }

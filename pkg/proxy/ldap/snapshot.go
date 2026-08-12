@@ -1,5 +1,5 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package ad
+package ldap
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ad/cache"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
 // snapshotVersion is bumped whenever a persisted mapping stops being readable
@@ -72,7 +72,7 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		Users:       mapping,
 	})
 	if err != nil {
-		klog.Errorf("failed to encode the Active Directory mapping to persist to %s: %s", d.cache, err)
+		klog.Errorf("failed to encode the LDAP mapping to persist to %s: %s", d.cache, err)
 		return
 	}
 
@@ -80,11 +80,11 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 	defer cancel()
 
 	if err := d.cache.Save(ctx, data); err != nil {
-		klog.Errorf("failed to persist the Active Directory mapping to %s: %s", d.cache, err)
+		klog.Errorf("failed to persist the LDAP mapping to %s: %s", d.cache, err)
 		return
 	}
 
-	klog.V(4).Infof("persisted Active Directory mapping of %d users to %s", len(mapping), d.cache)
+	klog.V(4).Infof("persisted LDAP mapping of %d users to %s", len(mapping), d.cache)
 }
 
 // restore installs the persisted mapping, if there is a usable one, and
@@ -100,17 +100,17 @@ func (d *Directory) restore() bool {
 
 	data, err := d.cache.Load(ctx)
 	if errors.Is(err, cache.ErrNotFound) {
-		klog.V(2).Infof("no Active Directory mapping persisted in %s yet", d.cache)
+		klog.V(2).Infof("no LDAP mapping persisted in %s yet", d.cache)
 		return false
 	}
 	if err != nil {
-		klog.Errorf("failed to load the Active Directory mapping persisted in %s: %s", d.cache, err)
+		klog.Errorf("failed to load the LDAP mapping persisted in %s: %s", d.cache, err)
 		return false
 	}
 
 	snapshot, err := d.decodeSnapshot(data)
 	if err != nil {
-		klog.Errorf("ignoring the Active Directory mapping persisted in %s: %s", d.cache, err)
+		klog.Errorf("ignoring the LDAP mapping persisted in %s: %s", d.cache, err)
 		return false
 	}
 
@@ -127,7 +127,7 @@ func (d *Directory) restore() bool {
 		Source:      SourceCache,
 	})
 
-	klog.Infof("loaded Active Directory mapping of %d users built %s ago from %s",
+	klog.Infof("loaded LDAP mapping of %d users built %s ago from %s",
 		len(mapping), time.Since(snapshot.BuiltAt).Truncate(time.Second), d.cache)
 
 	return true

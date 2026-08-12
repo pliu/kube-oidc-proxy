@@ -1,5 +1,5 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package ad
+package ldap
 
 import (
 	"bytes"
@@ -27,7 +27,7 @@ import (
 var Schema []byte
 
 // schemaURL is the identity the schema is compiled under. It is not fetched.
-const schemaURL = "https://github.com/jetstack/kube-oidc-proxy/schemas/ad-config.v1.json"
+const schemaURL = "https://github.com/jetstack/kube-oidc-proxy/schemas/ldap-config.v1.json"
 
 // Defaults applied to a configuration file that leaves a field out. They are
 // duplicated in the "default" keywords of the schema, which are documentation
@@ -50,7 +50,7 @@ const (
 	CacheTypeKubernetesSecret CacheType = "kubernetesSecret"
 )
 
-// Config is the decoded contents of an Active Directory configuration file.
+// Config is the decoded contents of an LDAP configuration file.
 type Config struct {
 	// Backends are the directories the mapping is built from. The mapping of
 	// every backend is merged into one, so a user held in more than one
@@ -168,18 +168,18 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// LoadConfig reads the Active Directory configuration from the given JSON
+// LoadConfig reads the LDAP configuration from the given JSON
 // file, checks it against the schema, applies defaults and validates the rules
 // the schema cannot express.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Active Directory config file %q: %s", path, err)
+		return nil, fmt.Errorf("failed to read LDAP config file %q: %s", path, err)
 	}
 
 	config, err := ParseConfig(data)
 	if err != nil {
-		return nil, fmt.Errorf("invalid Active Directory config file %q: %s", path, err)
+		return nil, fmt.Errorf("invalid LDAP config file %q: %s", path, err)
 	}
 
 	return config, nil
@@ -229,7 +229,7 @@ var compileSchema = sync.OnceValues(func() (*jsonschema.Schema, error) {
 func ValidateSchema(data []byte) error {
 	schema, err := compileSchema()
 	if err != nil {
-		return fmt.Errorf("failed to compile the Active Directory config schema: %s", err)
+		return fmt.Errorf("failed to compile the LDAP config schema: %s", err)
 	}
 
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
