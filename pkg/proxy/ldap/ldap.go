@@ -430,12 +430,6 @@ func (d *Directory) CanRefresh(username string) bool {
 	return false
 }
 
-// FallbackToTokenGroups reports whether users missing from every directory
-// keep the groups from their token.
-func (d *Directory) FallbackToTokenGroups() bool {
-	return d.config.FallbackToTokenGroups
-}
-
 func (d *Directory) Stats() *Stats {
 	return d.stats.Load()
 }

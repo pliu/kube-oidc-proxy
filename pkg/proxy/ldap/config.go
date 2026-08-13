@@ -63,8 +63,6 @@ type Config struct {
 	// leave the mapping refreshing on a schedule nobody asked for.
 	RefreshInterval *Duration `json:"refreshInterval,omitempty"`
 
-	FallbackToTokenGroups bool `json:"fallbackToTokenGroups,omitempty"`
-
 	// RefreshUsers is the set of users allowed to trigger a refresh. If empty,
 	// any authenticated user may trigger one.
 	RefreshUsers []string `json:"refreshUsers,omitempty"`

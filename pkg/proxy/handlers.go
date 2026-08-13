@@ -138,18 +138,19 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	})
 }
 
-// augmentGroups replaces the groups of the given user with the groups they
-// hold in the LDAP directories.
+// augmentGroups replaces the groups of the given user with the groups they hold
+// in the LDAP directories.
+//
+// A user held in none of them is given no groups at all, and so can do only
+// what system:authenticated allows. The groups of their token are not a
+// fallback: the directory being the only thing that decides group membership is
+// the whole point of augmenting, and a user who is missing because a directory
+// is misconfigured would otherwise quietly regain whatever their identity
+// provider claimed for them.
 func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
 	groups, ok := p.ldapDirectory.Groups(u.GetName())
 	if !ok {
-		if p.ldapDirectory.FallbackToTokenGroups() {
-			klog.V(4).Infof("user %q not found in LDAP, falling back to token groups (%s)",
-				u.GetName(), remoteAddr)
-			return u
-		}
-
-		klog.V(4).Infof("user %q not found in LDAP, dropping token groups (%s)",
+		klog.V(4).Infof("user %q is held in no directory, dropping the groups of their token (%s)",
 			u.GetName(), remoteAddr)
 	}
 

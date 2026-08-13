@@ -18,11 +18,6 @@
       "$ref": "#/$defs/duration",
       "default": "10m"
     },
-    "fallbackToTokenGroups": {
-      "description": "Whether a user that is in none of the directories keeps the groups of their token. By default such a user is given no groups.",
-      "type": "boolean",
-      "default": false
-    },
     "refreshUsers": {
       "description": "Users allowed to trigger a refresh of the mapping. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may trigger one.",
       "type": "array",

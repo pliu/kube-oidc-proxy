@@ -72,10 +72,6 @@ type GroupAugmenter interface {
 	// is known to the backend at all.
 	Groups(username string) ([]string, bool)
 
-	// FallbackToTokenGroups reports whether an unknown user keeps the groups
-	// of their token.
-	FallbackToTokenGroups() bool
-
 	// Run builds the initial mapping and keeps it refreshed until stopCh is
 	// closed.
 	Run(stopCh <-chan struct{}) error

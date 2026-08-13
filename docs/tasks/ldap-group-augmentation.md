@@ -142,7 +142,6 @@ And one using every field, two directories and a persisted mapping:
     }
   ],
   "refreshInterval": "10m",
-  "fallbackToTokenGroups": false,
   "refreshUsers": ["alice@example.net", "bob@example.net"],
   "cache": {
     "type": "kubernetesSecret",
@@ -160,7 +159,6 @@ And one using every field, two directories and a persisted mapping:
 | ----- | ------- | ----------- |
 | `backends` | | The directories to build the mapping from. At least one is required. |
 | `refreshInterval` | `10m` | How often the mapping is rebuilt. A Go duration string. |
-| `fallbackToTokenGroups` | `false` | Fall back to the groups of the JWT for users found in no directory. |
 | `refreshUsers` | | Users allowed to trigger a refresh. If unset, any authenticated user may. |
 | `cache` | | **Required.** Where the built mapping is persisted. See [below](#persisting-the-mapping). |
 
@@ -225,9 +223,16 @@ the user name before matching, so the directory can be keyed on the bare
 attribute value.
 
 A user that cannot be found in any directory is given no groups, and so will be
-able to do only what `system:authenticated` allows. Set
-`fallbackToTokenGroups` to have such a user keep the groups of their JWT
-instead.
+able to do only what `system:authenticated` allows. There is no way to have such
+a user keep the groups of their JWT: once the directory decides group
+membership, it decides it for everybody. A user who is missing because a search
+base is wrong or a directory is half configured would otherwise quietly regain
+whatever their identity provider claimed for them, which is the failure this
+whole feature exists to remove - and it would do so silently, at exactly the
+moment the configuration is wrong.
+
+A user who is genuinely absent from the directories and needs access wants an
+entry there, or an RBAC binding against their user name rather than a group.
 
 ### Group names
 

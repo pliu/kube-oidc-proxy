@@ -87,7 +87,6 @@ func TestParseConfigReadsEveryField(t *testing.T) {
     }
   ],
   "refreshInterval": "1h30m",
-  "fallbackToTokenGroups": true,
   "refreshUsers": ["alice@example.net"],
   "cache": {
     "type": "kubernetesSecret",
@@ -113,9 +112,6 @@ func TestParseConfigReadsEveryField(t *testing.T) {
 	}
 	if got := config.RefreshInterval.Duration(); got != time.Hour+time.Minute*30 {
 		t.Errorf("expected a refresh interval of 1h30m, got %s", got)
-	}
-	if !config.FallbackToTokenGroups {
-		t.Error("expected fallbackToTokenGroups to be set")
 	}
 	if got := config.Cache.MaxAge.Duration(); got != time.Hour*24 {
 		t.Errorf("expected a maxAge of 24h, got %s", got)
@@ -150,6 +146,18 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 		"a misspelled property": {
 			`{"backends": [], "refreshIntervals": "10m"}`,
 			"refreshIntervals",
+		},
+		// The directory is the only thing that decides group membership, so
+		// there is no longer a way to ask for the groups of the token. A file
+		// still carrying the old field is rejected rather than quietly served
+		// with the opposite behaviour to the one it asks for.
+		"the removed fallbackToTokenGroups property": {
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"},
+			  "fallbackToTokenGroups": true}`,
+			"fallbackToTokenGroups",
 		},
 		// Where the mapping is persisted has to be stated, because leaving it
 		// out gets a proxy that cannot start while a directory is down, and

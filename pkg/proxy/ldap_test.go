@@ -27,8 +27,7 @@ import (
 
 // fakeAugmenter stands in for a live LDAP backend.
 type fakeAugmenter struct {
-	mapping  map[string][]string
-	fallback bool
+	mapping map[string][]string
 
 	// refreshUsers is the set of users allowed to trigger a refresh. Empty
 	// allows everyone, as the real directory does.
@@ -56,8 +55,6 @@ func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
 	groups, ok := f.mapping[username]
 	return groups, ok
 }
-
-func (f *fakeAugmenter) FallbackToTokenGroups() bool { return f.fallback }
 
 func (f *fakeAugmenter) Run(stopCh <-chan struct{}) error { return nil }
 
@@ -105,8 +102,7 @@ func newADRequest(path string, method string) *http.Request {
 
 func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 	tests := map[string]struct {
-		mapping  map[string][]string
-		fallback bool
+		mapping map[string][]string
 
 		tokenUser *user.DefaultInfo
 		expGroup  []string
@@ -121,16 +117,18 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
 			expGroup:  []string{user.AllAuthenticated},
 		},
-		"an unknown user is given no groups by default": {
+		// There is no fallback to the groups of the token. A user the
+		// directories do not hold can do only what system:authenticated
+		// allows, however many groups their token claims.
+		"a user in no directory is given no groups": {
 			mapping:   map[string][]string{"bob@example.net": {"admins"}},
 			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
 			expGroup:  []string{user.AllAuthenticated},
 		},
-		"an unknown user keeps their token groups when falling back": {
+		"a user in no directory keeps none of the groups their token claims": {
 			mapping:   map[string][]string{"bob@example.net": {"admins"}},
-			fallback:  true,
-			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}},
-			expGroup:  []string{"from-token", user.AllAuthenticated},
+			tokenUser: &user.DefaultInfo{Name: "alice@example.net", Groups: []string{"cluster-admins", "from-token"}},
+			expGroup:  []string{user.AllAuthenticated},
 		},
 	}
 
@@ -139,7 +137,7 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 			p := newTestProxy(t)
 			defer p.ctrl.Finish()
 
-			p.ldapDirectory = &fakeAugmenter{mapping: test.mapping, fallback: test.fallback}
+			p.ldapDirectory = &fakeAugmenter{mapping: test.mapping}
 
 			p.fakeRT.expUser = test.tokenUser.GetName()
 			p.fakeRT.expGroup = test.expGroup
