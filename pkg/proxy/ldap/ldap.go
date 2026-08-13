@@ -189,7 +189,7 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 
 	refreshUsers := make(map[string]struct{}, len(config.RefreshUsers))
 	for _, username := range config.RefreshUsers {
-		refreshUsers[strings.ToLower(username)] = struct{}{}
+		refreshUsers[usernameKey(username, config.UsernamePrefix)] = struct{}{}
 	}
 
 	d := &Directory{
@@ -392,19 +392,8 @@ func (d *Directory) refresh() error {
 // true.
 func (d *Directory) Groups(username string) ([]string, bool) {
 	mapping := *d.mapping.Load()
-
-	if groups, ok := mapping[strings.ToLower(username)]; ok {
-		return groups, true
-	}
-
-	// The username of the request carries the OIDC username prefix, whereas
-	// the directory is keyed on the bare attribute value.
-	if p := d.config.UsernamePrefix; p != "" && strings.HasPrefix(username, p) {
-		groups, ok := mapping[strings.ToLower(strings.TrimPrefix(username, p))]
-		return groups, ok
-	}
-
-	return nil, false
+	groups, ok := mapping[usernameKey(username, d.config.UsernamePrefix)]
+	return groups, ok
 }
 
 // CanRefresh reports whether the given user is allowed to trigger a refresh.
@@ -415,19 +404,21 @@ func (d *Directory) CanRefresh(username string) bool {
 		return true
 	}
 
-	if _, ok := d.refreshUsers[strings.ToLower(username)]; ok {
-		return true
+	_, ok := d.refreshUsers[usernameKey(username, d.config.UsernamePrefix)]
+	return ok
+}
+
+// usernameKey returns the one directory identity represented by a username.
+// Authenticated requests carry the configured OIDC prefix, while LDAP entries
+// carry the raw claim value. Strip the prefix before looking in either map so a
+// prefixed request can never first capture a different LDAP entry whose raw
+// username happens to begin with the same prefix.
+func usernameKey(username, prefix string) string {
+	if prefix != "" && strings.HasPrefix(username, prefix) {
+		username = strings.TrimPrefix(username, prefix)
 	}
 
-	// Allow the allowed users to be given either as they appear in the token
-	// or without the OIDC username prefix, matching how users are looked up in
-	// the directory.
-	if p := d.config.UsernamePrefix; p != "" && strings.HasPrefix(username, p) {
-		_, ok := d.refreshUsers[strings.ToLower(strings.TrimPrefix(username, p))]
-		return ok
-	}
-
-	return false
+	return strings.ToLower(username)
 }
 
 func (d *Directory) Stats() *Stats {

@@ -1260,6 +1260,49 @@ func TestGroupsStripsUsernamePrefix(t *testing.T) {
 	}
 }
 
+// The full authenticated name must never be tried as an LDAP username before
+// its configured prefix is stripped. Otherwise the token user "alice" can be
+// assigned the groups of a distinct LDAP user literally named "oidc:alice".
+func TestGroupsDoesNotLetPrefixCaptureAnotherLDAPIdentity(t *testing.T) {
+	c := connWithUsers([]string{"admins", "viewers"}, map[string][]string{
+		"alice@example.net":      {"viewers"},
+		"oidc:alice@example.net": {"admins"},
+	})
+
+	config := testConfig()
+	config.UsernamePrefix = "oidc:"
+
+	d := newTestDirectory(t, config, c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, ok := d.Groups("oidc:alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"viewers"}) {
+		t.Errorf("expected the groups of bare LDAP user alice, got %v (found=%t)", groups, ok)
+	}
+}
+
+func TestGroupsDoesNotFallBackToPrefixedLDAPIdentity(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{
+		"oidc:alice@example.net": {"admins"},
+	})
+
+	config := testConfig()
+	config.UsernamePrefix = "oidc:"
+
+	d := newTestDirectory(t, config, c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if groups, ok := d.Groups("oidc:alice@example.net"); ok || groups != nil {
+		t.Errorf("expected bare LDAP user alice not to be found, got %v (found=%t)", groups, ok)
+	}
+}
+
 // A failed refresh must leave the previously built mapping serving requests.
 func TestFailedRefreshKeepsPreviousMapping(t *testing.T) {
 	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
@@ -1434,6 +1477,18 @@ func TestCanRefresh(t *testing.T) {
 			refreshUsers:   []string{"oidc:alice@example.net"},
 			usernamePrefix: "oidc:",
 			username:       "oidc:alice@example.net",
+			exp:            true,
+		},
+		"a prefixed allowed user does not authorize a raw name beginning with the prefix": {
+			refreshUsers:   []string{"oidc:alice@example.net"},
+			usernamePrefix: "oidc:",
+			username:       "oidc:oidc:alice@example.net",
+			exp:            false,
+		},
+		"a raw name beginning with the prefix can be allowed by its full token name": {
+			refreshUsers:   []string{"oidc:oidc:alice@example.net"},
+			usernamePrefix: "oidc:",
+			username:       "oidc:oidc:alice@example.net",
 			exp:            true,
 		},
 	}
