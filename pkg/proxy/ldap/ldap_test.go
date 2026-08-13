@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +24,13 @@ import (
 type fakeConn struct {
 	// entries maps a search base to the entries returned for it.
 	entries map[string][]*goldap.Entry
+
+	// searchFn, when set, answers the base scoped searches used to collect a
+	// truncated attribute a window at a time.
+	searchFn func(req *goldap.SearchRequest) (*goldap.SearchResult, error)
+
+	// searches counts the base scoped searches answered by searchFn.
+	searches int
 
 	searchErr error
 	bindErr   error
@@ -45,6 +53,20 @@ func (f *fakeConn) SearchWithPaging(req *goldap.SearchRequest, pagingSize uint32
 	if f.searchErr != nil {
 		return nil, f.searchErr
 	}
+	return &goldap.SearchResult{Entries: f.entries[req.BaseDN]}, nil
+}
+
+func (f *fakeConn) Search(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+
+	f.searches++
+
+	if f.searchFn != nil {
+		return f.searchFn(req)
+	}
+
 	return &goldap.SearchResult{Entries: f.entries[req.BaseDN]}, nil
 }
 
@@ -461,6 +483,180 @@ func TestRefreshMatchesDNsLoosely(t *testing.T) {
 	groups, _ := d.Groups("alice@example.net")
 	if !reflect.DeepEqual(groups, []string{"admins"}) {
 		t.Errorf("expected groups [admins], got %v", groups)
+	}
+}
+
+// connWithRangedUser returns a fake connection serving one user whose memberOf
+// the directory truncates into windows, the way Active Directory does past
+// MaxValRange.
+func connWithRangedUser(username string, groups []string, window int) *fakeConn {
+	c := &fakeConn{entries: map[string][]*goldap.Entry{}}
+
+	dns := make([]string, len(groups))
+	for i, group := range groups {
+		dns[i] = "CN=" + group + ",OU=Groups,DC=example,DC=net"
+
+		c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+			entry(dns[i], map[string][]string{"cn": {group}}))
+	}
+
+	userDN := "CN=" + username + ",OU=Users,DC=example,DC=net"
+
+	// chunk is the entry the directory answers with for the values from first
+	// onwards, naming the attribute the way it reports the window.
+	chunk := func(first int) *goldap.Entry {
+		last, name := first+window, fmt.Sprintf("memberOf;range=%d-%d", first, first+window-1)
+		if last >= len(dns) {
+			last, name = len(dns), fmt.Sprintf("memberOf;range=%d-*", first)
+		}
+
+		return &goldap.Entry{DN: userDN, Attributes: []*goldap.EntryAttribute{
+			{Name: "userPrincipalName", Values: []string{username}},
+			{Name: name, Values: dns[first:last]},
+		}}
+	}
+
+	c.entries["OU=Users,DC=example,DC=net"] = []*goldap.Entry{chunk(0)}
+
+	c.searchFn = func(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+		var first int
+		if _, err := fmt.Sscanf(req.Attributes[0], "memberOf;range=%d-*", &first); err != nil {
+			return nil, fmt.Errorf("unexpected attribute %q", req.Attributes[0])
+		}
+
+		return &goldap.SearchResult{Entries: []*goldap.Entry{chunk(first)}}, nil
+	}
+
+	return c
+}
+
+// A truncated memberOf comes back under a description that is not the one that
+// was asked for, so ignoring the range leaves the users in the most groups -
+// who tend to be the ones with the most access - holding no groups at all.
+func TestRefreshFollowsARangedMemberOf(t *testing.T) {
+	groups := make([]string, 7)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("group-%d", i)
+	}
+
+	c := connWithRangedUser("alice@example.net", groups, 3)
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	got, ok := d.Groups("alice@example.net")
+	if !ok {
+		t.Fatal("expected the user to be found")
+	}
+
+	if !reflect.DeepEqual(got, groups) {
+		t.Errorf("expected every group of the truncated memberOf, got %v", got)
+	}
+
+	// The first window arrives with the user search, so 7 values in windows of
+	// 3 leave two to collect.
+	if c.searches != 2 {
+		t.Errorf("expected 2 follow up searches, got %d", c.searches)
+	}
+}
+
+// The window has to move, or collecting it would only stop at the request
+// bound.
+func TestRefreshFailsWhenTheDirectoryDoesNotAdvanceTheRange(t *testing.T) {
+	c := connWithRangedUser("alice@example.net", []string{"a", "b", "c", "d"}, 2)
+
+	c.searchFn = func(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+		return &goldap.SearchResult{Entries: []*goldap.Entry{{
+			DN: "CN=alice@example.net,OU=Users,DC=example,DC=net",
+			Attributes: []*goldap.EntryAttribute{{
+				Name:   "memberOf;range=0-1",
+				Values: []string{"CN=a,OU=Groups,DC=example,DC=net"},
+			}},
+		}}}, nil
+	}
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing against a directory that never advances the range")
+	}
+
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Errorf("expected the error to say the window did not advance, got %q", err)
+	}
+}
+
+// A directory answers with the attribute descriptions of its own schema rather
+// than the ones that were asked for. 389 Directory Server, which FreeIPA is
+// built on, is the common case.
+func TestRefreshMatchesAttributeNamesCaseInsensitively(t *testing.T) {
+	c := &fakeConn{entries: map[string][]*goldap.Entry{
+		"OU=Groups,DC=example,DC=net": {
+			entry("cn=admins,ou=groups,dc=example,dc=net", map[string][]string{"CN": {"admins"}}),
+		},
+		"OU=Users,DC=example,DC=net": {
+			entry("uid=alice,ou=users,dc=example,dc=net", map[string][]string{
+				"UID":      {"alice@example.net"},
+				"memberof": {"cn=admins,ou=groups,dc=example,dc=net"},
+			}),
+		},
+	}}
+
+	backend := testBackend("ipa")
+	backend.UsernameAttribute = "uid"
+	backend.GroupNameAttribute = "cn"
+
+	d := newTestDirectory(t, testConfig(backend), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected groups [admins], got %v (found=%t)", groups, ok)
+	}
+}
+
+func TestParseRangeOption(t *testing.T) {
+	tests := map[string]struct {
+		options string
+		expNext int
+		expErr  bool
+	}{
+		"no options":          {"", -1, false},
+		"an unrelated option": {"binary", -1, false},
+		"a truncated range":   {"range=0-1499", 1500, false},
+		"a later window":      {"range=1500-2999", 3000, false},
+		"the final window":    {"range=3000-*", -1, false},
+		"an upper case range": {"RANGE=0-1499", 1500, false},
+		"among other options": {"binary;range=0-9", 10, false},
+		"no bounds":           {"range=0", 0, true},
+		"a non numeric bound": {"range=0-x", 0, true},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			next, err := parseRangeOption(test.options)
+
+			if test.expErr {
+				if err == nil {
+					t.Fatalf("expected an error parsing %q, got none", test.options)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error parsing %q: %s", test.options, err)
+			}
+
+			if next != test.expNext {
+				t.Errorf("expected the values to continue from %d, got %d", test.expNext, next)
+			}
+		})
 	}
 }
 

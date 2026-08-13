@@ -183,6 +183,31 @@ those groups did not come from the OIDC issuer. Use `groupPrefix` if the group
 names need a prefix to match your RBAC bindings, or to keep two directories that
 name their groups the same way apart.
 
+### Large directories
+
+Attribute names are matched case insensitively, and ignoring any options the
+directory attached, rather than compared to the name that was asked for. A
+directory is free to answer with the attribute descriptions of its own schema -
+389 Directory Server, which FreeIPA is built on, does - and comparing exactly
+would find nothing and quietly give the user no groups.
+
+Active Directory caps a multi valued attribute at `MaxValRange`, 1500 values by
+default, and answers a longer `memberOf` with a window of it under a different
+attribute description. The proxy collects the rest a window at a time, so a user
+in more than 1500 groups costs one extra search per additional window. Nothing
+needs configuring for this; on a directory that returns every value, such as 389
+Directory Server, the extra searches never happen.
+
+Server side limits on the *number of entries* a search may return are a
+different matter and are not worked around. Paging keeps each page within
+`MaxPageSize` on Active Directory, but a limit on the search as a whole -
+`nsslapd-sizelimit` and `nsslapd-lookthroughlimit` on 389 Directory Server,
+which default low enough to matter on a real directory - applies to the bind
+account and will stop the search. That surfaces as a failed rebuild rather than
+a short mapping, so it is visible rather than silent, but it does mean the
+proxy's bind account wants limits that accommodate the whole user and group
+tree.
+
 ## Persisting the mapping
 
 Without a `cache`, a proxy that restarts has to rebuild the mapping from the
