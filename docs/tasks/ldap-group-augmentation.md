@@ -345,10 +345,20 @@ cache exists for.
 ```
 
 The Secret is created if it does not exist, and only the configured key is
-written, so a Secret shared with something else is left otherwise intact. The
-payload is gzipped, since the API server caps a Secret at 1MiB; a mapping too
-large to fit even compressed is refused with an error rather than a failed
-write, and should be persisted to a file instead.
+written, so a Secret shared with something else is left otherwise intact.
+
+**This store has a ceiling, and a large directory will not fit under it.** The
+API server caps a Secret at 1MiB. The payload is gzipped, and holds each group
+name once rather than repeating it in every member's entry, which between them
+fit a directory of roughly 45,000 users in ten groups each - or roughly 15,000
+in thirty each. Past that the mapping is refused with an error rather than a
+failed write, and has to go to a `file` instead. Note also that the whole
+mapping is rewritten on every refresh, and every write of a Secret that size
+goes through etcd and out to everything watching it.
+
+Prefer `file` on a volume for anything but a small directory. `kubernetesSecret`
+is for the deployment that wants no volume of its own and knows it stays well
+under the cap.
 
 The namespace defaults to the one the proxy is running in, taken from
 `$POD_NAMESPACE` if set, and from the service account namespace file otherwise.

@@ -38,8 +38,16 @@ const (
 // Secret persists the mapping into the data of a Kubernetes Secret, so that it
 // survives a restart without the proxy needing a volume of its own.
 //
-// The payload is gzipped: a mapping of every user in a large directory
-// compresses well, and the API server enforces a 1MiB limit on a Secret.
+// It only suits a directory that stays well inside the 1MiB the API server
+// allows a Secret. Gzipping the payload, which is interned before it gets here,
+// buys room for something like 45,000 users in ten groups each - but a mapping
+// grows with the directory and this limit does not, so a large directory has to
+// be persisted to a file. Save refuses a mapping that does not fit rather than
+// letting the write fail.
+//
+// The whole mapping is also rewritten on every refresh, and a Secret this size
+// is not a cheap object to keep rewriting: it goes through etcd and out to
+// everything watching it.
 type Secret struct {
 	client kubernetes.Interface
 
@@ -132,7 +140,8 @@ func (s *Secret) Save(ctx context.Context, data []byte) error {
 
 	if len(compressed) > maxSecretSize {
 		return fmt.Errorf("the compressed mapping is %d bytes, over the %d byte limit of Secret %s/%s: "+
-			"narrow the configured search bases, or persist to a file instead",
+			"this directory is too large for a Secret to hold its mapping, so persist to a file "+
+			"instead, or narrow the configured search bases",
 			len(compressed), maxSecretSize, s.namespace, s.name)
 	}
 

@@ -153,7 +153,7 @@
           }
         },
         "kubernetesSecret": {
-          "description": "Configuration of the 'kubernetesSecret' store. Required when type is 'kubernetesSecret'.",
+          "description": "Configuration of the 'kubernetesSecret' store. Required when type is 'kubernetesSecret'. Only suits a directory whose mapping fits in the 1MiB the API server allows a Secret; use the 'file' store for anything larger.",
           "type": "object",
           "additionalProperties": false,
           "required": ["name"],
