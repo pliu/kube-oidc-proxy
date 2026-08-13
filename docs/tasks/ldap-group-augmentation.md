@@ -102,7 +102,11 @@ A minimal configuration:
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
-  ]
+  ],
+  "cache": {
+    "type": "kubernetesSecret",
+    "kubernetesSecret": {"name": "kube-oidc-proxy-ldap-mapping"}
+  }
 }
 ```
 
@@ -158,7 +162,7 @@ And one using every field, two directories and a persisted mapping:
 | `refreshInterval` | `10m` | How often the mapping is rebuilt. A Go duration string. |
 | `fallbackToTokenGroups` | `false` | Fall back to the groups of the JWT for users found in no directory. |
 | `refreshUsers` | | Users allowed to trigger a refresh. If unset, any authenticated user may. |
-| `cache` | | Where the built mapping is persisted. See [below](#persisting-the-mapping). |
+| `cache` | | **Required.** Where the built mapping is persisted. See [below](#persisting-the-mapping). |
 
 ### Backend fields
 
@@ -230,11 +234,23 @@ tree.
 
 ## Persisting the mapping
 
-Without a `cache`, a proxy that restarts has to rebuild the mapping from the
-directories before it can serve anything, and exits if it cannot reach them. A
-directory outage during a rollout then takes the proxy down with it.
+`cache` is required, and has to be stated even when the answer is "nowhere":
+`{"type": "none"}` turns persistence off. It is mandatory because leaving it out
+gets the worst behaviour by default, and nobody picks that on purpose.
 
-With a `cache` configured, a rebuilt mapping is written to the store *before* it
+With persistence off, a proxy that restarts has to rebuild the mapping from the
+directories before it can serve anything, and exits if it cannot reach them. A
+directory outage that coincides with a restart - a rollout, a drain, an
+eviction, an OOM kill - then takes the proxy down with it, and keeps it down
+until a directory answers. The proxy logs a warning at startup when it is
+running this way.
+
+Note that the mapping is a dump of every user and the groups they hold, so
+persisting it to a Secret makes that readable by anyone who can read Secrets in
+that namespace. That is a real reason to choose `none`, or to choose a `file` on
+a volume with tighter access than the namespace has - but it should be a choice.
+
+With a store configured, a rebuilt mapping is written to it *before* it
 starts being served, and a mapping that cannot be written is not served at all -
 the rebuild fails and the previous mapping, which is the one the store holds,
 carries on serving.
@@ -270,7 +286,7 @@ password or changing a URL does not discard it.
 
 | Field | Default | Description |
 | ----- | ------- | ----------- |
-| `type` | | One of `none`, `file` or `kubernetesSecret`. |
+| `type` | | **Required.** One of `none`, `file` or `kubernetesSecret`. |
 | `maxAge` | | How old a persisted mapping may be and still be served. If unset, it is served however old it is. |
 | `file.path` | | Where to write the mapping. Required when `type` is `file`. |
 | `kubernetesSecret.name` | | Name of the Secret to write. Required when `type` is `kubernetesSecret`. |

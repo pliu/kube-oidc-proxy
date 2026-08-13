@@ -248,6 +248,15 @@ func newBackend(config *BackendConfig) (*backend, error) {
 // is loaded first so that it can stand in if that refresh fails, and only when
 // there is no mapping to fall back on does a failure stop the proxy starting.
 func (d *Directory) Run(stopCh <-chan struct{}) error {
+	// Saying so out loud, because the cost is paid at the worst moment: a pod
+	// that restarts while a directory is unreachable - a rollout, a drain, an
+	// eviction, an OOM kill - has nothing to serve and will not start at all.
+	// Persistence is what turns that outage into a stale mapping.
+	if d.cache == nil {
+		klog.Warning("no LDAP mapping cache is configured, so the proxy will refuse to start if a " +
+			"directory is unreachable at startup, and will keep doing so until one answers")
+	}
+
 	restored := d.restore()
 
 	if err := d.Refresh(); err != nil {

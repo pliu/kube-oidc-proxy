@@ -19,7 +19,8 @@ const minimalConfig = `{
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
-  ]
+  ],
+  "cache": {"type": "none"}
 }`
 
 func TestParseConfigAppliesDefaults(t *testing.T) {
@@ -54,7 +55,7 @@ func TestParseConfigAppliesDefaults(t *testing.T) {
 	}
 
 	if config.Cache.Enabled() {
-		t.Error("expected persistence to be off when no cache is configured")
+		t.Error(`expected persistence to be off when the cache type is "none"`)
 	}
 }
 
@@ -150,6 +151,15 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			`{"backends": [], "refreshIntervals": "10m"}`,
 			"refreshIntervals",
 		},
+		// Where the mapping is persisted has to be stated, because leaving it
+		// out gets a proxy that cannot start while a directory is down, and
+		// nobody chooses that on purpose.
+		"a missing cache property": {
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			"cache",
+		},
 		"a misspelled backend property": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBase": ["OU=Users,DC=example,DC=net"],
@@ -240,7 +250,8 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			   "groupSearchBases": ["OU=Groups,DC=example,DC=net"]},
 			  {"name": "corp", "urls": ["ldaps://two.example.net:636"],
 			   "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			   "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			   "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}}`,
 			"duplicate backend name",
 		},
 		"both a bind password and a bind password file": {
@@ -248,27 +259,31 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "bindDN": "CN=svc,DC=example,DC=net",
 			  "bindPassword": "password", "bindPasswordFile": "/etc/password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}}`,
 			"cannot set both bindPassword and bindPasswordFile",
 		},
 		"a bind password with no bind DN": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "bindPassword": "password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}}`,
 			"without a bindDN",
 		},
 		"both a CA file and skipped verification": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "caFile": "/etc/ca.pem", "insecureSkipTLSVerify": true,
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}}`,
 			"cannot set both caFile and insecureSkipTLSVerify",
 		},
 		"a refresh interval of zero": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"},
 			  "refreshInterval": "0s"}`,
 			"refreshInterval must be a positive duration",
 		},
@@ -276,7 +291,8 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "timeout": "0s",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}}`,
 			"timeout must be a positive duration",
 		},
 	}

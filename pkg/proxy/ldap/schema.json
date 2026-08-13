@@ -5,7 +5,7 @@
   "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["backends"],
+  "required": ["backends", "cache"],
   "properties": {
     "backends": {
       "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups.",
@@ -29,7 +29,7 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "cache": {
-      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup.",
+      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup. Required: without a persisted mapping the proxy has nothing to fall back on and refuses to start while a directory is unreachable, so turning persistence off is stated explicitly with a type of 'none' rather than reached by leaving this out.",
       "$ref": "#/$defs/cache"
     }
   },
