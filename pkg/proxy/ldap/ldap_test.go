@@ -1610,8 +1610,13 @@ func TestRefreshPersistsMapping(t *testing.T) {
 	if snapshot.Version != snapshotVersion {
 		t.Errorf("expected version %d, got %d", snapshotVersion, snapshot.Version)
 	}
-	if !reflect.DeepEqual(snapshot.Users, map[string][]string{"alice@example.net": {"admins"}}) {
-		t.Errorf("expected the mapping to have been persisted, got %v", snapshot.Users)
+
+	mapping, err := snapshot.mapping()
+	if err != nil {
+		t.Fatalf("unexpected error resolving the persisted mapping: %s", err)
+	}
+	if !reflect.DeepEqual(mapping, map[string][]string{"alice@example.net": {"admins"}}) {
+		t.Errorf("expected the mapping to have been persisted, got %v", mapping)
 	}
 	if snapshot.BuiltAt.IsZero() {
 		t.Error("expected the persisted mapping to record when it was built")
@@ -1912,7 +1917,8 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 		Version:     snapshotVersion,
 		MappingHash: config.mappingHash(),
 		BuiltAt:     time.Now(),
-		Users:       map[string][]string{"alice@example.net": {"admins"}},
+		GroupTable:  []string{"admins"},
+		Users:       map[string][]int{"alice@example.net": {0}},
 	}
 
 	otherConfig := testConfig()
@@ -1935,6 +1941,14 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 			mutate: func(s *Snapshot) { s.Users = nil },
 			expErr: "holds no users",
 		},
+		"a snapshot naming a group its table does not hold": {
+			mutate: func(s *Snapshot) { s.Users = map[string][]int{"alice@example.net": {1}} },
+			expErr: "outside the table",
+		},
+		"a snapshot with no group table": {
+			mutate: func(s *Snapshot) { s.GroupTable = nil },
+			expErr: "outside the table",
+		},
 		"a snapshot older than the configured maximum age": {
 			mutate: func(s *Snapshot) { s.BuiltAt = time.Now().Add(-time.Hour) },
 			maxAge: time.Minute,
@@ -1954,7 +1968,7 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 
 			d.config.Cache = &CacheConfig{Type: CacheTypeNone, MaxAge: Duration(test.maxAge)}
 
-			if _, err := d.decodeSnapshot(data); err == nil {
+			if _, _, err := d.decodeSnapshot(data); err == nil {
 				t.Errorf("expected an error containing %q, got none", test.expErr)
 			} else if !strings.Contains(err.Error(), test.expErr) {
 				t.Errorf("expected an error containing %q, got %q", test.expErr, err)
@@ -1971,7 +1985,7 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 		t.Fatalf("unexpected error encoding snapshot: %s", err)
 	}
 
-	if _, err := d.decodeSnapshot(data); err != nil {
+	if _, _, err := d.decodeSnapshot(data); err != nil {
 		t.Errorf("expected a good snapshot to be accepted, got %s", err)
 	}
 }
