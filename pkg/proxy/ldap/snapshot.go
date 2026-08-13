@@ -49,13 +49,20 @@ type SnapshotBackend struct {
 	Groups int    `json:"groups"`
 }
 
-// persist writes the mapping to the configured store. A store that cannot be
-// written to is logged and otherwise ignored: the mapping in memory is good,
-// and failing the refresh over it would throw away a mapping that requests can
-// be served from right now.
-func (d *Directory) persist(mapping map[string][]string, groups int, builtAt time.Time, backends []BackendStats) {
+// persist writes the mapping to the configured store. It runs before the
+// mapping is served, so that what is persisted is never older than what is
+// being served.
+//
+// A store that cannot be written to therefore fails the rebuild, rather than
+// being logged and carried on from. Serving a mapping that could not be
+// persisted is what lets a restart go backwards: the proxy would come back up,
+// find the previous mapping in the store, and serve that instead - and if the
+// directories are unreachable by then, it has no way of getting forwards
+// again. Keeping the previous mapping, which is the one in the store, at least
+// leaves the two agreeing.
+func (d *Directory) persist(mapping map[string][]string, groups int, builtAt time.Time, backends []BackendStats) error {
 	if d.cache == nil {
-		return
+		return nil
 	}
 
 	persisted := make([]SnapshotBackend, 0, len(backends))
@@ -72,19 +79,19 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		Users:       mapping,
 	})
 	if err != nil {
-		klog.Errorf("failed to encode the LDAP mapping to persist to %s: %s", d.cache, err)
-		return
+		return fmt.Errorf("failed to encode the mapping to persist to %s: %s", d.cache, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
 	defer cancel()
 
 	if err := d.cache.Save(ctx, data); err != nil {
-		klog.Errorf("failed to persist the LDAP mapping to %s: %s", d.cache, err)
-		return
+		return fmt.Errorf("failed to persist the mapping to %s: %s", d.cache, err)
 	}
 
 	klog.V(4).Infof("persisted LDAP mapping of %d users to %s", len(mapping), d.cache)
+
+	return nil
 }
 
 // restore installs the persisted mapping, if there is a usable one, and

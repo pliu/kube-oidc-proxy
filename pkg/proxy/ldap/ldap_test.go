@@ -13,10 +13,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	goldap "github.com/go-ldap/ldap/v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
@@ -361,6 +365,391 @@ func TestRefreshFailsWhenABackendIsDown(t *testing.T) {
 	groups, ok := d.Groups("alice@example.net")
 	if !ok || !reflect.DeepEqual(groups, []string{"admins", "contractors"}) {
 		t.Errorf("expected the previous merged mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// Which entry a request should be authorized as is genuinely ambiguous, and
+// picking whichever came back last would make a user's groups depend on the
+// order the directory happened to return them in.
+func TestRefreshFailsWhenTwoEntriesClaimOneUsername(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	// A second object holding the same userPrincipalName, in another OU: a
+	// recreated account, or one migrated without the old object being removed.
+	c.entries["OU=Users,DC=example,DC=net"] = append(c.entries["OU=Users,DC=example,DC=net"],
+		entry("CN=alice.old,OU=Contractors,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"alice@example.net"},
+		}))
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing a directory holding one username twice")
+	}
+
+	for _, want := range []string{"alice@example.net", "OU=Users,DC=example,DC=net", "CN=alice.old,OU=Contractors"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected the error to name %q, got %q", want, err)
+		}
+	}
+}
+
+// Search bases that overlap return one entry more than once, which says
+// nothing about the identity being ambiguous.
+func TestRefreshAcceptsOneEntryReturnedByOverlappingSearchBases(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	// The same entries, reachable under a base that contains the first.
+	c.entries["DC=example,DC=net"] = c.entries["OU=Users,DC=example,DC=net"]
+
+	backend := testBackend("ldap")
+	backend.UserSearchBases = []string{"OU=Users,DC=example,DC=net", "DC=example,DC=net"}
+
+	d := newTestDirectory(t, testConfig(backend), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("expected overlapping search bases to be accepted, got %s", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected groups [admins], got %v (found=%t)", groups, ok)
+	}
+}
+
+// A rebuild that fails is not an outage, so nothing about serving a request
+// says the mapping has stopped being updated. The gauge is what does.
+func TestLastRefreshSuccessGauge(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 1 {
+		t.Errorf("expected a successful refresh to report 1, got %v", got)
+	}
+
+	c.searchErr = errors.New("directory is down")
+
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing against a broken directory")
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 0 {
+		t.Errorf("expected a failed refresh to report 0, got %v", got)
+	}
+
+	// Recovering has to clear it again, or it would need a restart to.
+	c.searchErr = nil
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 1 {
+		t.Errorf("expected a recovered refresh to report 1, got %v", got)
+	}
+}
+
+// A directory holding one username twice needs somebody to go and clean it up,
+// which is worth telling apart from a directory that is merely unreachable.
+func TestBackendDuplicateUsersGauge(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(testBackend("corp")), c)
+
+	gauge := backendDuplicateUsers.WithLabelValues("corp")
+
+	// The series exists from the start, so that "no duplicates" is a zero
+	// rather than an absence.
+	if got := testutil.ToFloat64(gauge); got != 0 {
+		t.Errorf("expected a backend with no duplicates to report 0, got %v", got)
+	}
+
+	duplicate := entry("CN=alice.old,OU=Contractors,DC=example,DC=net", map[string][]string{
+		"userPrincipalName": {"alice@example.net"},
+	})
+	c.entries["OU=Users,DC=example,DC=net"] = append(c.entries["OU=Users,DC=example,DC=net"], duplicate)
+
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing a directory holding one username twice")
+	}
+
+	if got := testutil.ToFloat64(gauge); got != 1 {
+		t.Errorf("expected a backend holding one username twice to report 1, got %v", got)
+	}
+
+	// An unreachable directory says nothing about whether it holds duplicates,
+	// so the gauge must stay where it was rather than being cleared.
+	c.searchErr = errors.New("directory is down")
+
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing against a broken directory")
+	}
+
+	if got := testutil.ToFloat64(gauge); got != 1 {
+		t.Errorf("expected an unreachable backend to leave the gauge alone, got %v", got)
+	}
+
+	// Cleaning up the directory clears it.
+	c.searchErr = nil
+	c.entries["OU=Users,DC=example,DC=net"] = c.entries["OU=Users,DC=example,DC=net"][:1]
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if got := testutil.ToFloat64(gauge); got != 0 {
+		t.Errorf("expected a cleaned up backend to report 0, got %v", got)
+	}
+}
+
+// histogramCount is the number of observations a histogram holds, which is
+// what says whether a rebuild was actually timed rather than merely published.
+func histogramCount(t *testing.T, collector prometheus.Collector) uint64 {
+	t.Helper()
+
+	metrics := make(chan prometheus.Metric, 32)
+	collector.Collect(metrics)
+	close(metrics)
+
+	var total uint64
+	for metric := range metrics {
+		var written dto.Metric
+		if err := metric.Write(&written); err != nil {
+			t.Fatalf("unexpected error reading a metric: %s", err)
+		}
+
+		total += written.GetHistogram().GetSampleCount()
+	}
+
+	return total
+}
+
+// backendDuration is one backend's timing histogram as a collector: a child of
+// a vector is handed back as an Observer, which cannot be collected from.
+func backendDuration(t *testing.T, backend string) prometheus.Collector {
+	t.Helper()
+
+	collector, ok := backendRefreshDuration.WithLabelValues(backend).(prometheus.Collector)
+	if !ok {
+		t.Fatal("expected a histogram child to be collectable")
+	}
+
+	return collector
+}
+
+func TestRefreshDurationsAreObserved(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	second := connWithUsers([]string{"contractors"}, map[string][]string{"bob@example.net": {"contractors"}})
+
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), c, second)
+
+	before := histogramCount(t, refreshDuration)
+	beforeFirst := histogramCount(t, backendDuration(t, "first"))
+	beforeSecond := histogramCount(t, backendDuration(t, "second"))
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if got := histogramCount(t, refreshDuration) - before; got != 1 {
+		t.Errorf("expected the complete rebuild to have been timed once, got %d", got)
+	}
+
+	// Each backend is timed separately, so that one slow directory can be told
+	// from a rebuild that is slow all over.
+	if got := histogramCount(t, backendDuration(t, "first")) - beforeFirst; got != 1 {
+		t.Errorf("expected backend \"first\" to have been timed once, got %d", got)
+	}
+	if got := histogramCount(t, backendDuration(t, "second")) - beforeSecond; got != 1 {
+		t.Errorf("expected backend \"second\" to have been timed once, got %d", got)
+	}
+}
+
+// How long it took to give up says nothing about how long the work takes, and
+// would drag the distribution somewhere useless.
+func TestFailedRefreshesAreNotTimed(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	c.searchErr = errors.New("directory is down")
+
+	d := newTestDirectory(t, testConfig(testBackend("broken")), c)
+
+	before := histogramCount(t, refreshDuration)
+	beforeBackend := histogramCount(t, backendDuration(t, "broken"))
+
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing against a broken directory")
+	}
+
+	if got := histogramCount(t, refreshDuration) - before; got != 0 {
+		t.Errorf("expected a failed rebuild not to be timed, got %d observations", got)
+	}
+	if got := histogramCount(t, backendDuration(t, "broken")) - beforeBackend; got != 0 {
+		t.Errorf("expected a failed backend not to be timed, got %d observations", got)
+	}
+}
+
+// gatedConn holds up a rebuild until it is released, so that callers can be
+// made to arrive while one is genuinely in flight.
+type gatedConn struct {
+	*fakeConn
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedConn) SearchWithPaging(req *goldap.SearchRequest, size uint32) (*goldap.SearchResult, error) {
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+
+	return g.fakeConn.SearchWithPaging(req, size)
+}
+
+// A burst of requests to the refresh endpoint must cost one rebuild, not one
+// each: every one of them searches every directory in full, and by default any
+// authenticated user may ask for one.
+func TestConcurrentRefreshesAreCoalesced(t *testing.T) {
+	c := &gatedConn{
+		fakeConn: connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}}),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	// One dial per rebuild, so this counts the rebuilds that were actually run.
+	var dials atomic.Int32
+	d.backends[0].dial = func(string) (conn, error) {
+		dials.Add(1)
+		return c, nil
+	}
+
+	const callers = 8
+
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs[0] = d.Refresh()
+	}()
+
+	// The first caller now holds the rebuild, blocked in the directory.
+	<-c.entered
+
+	arrived := make(chan struct{}, callers)
+	for i := 1; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			arrived <- struct{}{}
+			errs[i] = d.Refresh()
+		}(i)
+	}
+
+	for i := 1; i < callers; i++ {
+		<-arrived
+	}
+
+	// Every joiner has been scheduled; give them a moment to actually reach
+	// the lock before the rebuild they are meant to join completes.
+	time.Sleep(time.Millisecond * 50)
+
+	close(c.release)
+	wg.Wait()
+
+	if got := dials.Load(); got != 1 {
+		t.Errorf("expected %d concurrent refreshes to cost one rebuild, got %d", callers, got)
+	}
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("caller %d: unexpected error refreshing: %s", i, err)
+		}
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the mapping to have been built, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A joined rebuild reports to its callers what it actually did.
+func TestCoalescedRefreshesShareTheFailure(t *testing.T) {
+	c := &gatedConn{
+		fakeConn: connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}}),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	c.fakeConn.searchErr = errors.New("directory is down")
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs[0] = d.Refresh()
+	}()
+
+	<-c.entered
+
+	arrived := make(chan struct{}, 3)
+	for i := 1; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			arrived <- struct{}{}
+			errs[i] = d.Refresh()
+		}(i)
+	}
+
+	for i := 1; i < 4; i++ {
+		<-arrived
+	}
+	time.Sleep(time.Millisecond * 50)
+
+	close(c.release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("caller %d: expected the failure of the rebuild it joined, got none", i)
+		}
+	}
+}
+
+// A caller arriving once a rebuild is over must get a rebuild, not the result
+// of the one that just finished.
+func TestRefreshAfterAnotherFinishesRebuilds(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	var dials atomic.Int32
+	d.backends[0].dial = func(string) (conn, error) {
+		dials.Add(1)
+		return c, nil
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := d.Refresh(); err != nil {
+			t.Fatalf("unexpected error refreshing: %s", err)
+		}
+	}
+
+	if got := dials.Load(); got != 3 {
+		t.Errorf("expected 3 sequential refreshes to cost 3 rebuilds, got %d", got)
 	}
 }
 
@@ -1056,6 +1445,10 @@ type memoryStore struct {
 	loadErr error
 	saveErr error
 
+	// onSave runs inside Save, so that a test can see what was being served at
+	// the moment the mapping was written.
+	onSave func()
+
 	saves int
 }
 
@@ -1071,6 +1464,11 @@ func (m *memoryStore) Load(_ context.Context) ([]byte, error) {
 
 func (m *memoryStore) Save(_ context.Context, data []byte) error {
 	m.saves++
+
+	if m.onSave != nil {
+		m.onSave()
+	}
+
 	if m.saveErr != nil {
 		return m.saveErr
 	}
@@ -1164,11 +1562,13 @@ func TestRunFailsARestoredBackendThatStopsReturningUsers(t *testing.T) {
 	}
 }
 
-// A failure to persist must not fail a refresh that otherwise worked.
-func TestRefreshSucceedsWhenPersistingFails(t *testing.T) {
+// Serving a mapping that could not be persisted is what lets a restart go
+// backwards, so it fails the refresh and the previous mapping - the one the
+// store still holds - keeps serving.
+func TestRefreshFailsWhenPersistingFails(t *testing.T) {
 	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
-	store := &memoryStore{saveErr: errors.New("store is down")}
+	store := new(memoryStore)
 
 	d, err := New(testConfig(), store)
 	if err != nil {
@@ -1177,11 +1577,73 @@ func TestRefreshSucceedsWhenPersistingFails(t *testing.T) {
 	d.backends[0].dial = func(string) (conn, error) { return c, nil }
 
 	if err := d.Refresh(); err != nil {
-		t.Errorf("expected a refresh that could not be persisted to succeed, got %s", err)
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// The store breaks, and the directory grows a group, after the first
+	// mapping was built and persisted.
+	store.saveErr = errors.New("store is down")
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+		entry("CN=devs,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"devs"}}))
+	c.entries["OU=Users,DC=example,DC=net"] = []*goldap.Entry{
+		entry("CN=alice@example.net,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"alice@example.net"},
+			"memberOf": {
+				"CN=admins,OU=Groups,DC=example,DC=net",
+				"CN=devs,OU=Groups,DC=example,DC=net",
+			},
+		}),
+	}
+
+	err = d.Refresh()
+	if err == nil {
+		t.Fatal("expected a refresh that could not be persisted to fail")
+	}
+	if !strings.Contains(err.Error(), "failed to persist") {
+		t.Errorf("expected the error to say persisting failed, got %q", err)
+	}
+
+	// What is served has to still match what the store holds, or a restart
+	// would go backwards from it.
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the persisted mapping to still be the one served, got %v (found=%t)", groups, ok)
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 0 {
+		t.Errorf("expected a refresh that could not be persisted to report 0, got %v", got)
+	}
+}
+
+// The ordering the whole thing rests on: nothing is served until the store has
+// it.
+func TestMappingIsPersistedBeforeItIsServed(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	var servedDuringSave []string
+	var foundDuringSave bool
+
+	store.onSave = func() {
+		servedDuringSave, foundDuringSave = d.Groups("alice@example.net")
+	}
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if foundDuringSave {
+		t.Errorf("expected the new mapping not to be served until it was persisted, got %v", servedDuringSave)
 	}
 
 	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
-		t.Errorf("expected the mapping to be served, got %v (found=%t)", groups, ok)
+		t.Errorf("expected the mapping to be served once persisted, got %v (found=%t)", groups, ok)
 	}
 }
 

@@ -24,6 +24,7 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	handler = p.withImpersonateRequest(handler)
 	handler = p.withLDAPRefresh(handler)
 	handler = p.withAuthenticateRequest(handler)
+	handler = p.withRequestCount(handler)
 
 	// Add the auditor backend as a shutdown hook
 	p.hooks.AddPreShutdownHook("AuditBackend", p.auditor.Shutdown)

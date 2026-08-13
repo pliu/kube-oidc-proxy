@@ -63,6 +63,14 @@ the very first build is a configuration to fix rather than a mapping to protect.
 A directory that really has been emptied is accepted again once the proxy is
 restarted and its [persisted mapping](#persisting-the-mapping), if any, removed.
 
+Two entries of one directory that claim the same username also fail the rebuild.
+Which of them a request should be authorized as is genuinely ambiguous, and
+taking whichever the directory returned last would make a user's groups depend
+on search order. One entry returned more than once because the search bases
+overlap is not ambiguous and is accepted. A username held in *different*
+backends is not ambiguous either - that is the merge described above, and those
+groups are unioned.
+
 The initial build happens before the proxy starts serving, so that requests are
 never authorized against an empty mapping. If it fails and there is no
 [persisted mapping](#persisting-the-mapping) to fall back on, the proxy exits.
@@ -226,9 +234,21 @@ Without a `cache`, a proxy that restarts has to rebuild the mapping from the
 directories before it can serve anything, and exits if it cannot reach them. A
 directory outage during a rollout then takes the proxy down with it.
 
-With a `cache` configured, the built mapping is persisted after every successful
-refresh. At startup the persisted mapping is loaded first, and the proxy then
-tries to refresh from the directories:
+With a `cache` configured, a rebuilt mapping is written to the store *before* it
+starts being served, and a mapping that cannot be written is not served at all -
+the rebuild fails and the previous mapping, which is the one the store holds,
+carries on serving.
+
+The order matters more than it looks. Serving first and persisting after lets a
+restart go backwards in time: a proxy that served a new mapping, failed to
+persist it, and then died would come back up, find the older mapping in the
+store and serve that - and if the directories happen to be unreachable by then,
+it has no way of getting forwards again. Writing first means the store is never
+behind what is being served, so the worst a restart can do is replay a mapping
+that is at least as new as the one that was lost.
+
+At startup the persisted mapping is loaded first, and the proxy then tries to
+refresh from the directories:
 
 * If the refresh succeeds, the fresh mapping replaces the persisted one. The
   persisted mapping is never served in preference to a reachable directory.
@@ -304,6 +324,64 @@ rules:
 Note that the mapping names every user of the cluster and the groups they hold.
 Anything that can read the Secret can read that.
 
+## Metrics
+
+Both failures above are quiet by design: the previous mapping keeps serving, so
+no request fails and nothing tells you that group changes have stopped being
+picked up. Two gauges are published for alerting on that, in Prometheus format
+at `/metrics` on the readiness probe listener - `--readiness-probe-port`, 8080
+by default, beside `/ready` and `/live`. That listener is plain HTTP with no
+authentication, so the metrics are readable by anything that can reach the pod
+on that port. They carry no request or user data; the only label value is the
+name of a configured backend.
+
+| Metric | Type | Description |
+| ------ | ---- | ----------- |
+| `kube_oidc_proxy_ldap_last_refresh_success` | gauge | `1` if the last rebuild of the mapping succeeded, `0` if it failed. |
+| `kube_oidc_proxy_ldap_backend_duplicate_users{backend}` | gauge | `1` if two entries of this backend claim one username, which fails the rebuild. |
+| `kube_oidc_proxy_ldap_refresh_duration_seconds` | histogram | How long a complete rebuild took, across every backend. |
+| `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend}` | histogram | How long searching one backend took, so that one slow directory can be told from a rebuild that is slow all over. |
+
+The proxy also publishes `kube_oidc_proxy_requests_total`, a counter of every
+request it is handed. It is counted before authentication, so requests being
+turned away reads as requests arriving rather than as silence. It is not broken
+down by status code: that would mean putting a wrapper around the
+`ResponseWriter` of every request, including the ones hijacked for `exec` and
+`port-forward`, which is not worth it for a count.
+
+The two histograms record only rebuilds that *succeeded*. How long a failed one
+took is mostly how long it took to give up - a connection timing out, say -
+which would drag the distribution somewhere that says nothing about how long the
+work takes. Their buckets run from 100ms to a little over three minutes, since
+rebuilding reads every user and every group of a directory.
+
+`refresh_duration_seconds` and `last_refresh_success` both cover
+[persisting](#persisting-the-mapping) the mapping as well as building it, since
+a rebuild is not finished until what it built is safe to serve. A store that
+cannot be written to therefore shows up as a failed refresh, not as a slow one.
+
+None of the `_ldap_` series exist unless `--ldap-config-file` is set, so a proxy
+running without augmentation does not report a permanent zero for a rebuild it
+is never going to do. `backend_duplicate_users` is published as `0` for every
+configured backend from startup, so an alert can tell "no duplicates" from a
+backend that has not been searched yet.
+
+An unreachable directory leaves `backend_duplicate_users` where it was rather
+than clearing it, since a search that did not run says nothing about what the
+directory holds. Alert on `last_refresh_success` for that instead:
+
+```
+kube_oidc_proxy_ldap_last_refresh_success == 0
+kube_oidc_proxy_ldap_backend_duplicate_users > 0
+histogram_quantile(0.9, rate(kube_oidc_proxy_ldap_backend_refresh_duration_seconds_bucket[1h])) > 60
+```
+
+The first firing for longer than a couple of `refreshInterval`s means the
+mapping is going stale. The second means a directory needs cleaning up, and will
+keep failing every rebuild until it is. The third is the early warning for the
+first: a backend whose rebuilds are creeping towards its `timeout` will start
+failing them, and the duration is visible well before that happens.
+
 ## Triggering a refresh
 
 Waiting out `refreshInterval` after a group membership change is often
@@ -320,10 +398,12 @@ $ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
 it was loaded from the persisted mapping after a failed startup refresh.
 
 The endpoint sits behind the same OIDC authentication as every other request, so
-an unauthenticated caller cannot trigger a rebuild. Refreshes are serialised, so
-concurrent calls cannot fan out into concurrent searches of the directories. The
-path is not a valid API server path, so it never shadows a request destined for
-Kubernetes.
+an unauthenticated caller cannot trigger a rebuild. A caller arriving while a
+rebuild is already running joins it and is given its result, so a burst of
+requests costs one rebuild rather than one each - which matters because every
+rebuild searches every directory in full, and by default any authenticated user
+may ask for one. The path is not a valid API server path, so it never shadows a
+request destined for Kubernetes.
 
 By default any authenticated user may trigger a refresh. To restrict this to a
 set of users, set `refreshUsers`. Names are matched case insensitively, and may

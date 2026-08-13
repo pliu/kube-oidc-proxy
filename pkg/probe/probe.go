@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/heptiolabs/healthcheck"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/klog/v2"
 )
@@ -36,9 +37,18 @@ func Run(port, fakeJWT string, oidcAuther authenticator.Token) error {
 
 	h.handler.AddReadinessCheck("secure serving", h.Check)
 
+	// Metrics are served beside the probes rather than on the secure port,
+	// where every path that is not handled by the proxy itself is forwarded to
+	// the API server, and where a scraper would need a token the OIDC issuer
+	// accepts. They carry no request data, only counts and the names of the
+	// configured LDAP backends.
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/", h.handler)
+
 	go func() {
 		for {
-			err := http.ListenAndServe(net.JoinHostPort("0.0.0.0", port), h.handler)
+			err := http.ListenAndServe(net.JoinHostPort("0.0.0.0", port), mux)
 			if err != nil {
 				klog.Errorf("ready probe listener failed: %s", err)
 			}

@@ -164,6 +164,8 @@ func New(restConfig *rest.Config,
 		return nil, err
 	}
 
+	registerMetrics()
+
 	p := &Proxy{
 		restConfig:            restConfig,
 		hooks:                 hooks.New(),

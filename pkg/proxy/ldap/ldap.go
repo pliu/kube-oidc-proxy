@@ -67,6 +67,21 @@ const (
 // from. Every other configuration problem is reported by Config.Validate.
 var ErrNoBackends = errors.New("no LDAP backends configured")
 
+// duplicateUserError reports two entries of one backend claiming one username.
+// It is a type of its own so that the condition can be reported as a metric,
+// which is what an operator needs to notice a directory that needs cleaning up
+// rather than one that is merely unreachable.
+type duplicateUserError struct {
+	username string
+	first    string
+	second   string
+}
+
+func (e *duplicateUserError) Error() string {
+	return fmt.Sprintf("%q is held by both %q and %q, so the groups to give them are ambiguous",
+		e.username, e.first, e.second)
+}
+
 // conn is the subset of *goldap.Conn used by a backend, so that the search
 // behaviour can be exercised without a live directory.
 type conn interface {
@@ -115,9 +130,12 @@ type Directory struct {
 	mapping atomic.Pointer[map[string][]string]
 	stats   atomic.Pointer[Stats]
 
-	// refreshMu serialises refreshes so that a burst of requests to the
-	// refresh endpoint cannot fan out into a burst of directory searches.
+	// refreshMu guards inflight. It is not held across a rebuild.
 	refreshMu sync.Mutex
+
+	// inflight is the rebuild currently running, if one is. A caller arriving
+	// while it runs waits for it rather than starting another.
+	inflight *refreshCall
 
 	// refreshUsers holds the lower cased names of the users allowed to trigger
 	// a refresh. Empty means any authenticated user may.
@@ -185,6 +203,15 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 	empty := make(map[string][]string)
 	d.mapping.Store(&empty)
 	d.stats.Store(&Stats{})
+
+	// Published from here rather than at init, so that a proxy running without
+	// augmentation configured reports no series at all. Every backend starts
+	// with a series of its own, so that "no duplicates" is a zero rather than
+	// an absence an alert cannot tell from a backend that never ran.
+	registerMetrics()
+	for _, b := range backends {
+		backendDuplicateUsers.WithLabelValues(b.config.Name).Set(0)
+	}
 
 	return d, nil
 }
@@ -254,33 +281,98 @@ func (d *Directory) Run(stopCh <-chan struct{}) error {
 	return nil
 }
 
+// refreshCall is one rebuild, along with the result every caller waiting on it
+// is given.
+type refreshCall struct {
+	done chan struct{}
+	err  error
+}
+
 // Refresh rebuilds the user -> group mapping from every backend and atomically
 // swaps it in. The previous mapping is left in place if the rebuild fails.
+//
+// A caller arriving while a rebuild is running joins it and takes its result
+// rather than queueing another. Merely serialising them would turn a burst of
+// requests to the refresh endpoint into that many complete rebuilds run back
+// to back, each searching every directory again for an answer the one before
+// it already had - and by default any authenticated user may ask for one.
 func (d *Directory) Refresh() error {
 	d.refreshMu.Lock()
-	defer d.refreshMu.Unlock()
 
+	if call := d.inflight; call != nil {
+		d.refreshMu.Unlock()
+
+		<-call.done
+
+		return call.err
+	}
+
+	call := &refreshCall{done: make(chan struct{})}
+	d.inflight = call
+
+	d.refreshMu.Unlock()
+
+	call.err = d.refresh()
+
+	// Cleared before the waiters are released, so that a caller arriving as
+	// this one finishes starts a rebuild of its own rather than being handed
+	// the result of one that is already over.
+	d.refreshMu.Lock()
+	d.inflight = nil
+	d.refreshMu.Unlock()
+
+	close(call.done)
+
+	return call.err
+}
+
+// refresh does the rebuild itself. Only the caller that claimed the rebuild
+// runs it, so it needs no locking of its own.
+//
+// The mapping is persisted before it is served, so that what is in the store is
+// never older than what requests are being answered from. The other order lets
+// a restart go backwards in time: a proxy that served a mapping it had not yet
+// persisted, and then died, would come back up and serve the older one it finds
+// in the store - and if the directories are unreachable by then, it cannot get
+// forwards again.
+func (d *Directory) refresh() error {
 	start := time.Now()
 
 	mapping, groups, backendStats, err := d.build()
 	if err != nil {
+		// A failed rebuild is not an outage - the previous mapping keeps
+		// serving - so nothing else surfaces that group changes have stopped
+		// being picked up.
+		lastRefreshSuccess.Set(0)
+
 		return err
 	}
+
+	if err := d.persist(mapping, groups, start, backendStats); err != nil {
+		lastRefreshSuccess.Set(0)
+
+		return err
+	}
+
+	// Measured over the persisting as well as the searching, since a rebuild
+	// is not finished until the mapping it built is safe to serve.
+	took := time.Since(start)
+
+	lastRefreshSuccess.Set(1)
+	refreshDuration.Observe(took.Seconds())
 
 	d.mapping.Store(&mapping)
 	d.stats.Store(&Stats{
 		Users:       len(mapping),
 		Groups:      groups,
 		LastRefresh: start,
-		Duration:    time.Since(start).String(),
+		Duration:    took.String(),
 		Source:      SourceDirectory,
 		Backends:    backendStats,
 	})
 
 	klog.V(2).Infof("refreshed LDAP mapping from %d backends: %d users, %d groups (%s)",
-		len(d.backends), len(mapping), groups, time.Since(start))
-
-	d.persist(mapping, groups, start, backendStats)
+		len(d.backends), len(mapping), groups, took)
 
 	return nil
 }
@@ -367,11 +459,14 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 		merge(mapping, built)
 		groups += builtGroups
 
+		took := time.Since(start)
+		backendRefreshDuration.WithLabelValues(b.config.Name).Observe(took.Seconds())
+
 		stats = append(stats, BackendStats{
 			Name:     b.config.Name,
 			Users:    len(built),
 			Groups:   builtGroups,
-			Duration: time.Since(start).String(),
+			Duration: took.String(),
 		})
 
 		klog.V(4).Infof("built LDAP mapping from backend %q: %d users, %d groups (%s)",
@@ -450,8 +545,17 @@ func (b *backend) build() (map[string][]string, int, error) {
 
 	mapping, err := b.searchUsers(c, groupNames)
 	if err != nil {
+		// A directory holding one username twice needs cleaning up, so it is
+		// worth telling apart from a directory that is merely unreachable.
+		var duplicate *duplicateUserError
+		if errors.As(err, &duplicate) {
+			backendDuplicateUsers.WithLabelValues(b.config.Name).Set(1)
+		}
+
 		return nil, 0, w.wrap(err)
 	}
+
+	backendDuplicateUsers.WithLabelValues(b.config.Name).Set(0)
 
 	return mapping, len(groupNames), nil
 }
@@ -604,8 +708,18 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 
 // searchUsers returns a mapping of lower cased username -> group names, using
 // the memberOf attribute of each user filtered down to the known groups.
+//
+// Two entries of one directory that claim the same username fail the rebuild.
+// Which of them a request should be authorized as is genuinely ambiguous, and
+// resolving it by taking whichever the directory happened to return last would
+// hand a user groups that depend on search order.
 func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string][]string, error) {
 	mapping := make(map[string][]string)
+
+	// claimedBy holds the DN that a username was found on, so that two entries
+	// claiming one identity can be told apart from one entry returned twice by
+	// search bases that overlap.
+	claimedBy := make(map[string]string)
 
 	for _, base := range b.config.UserSearchBases {
 		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
@@ -624,6 +738,20 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 				continue
 			}
 
+			key := strings.ToLower(username)
+
+			if claimed, ok := claimedBy[key]; ok {
+				// One entry returned again because the search bases overlap
+				// carries the same groups either way, so it is not ambiguous.
+				if normaliseDN(claimed) != normaliseDN(entry.DN) {
+					return nil, &duplicateUserError{username: username, first: claimed, second: entry.DN}
+				}
+
+				continue
+			}
+
+			claimedBy[key] = entry.DN
+
 			dns, err := b.memberOfDNs(c, entry)
 			if err != nil {
 				return nil, err
@@ -636,7 +764,7 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 				}
 			}
 
-			mapping[strings.ToLower(username)] = groups
+			mapping[key] = groups
 		}
 	}
 
