@@ -998,6 +998,56 @@ func TestRefreshMatchesDNsLoosely(t *testing.T) {
 	}
 }
 
+// A comma escaped inside an RDN value is data, not an RDN separator. Splitting
+// DNs on commas used to collapse these two distinct groups onto one key after
+// trimming the space, allowing the group returned last to decide the user's
+// authorization. The memberOf also uses the equivalent hexadecimal spelling
+// of the escaped comma to exercise canonical matching.
+func TestRefreshDoesNotConflateEscapedCommasInDNs(t *testing.T) {
+	c := &fakeConn{entries: map[string][]*goldap.Entry{
+		"OU=Groups,DC=example,DC=net": {
+			entry(`CN=Ops\, Admins,OU=Groups,DC=example,DC=net`, map[string][]string{
+				"cn": {"cluster-admins"},
+			}),
+			entry(`CN=Ops\,Admins,OU=Groups,DC=example,DC=net`, map[string][]string{
+				"cn": {"viewers"},
+			}),
+		},
+		"OU=Users,DC=example,DC=net": {
+			entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
+				"userPrincipalName": {"alice@example.net"},
+				"memberOf":          {`cn=ops\2C admins, ou=groups, dc=example, dc=net`},
+			}),
+		},
+	}}
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"cluster-admins"}) {
+		t.Errorf("expected only the group named by memberOf, got %v (found=%t)", groups, ok)
+	}
+}
+
+func TestRefreshRejectsMalformedDNs(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	c.entries["OU=Groups,DC=example,DC=net"][0].DN = `CN=broken\`
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing a malformed group DN")
+	}
+	if !strings.Contains(err.Error(), "invalid DN") {
+		t.Errorf("expected the error to identify the invalid DN, got %q", err)
+	}
+}
+
 // connWithRangedUser returns a fake connection serving one user whose memberOf
 // the directory truncates into windows, the way Active Directory does past
 // MaxValRange.

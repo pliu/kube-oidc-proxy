@@ -702,7 +702,12 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 				continue
 			}
 
-			groupNames[normaliseDN(entry.DN)] = b.config.GroupPrefix + name
+			key, err := normaliseDN(entry.DN)
+			if err != nil {
+				return nil, fmt.Errorf("group %q has an invalid DN: %s", entry.DN, err)
+			}
+
+			groupNames[key] = b.config.GroupPrefix + name
 		}
 	}
 
@@ -746,7 +751,17 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 			if claimed, ok := claimedBy[key]; ok {
 				// One entry returned again because the search bases overlap
 				// carries the same groups either way, so it is not ambiguous.
-				if normaliseDN(claimed) != normaliseDN(entry.DN) {
+				claimedDN, err := normaliseDN(claimed)
+				if err != nil {
+					return nil, fmt.Errorf("user %q has an invalid DN: %s", claimed, err)
+				}
+
+				entryDN, err := normaliseDN(entry.DN)
+				if err != nil {
+					return nil, fmt.Errorf("user %q has an invalid DN: %s", entry.DN, err)
+				}
+
+				if claimedDN != entryDN {
 					return nil, &duplicateUserError{username: username, first: claimed, second: entry.DN}
 				}
 
@@ -762,7 +777,13 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 
 			groups := make([]string, 0)
 			for _, dn := range dns {
-				if name, ok := groupNames[normaliseDN(dn)]; ok {
+				key, err := normaliseDN(dn)
+				if err != nil {
+					return nil, fmt.Errorf("user %q has an invalid %s DN %q: %s",
+						entry.DN, memberOfAttribute, dn, err)
+				}
+
+				if name, ok := groupNames[key]; ok {
 					groups = append(groups, name)
 				}
 			}
@@ -1019,13 +1040,25 @@ func (b *backend) searchMemberOfRange(c conn, dn string, from int) (memberOfChun
 	return memberOfFrom(res.Entries[0])
 }
 
-// normaliseDN makes DNs comparable across the group and memberOf attributes,
-// which are not guaranteed to agree on case or spacing.
-func normaliseDN(dn string) string {
-	parts := strings.Split(dn, ",")
-	for i, part := range parts {
-		parts[i] = strings.TrimSpace(part)
+// normaliseDN makes DNs comparable across the group and memberOf attributes.
+// LDAP can spell the same DN with different case, whitespace, escapes and
+// ordering inside a multi-valued RDN, so it must be parsed as RFC 4514 rather
+// than split on commas (which may themselves be escaped inside a value).
+func normaliseDN(dn string) (string, error) {
+	parsed, err := goldap.ParseDN(dn)
+	if err != nil {
+		return "", err
 	}
 
-	return strings.ToLower(strings.Join(parts, ","))
+	// DN matching in the directories this augmenter supports is intentionally
+	// case insensitive. Lowercase values before String sorts the attributes of
+	// a multi-valued RDN, so equivalent RDNs produce the same key even when the
+	// input used different case and attribute order.
+	for _, rdn := range parsed.RDNs {
+		for _, attribute := range rdn.Attributes {
+			attribute.Value = strings.ToLower(attribute.Value)
+		}
+	}
+
+	return parsed.String(), nil
 }
