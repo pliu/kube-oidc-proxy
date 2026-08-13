@@ -188,6 +188,35 @@ And one using every field, two directories and a persisted mapping:
 Group augmentation relies on impersonation, so it cannot be combined with
 `--disable-impersonation`.
 
+### Client set impersonation
+
+While augmentation is enabled the proxy decides the identity a request is
+impersonated as, so a request that carries `Impersonate-` headers of its own is
+refused with a `403` and this message:
+
+```
+impersonation headers are not accepted while group augmentation is enabled
+```
+
+The two cannot both be honoured. An impersonated identity is built out of the
+headers alone, so `Impersonate-Group` would let the caller choose the groups the
+request runs with - exactly what taking groups from the directory is there to
+prevent. `Impersonate-User` on its own is no better: the target would run as a
+member of no groups at all, rather than of the groups the directory holds for
+them.
+
+The request is refused rather than served with the headers dropped, because a
+caller that asked to act as somebody else and is quietly served as themselves
+has been told the wrong thing about who did the work.
+
+This is decided before the `SubjectAccessReview`, so RBAC granting `impersonate`
+does not change the outcome, and the API server is not consulted.
+
+`--token-passthrough` is unaffected: a request that authenticates that way is
+forwarded with its own credentials and is never impersonated by the proxy, so
+its groups do not come from the directory either. The API server authenticates
+it directly and applies its own impersonation rules.
+
 ### Matching users
 
 The user name of a request is matched against `usernameAttribute` case

@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	gocontext "context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,13 +10,19 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"go.uber.org/mock/gomock"
+	azv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
+	clientazv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
+	fakesubjectaccessreview "github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview/fake"
 )
 
 // fakeAugmenter stands in for a live LDAP backend.
@@ -357,5 +364,117 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 	sort.Strings(groups)
 	if !reflect.DeepEqual(groups, []string{"admins"}) {
 		t.Errorf("expected groups [admins], got %v", groups)
+	}
+}
+
+// countingReviewer records whether the API server was consulted about an
+// impersonation at all.
+type countingReviewer struct {
+	clientazv1.SubjectAccessReviewInterface
+	calls int
+}
+
+func (c *countingReviewer) Create(ctx gocontext.Context, req *azv1.SubjectAccessReview,
+	opts metav1.CreateOptions) (*azv1.SubjectAccessReview, error) {
+	c.calls++
+	return c.SubjectAccessReviewInterface.Create(ctx, req, opts)
+}
+
+// A request may not both carry impersonation headers and have its groups
+// decided by the directory, since the headers would decide the groups instead.
+//
+// Every case here impersonates something the fake reviewer allows, so a refusal
+// cannot be mistaken for RBAC having said no.
+func TestImpersonationIsRefusedWhenAugmentationIsEnabled(t *testing.T) {
+	tests := map[string]http.Header{
+		"a user": {
+			"Impersonate-User": []string{"jjackson"},
+		},
+		"a group": {
+			"Impersonate-User":  []string{"jjackson"},
+			"Impersonate-Group": []string{"group3"},
+		},
+		"a uid": {
+			"Impersonate-User": []string{"jjackson"},
+			"Impersonate-Uid":  []string{"1-2-3-4"},
+		},
+		"an extra": {
+			"Impersonate-User":             []string{"jjackson"},
+			"Impersonate-Extra-Remoteaddr": []string{"1.2.3.4"},
+		},
+	}
+
+	for name, headers := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			defer p.ctrl.Finish()
+
+			reviewer := &countingReviewer{
+				SubjectAccessReviewInterface: fakesubjectaccessreview.New(nil),
+			}
+			p.subjectAccessReviewer, _ = subjectaccessreview.New(reviewer)
+
+			p.ldapDirectory = &fakeAugmenter{
+				mapping: map[string][]string{"alice@example.net": {"admins"}},
+			}
+
+			req := newADRequest("/api/v1/pods", http.MethodGet)
+			for k, vs := range headers {
+				req.Header[k] = vs
+			}
+
+			p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(
+				&authenticator.Response{User: &user.DefaultInfo{Name: "alice@example.net"}}, true, nil)
+
+			var proxied bool
+			handler := p.withHandlers(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				proxied = true
+			}))
+
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("got unexpected response code, exp=%d got=%d",
+					http.StatusForbidden, resp.StatusCode)
+			}
+
+			// The refusal has to say why, or it reads as an RBAC decision the
+			// caller could go and get themselves granted.
+			if body := w.Body.String(); !strings.Contains(body, "group augmentation") {
+				t.Errorf("expected the response to explain the refusal, got %q", body)
+			}
+
+			if proxied {
+				t.Error("expected the request never to reach the API server")
+			}
+
+			// Refused before the check, so holding the RBAC to impersonate does
+			// not get the headers honoured.
+			if reviewer.calls != 0 {
+				t.Errorf("expected no SubjectAccessReview to be created, got %d", reviewer.calls)
+			}
+		})
+	}
+}
+
+// A request carrying no impersonation headers is still served, and still gets
+// the groups of the directory.
+func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+
+	p.fakeRT.expUser = "alice@example.net"
+	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
+
+	resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet),
+		&user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusOK, resp.StatusCode)
 	}
 }

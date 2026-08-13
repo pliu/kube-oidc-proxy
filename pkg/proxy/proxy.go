@@ -43,6 +43,13 @@ var (
 	errUnauthorized          = errors.New("Unauthorized")
 	errNoName                = errors.New("No name in OIDC info")
 	errNoImpersonationConfig = errors.New("No impersonation configuration in context")
+
+	// errImpersonationNotAccepted is returned for a request that carries
+	// Impersonate- headers while the groups of a request are being taken from
+	// the directory. See withImpersonateRequest for why the two cannot both be
+	// honoured.
+	errImpersonationNotAccepted = errors.New(
+		"impersonation headers are not accepted while group augmentation is enabled")
 )
 
 type Config struct {

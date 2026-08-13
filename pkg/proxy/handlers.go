@@ -192,6 +192,24 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			return
 		}
 
+		// A request may not both ask to be impersonated as somebody else and
+		// have its groups decided by the directory. Honouring the headers
+		// builds the target identity out of Impersonate-Group alone, so the
+		// caller - not the directory - would decide the groups the request runs
+		// with, which is the thing augmentation exists to stop. Even
+		// Impersonate-User on its own runs the target as a member of no groups
+		// rather than of the groups the directory holds for them.
+		//
+		// This is refused rather than ignored. A caller that asked to act as
+		// somebody else and is quietly served as themselves has been told the
+		// wrong thing about who did the work.
+		if p.ldapDirectory != nil && p.hasImpersonation(req.Header) {
+			klog.V(2).Infof("rejecting impersonation headers from %q while groups are taken from the directory (%s)",
+				user.GetName(), remoteAddr)
+			p.handleError(rw, req, errImpersonationNotAccepted)
+			return
+		}
+
 		// Keep the name from the token but take the groups from the directory.
 		// This happens before the impersonation check below so that the
 		// authorization decision is made against the directory groups too.
@@ -332,6 +350,12 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 		case errNoName:
 			klog.V(2).Infof("no name available in oidc info %s", r.RemoteAddr)
 			http.Error(rw, "Username claim not available in OIDC Issuer response", http.StatusForbidden)
+			return
+
+			// Impersonation headers sent while the groups of a request are
+			// taken from the directory
+		case errImpersonationNotAccepted:
+			http.Error(rw, errImpersonationNotAccepted.Error(), http.StatusForbidden)
 			return
 
 			// No impersonation configuration found in context
