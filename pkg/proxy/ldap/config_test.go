@@ -43,6 +43,10 @@ func TestParseConfigAppliesDefaults(t *testing.T) {
 		"groupNameAttribute": {backend.GroupNameAttribute, DefaultGroupNameAttribute},
 	}
 
+	if got := backend.Timeout.Duration(); got != DefaultTimeout {
+		t.Errorf("expected a default timeout of %s, got %s", DefaultTimeout, got)
+	}
+
 	for name, test := range tests {
 		if test.got != test.exp {
 			t.Errorf("expected a default %s of %q, got %q", name, test.exp, test.got)
@@ -267,6 +271,13 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "refreshInterval": "0s"}`,
 			"refreshInterval must be a positive duration",
+		},
+		"a timeout of zero": {
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "timeout": "0s",
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
+			"timeout must be a positive duration",
 		},
 	}
 

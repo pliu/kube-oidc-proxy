@@ -364,6 +364,129 @@ func TestRefreshFailsWhenABackendIsDown(t *testing.T) {
 	}
 }
 
+// hangingConn accepts a connection and then answers nothing until it is
+// closed, the way a directory that has stopped responding does: go-ldap waits
+// on a channel that only the connection closing ever unblocks.
+type hangingConn struct {
+	*fakeConn
+
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newHangingConn() *hangingConn {
+	return &hangingConn{
+		fakeConn: &fakeConn{entries: map[string][]*goldap.Entry{}},
+		closed:   make(chan struct{}),
+	}
+}
+
+func (h *hangingConn) SearchWithPaging(*goldap.SearchRequest, uint32) (*goldap.SearchResult, error) {
+	<-h.closed
+	return nil, errors.New("ldap: response channel closed")
+}
+
+func (h *hangingConn) Close() error {
+	h.once.Do(func() { close(h.closed) })
+	return nil
+}
+
+// A directory that accepts a connection and then goes quiet has to fail the
+// rebuild like any other unreachable backend, rather than holding the refresh
+// open for as long as the process runs.
+func TestRefreshTimesOutOnABackendThatStopsResponding(t *testing.T) {
+	responsive := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	config := testConfig()
+	config.Backends[0].Timeout = NewDuration(time.Millisecond * 50)
+
+	d, err := New(config, store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return responsive, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	hanging := newHangingConn()
+	d.backends[0].dial = func(string) (conn, error) { return hanging, nil }
+
+	err = d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing against a directory that stopped responding")
+	}
+
+	if !strings.Contains(err.Error(), "timed out after 50ms") {
+		t.Errorf("expected the error to report the timeout, got %q", err)
+	}
+
+	// The connection has to actually be closed, since that is the only thing
+	// that unblocks the search waiting on it.
+	select {
+	case <-hanging.closed:
+	default:
+		t.Error("expected the timed out connection to have been closed")
+	}
+
+	// A timeout is a failed refresh, so the previous mapping keeps serving and
+	// nothing is written over the persisted copy of it.
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the previous mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+
+	if store.saves != 1 {
+		t.Errorf("expected the timed out refresh not to have been persisted, got %d saves", store.saves)
+	}
+}
+
+func TestWatchdogClosesAConnectionThatOutlastsIt(t *testing.T) {
+	c := newHangingConn()
+
+	w := newWatchdog(time.Millisecond)
+	defer w.stop()
+
+	w.watch(c)
+
+	select {
+	case <-c.closed:
+	case <-time.After(time.Second * 5):
+		t.Fatal("expected the watchdog to close the connection it was given")
+	}
+}
+
+// Dialling races the timeout, so a connection that arrives after it expired
+// must not be left open and searched.
+func TestWatchdogClosesAConnectionHandedOverAfterItFired(t *testing.T) {
+	w := newWatchdog(time.Hour)
+	defer w.stop()
+
+	w.fire()
+
+	c := newHangingConn()
+	w.watch(c)
+
+	select {
+	case <-c.closed:
+	default:
+		t.Error("expected a connection handed over after the timeout to be closed straight away")
+	}
+
+	if err := w.wrap(errors.New("response channel closed")); !strings.Contains(err.Error(), "timed out after 1h0m0s") {
+		t.Errorf("expected the error to be reported as the timeout, got %q", err)
+	}
+
+	if err := w.wrap(nil); err != nil {
+		t.Errorf("expected no error to stay no error, got %s", err)
+	}
+}
+
 // A backend whose searches still succeed but find nobody would otherwise merge
 // in as a backend that contributes nothing, silently stripping every user of
 // that directory of their groups.
@@ -740,7 +863,10 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 		return c, nil
 	}
 
-	got, err := d.backends[0].connect()
+	w := newWatchdog(time.Minute)
+	defer w.stop()
+
+	got, err := d.backends[0].connect(w)
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
@@ -1302,6 +1428,7 @@ func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
 		"a changed url":           {func(c *Config) { c.Backends[0].URLs = []string{"ldaps://other.example.net:636"} }, false},
 		"a changed refresh":       {func(c *Config) { c.RefreshInterval = NewDuration(time.Hour) }, false},
 		"a changed cache setting": {func(c *Config) { c.Cache = &CacheConfig{Type: CacheTypeNone} }, false},
+		"a changed timeout":       {func(c *Config) { c.Backends[0].Timeout = NewDuration(time.Hour) }, false},
 	}
 
 	for name, test := range tests {

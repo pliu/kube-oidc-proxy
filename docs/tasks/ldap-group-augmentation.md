@@ -34,6 +34,16 @@ reachable backends returned would quietly drop the groups a user holds in the
 unreachable one, which is worse than serving a mapping that is one refresh
 interval out of date.
 
+The same applies to a backend that stops answering part way through. Each
+backend has a `timeout`, five minutes by default, covering everything it does in
+one rebuild - connecting, binding and every search. A directory that accepts a
+connection and then goes quiet is otherwise indistinguishable from one that is
+merely slow, and would hold the rebuild open for as long as the proxy runs;
+instead the connection is closed and the rebuild fails, leaving the previous
+mapping serving and the persisted copy of it untouched. Searches also carry the
+timeout as their server side time limit, so a directory that is still listening
+gives up and answers for itself rather than being cut off.
+
 The same applies to a backend that is still answering but has stopped returning
 anything. A search that finds nothing is not an error, so a bind account that
 loses its read on the user OU, or a search base renamed out from under the
@@ -111,6 +121,7 @@ And one using every field, two directories and a persisted mapping:
       "name": "partners",
       "urls": ["ldap://partners.example.net:389"],
       "startTLS": true,
+      "timeout": "2m",
       "bindDN": "CN=kube-oidc-proxy,OU=Service Accounts,DC=partners,DC=net",
       "bindPasswordFile": "/etc/kube-oidc-proxy/partners-password",
       "userSearchBases": ["OU=Users,DC=partners,DC=net"],
@@ -153,6 +164,7 @@ And one using every field, two directories and a persisted mapping:
 | `caFile` | | PEM bundle used to verify the directory's serving certificate. Defaults to the host trust store. |
 | `insecureSkipTLSVerify` | `false` | Do not verify the directory's serving certificate. |
 | `startTLS` | `false` | Issue a StartTLS request after connecting. Used with an `ldap://` URL. |
+| `timeout` | `5m` | How long this directory has to connect, bind and be searched before the rebuild is failed. |
 | `userSearchBases` | | Base DN(s) to search for users under. |
 | `userFilter` | `(objectClass=user)` | LDAP filter selecting user entries. |
 | `usernameAttribute` | `userPrincipalName` | Attribute holding the name that matches the user name of the JWT. |

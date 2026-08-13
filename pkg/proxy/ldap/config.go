@@ -38,6 +38,7 @@ const (
 	DefaultGroupFilter        = "(objectClass=group)"
 	DefaultGroupNameAttribute = "cn"
 	DefaultRefreshInterval    = time.Minute * 10
+	DefaultTimeout            = time.Minute * 5
 	DefaultSecretKey          = "mapping.json.gz"
 )
 
@@ -91,6 +92,12 @@ type BackendConfig struct {
 	CAFile                string `json:"caFile,omitempty"`
 	InsecureSkipTLSVerify bool   `json:"insecureSkipTLSVerify,omitempty"`
 	StartTLS              bool   `json:"startTLS,omitempty"`
+
+	// Timeout bounds everything this backend does in one rebuild: connecting,
+	// binding and every search. It is a pointer so that a file asking for a
+	// timeout of "0s" is rejected rather than quietly taken to mean no bound
+	// at all, which is the behaviour it reads as asking for.
+	Timeout *Duration `json:"timeout,omitempty"`
 
 	UserSearchBases   []string `json:"userSearchBases"`
 	UserFilter        string   `json:"userFilter,omitempty"`
@@ -275,6 +282,9 @@ func (c *Config) SetDefaults() {
 		if backend.GroupNameAttribute == "" {
 			backend.GroupNameAttribute = DefaultGroupNameAttribute
 		}
+		if backend.Timeout == nil {
+			backend.Timeout = NewDuration(DefaultTimeout)
+		}
 	}
 
 	if c.Cache == nil {
@@ -355,6 +365,10 @@ func (b *BackendConfig) validate(id string) []error {
 
 	if b.CAFile != "" && b.InsecureSkipTLSVerify {
 		errs = append(errs, fmt.Errorf("%s: cannot set both caFile and insecureSkipTLSVerify", id))
+	}
+
+	if b.Timeout != nil && b.Timeout.Duration() <= 0 {
+		errs = append(errs, fmt.Errorf("%s: timeout must be a positive duration", id))
 	}
 
 	return errs

@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -427,9 +428,16 @@ func finalise(mapping map[string][]string) {
 // build searches this backend and returns a username -> groups mapping, along
 // with the number of distinct groups that were considered.
 func (b *backend) build() (map[string][]string, int, error) {
-	c, err := b.connect()
+	// A directory that accepts a connection and then stops answering would
+	// otherwise hold a refresh here for as long as the process runs: go-ldap
+	// waits for a response on a channel with no deadline of its own, so
+	// closing the connection under it is the only way back out.
+	w := newWatchdog(b.config.Timeout.Duration())
+	defer w.stop()
+
+	c, err := b.connect(w)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, w.wrap(err)
 	}
 	defer c.Close()
 
@@ -437,15 +445,104 @@ func (b *backend) build() (map[string][]string, int, error) {
 	// pulled, so the mapping is restricted to the intended part of the tree.
 	groupNames, err := b.searchGroups(c)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, w.wrap(err)
 	}
 
 	mapping, err := b.searchUsers(c, groupNames)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, w.wrap(err)
 	}
 
 	return mapping, len(groupNames), nil
+}
+
+// watchdog closes a connection that a backend has not finished with in time.
+//
+// go-ldap reads a response off a channel that nothing else ever writes to if
+// the directory goes quiet, and neither Conn.SetTimeout nor the request time
+// limit reaches that: the first bounds the delivery of a response that did
+// arrive, the second is enforced by a server that is still listening. Closing
+// the connection is what unblocks the read, so that is what this does.
+type watchdog struct {
+	timeout time.Duration
+	timer   *time.Timer
+
+	mu sync.Mutex
+	// c is the connection to close, once there is one to close.
+	c conn
+	// fired records that the timeout expired, so that whatever error the
+	// closed connection produces can be reported as the timeout it is.
+	fired bool
+}
+
+// timeLimit is the timeout as the seconds a search request carries, so that a
+// directory which is still listening gives up on its own and answers with a
+// result code, rather than being cut off mid sentence by the watchdog. It is
+// rounded up, since a limit of zero is what the protocol uses for no limit.
+func (b *backend) timeLimit() int {
+	seconds := int((b.config.Timeout.Duration() + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+
+	return seconds
+}
+
+func newWatchdog(timeout time.Duration) *watchdog {
+	w := &watchdog{timeout: timeout}
+	w.timer = time.AfterFunc(timeout, w.fire)
+
+	return w
+}
+
+// watch hands the watchdog the connection to close, closing it immediately if
+// the timeout has already expired.
+func (w *watchdog) watch(c conn) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.c = c
+
+	if w.fired {
+		c.Close()
+	}
+}
+
+// forget drops a connection the backend has closed itself, so that a later
+// timeout cannot close a connection this backend no longer owns.
+func (w *watchdog) forget() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.c = nil
+}
+
+func (w *watchdog) fire() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.fired = true
+
+	if w.c != nil {
+		w.c.Close()
+	}
+}
+
+func (w *watchdog) stop() {
+	w.timer.Stop()
+}
+
+// wrap reports an error as the timeout that caused it, when it was. What
+// go-ldap returns from a connection closed under it says nothing about why.
+func (w *watchdog) wrap(err error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err == nil || !w.fired {
+		return err
+	}
+
+	return fmt.Errorf("timed out after %s: %s", w.timeout, err)
 }
 
 // observe records what a backend returned, rejecting one that has stopped
@@ -484,7 +581,7 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 
 	for _, base := range b.config.GroupSearchBases {
 		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
-			0, 0, false, b.config.GroupFilter, []string{b.config.GroupNameAttribute}, nil)
+			0, b.timeLimit(), false, b.config.GroupFilter, []string{b.config.GroupNameAttribute}, nil)
 
 		res, err := c.SearchWithPaging(req, pageSize)
 		if err != nil {
@@ -512,7 +609,7 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 
 	for _, base := range b.config.UserSearchBases {
 		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
-			0, 0, false, b.config.UserFilter,
+			0, b.timeLimit(), false, b.config.UserFilter,
 			[]string{b.config.UsernameAttribute, memberOfAttribute}, nil)
 
 		res, err := c.SearchWithPaging(req, pageSize)
@@ -548,7 +645,11 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 
 // connect dials the configured URLs in order, returning the first connection
 // that can be established and bound.
-func (b *backend) connect() (conn, error) {
+//
+// Each connection is handed to the watchdog as soon as it exists, since a
+// directory that accepts the connection and then never answers the bind hangs
+// just as thoroughly as one that never answers a search.
+func (b *backend) connect(w *watchdog) (conn, error) {
 	var errs []string
 
 	for _, url := range b.config.URLs {
@@ -558,9 +659,12 @@ func (b *backend) connect() (conn, error) {
 			continue
 		}
 
+		w.watch(c)
+
 		if b.config.StartTLS {
 			if err := c.StartTLS(b.tlsConfig); err != nil {
 				c.Close()
+				w.forget()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS failed: %s", url, err))
 				continue
 			}
@@ -570,6 +674,7 @@ func (b *backend) connect() (conn, error) {
 		if b.config.BindDN != "" {
 			if err := c.Bind(b.config.BindDN, b.bindPassword); err != nil {
 				c.Close()
+				w.forget()
 				errs = append(errs, fmt.Sprintf("%s: bind failed: %s", url, err))
 				continue
 			}
@@ -582,7 +687,12 @@ func (b *backend) connect() (conn, error) {
 }
 
 func (b *backend) dialLDAP(url string) (conn, error) {
-	return goldap.DialURL(url, goldap.DialWithTLSConfig(b.tlsConfig))
+	// The watchdog cannot close a connection that does not exist yet, so the
+	// dial carries its own bound. go-ldap otherwise applies a package level
+	// default of 60s, which no configuration can move.
+	dialer := &net.Dialer{Timeout: b.config.Timeout.Duration()}
+
+	return goldap.DialURL(url, goldap.DialWithTLSConfig(b.tlsConfig), goldap.DialWithDialer(dialer))
 }
 
 func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {
@@ -763,7 +873,7 @@ func (b *backend) searchMemberOfRange(c conn, dn string, from int) (memberOfChun
 	attribute := fmt.Sprintf("%s;%s%d-*", memberOfAttribute, rangeOption, from)
 
 	req := goldap.NewSearchRequest(dn, goldap.ScopeBaseObject, goldap.NeverDerefAliases,
-		0, 0, false, "(objectClass=*)", []string{attribute}, nil)
+		0, b.timeLimit(), false, "(objectClass=*)", []string{attribute}, nil)
 
 	res, err := c.Search(req)
 	if err != nil {

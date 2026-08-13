@@ -84,6 +84,11 @@
           "type": "boolean",
           "default": false
         },
+        "timeout": {
+          "description": "How long this directory has to connect, bind and be searched before the rebuild is given up on and failed. A Go duration string.",
+          "$ref": "#/$defs/duration",
+          "default": "5m"
+        },
         "userSearchBases": {
           "description": "Base DN(s) to search for users under.",
           "type": "array",
