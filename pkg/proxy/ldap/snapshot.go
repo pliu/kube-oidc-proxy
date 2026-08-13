@@ -3,10 +3,13 @@ package ldap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -83,7 +86,7 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 
 	table, users := internMapping(mapping)
 
-	data, err := json.Marshal(&Snapshot{
+	snapshot := &Snapshot{
 		Version:     snapshotVersion,
 		MappingHash: d.mappingHash,
 		BuiltAt:     builtAt,
@@ -91,7 +94,24 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		Backends:    persisted,
 		GroupTable:  table,
 		Users:       users,
-	})
+	}
+
+	// A refresh that rebuilt the mapping the store already holds has nothing to
+	// add to it. Most refreshes are that: group memberships change far less
+	// often than they are looked at, which is why the mapping is worth building
+	// ahead of time at all. There is no partial write either - the whole
+	// mapping goes out every time it goes out at all - so on a directory that
+	// is not changing this is the difference between rewriting megabytes every
+	// refresh interval and writing nothing.
+	hash := snapshot.contentHash()
+	if hash == d.persisted.hash && !d.persisted.ageing(builtAt, d.maxCacheAge()) {
+		klog.V(4).Infof("LDAP mapping of %d users is the one already persisted to %s, leaving it",
+			len(mapping), d.cache)
+
+		return nil
+	}
+
+	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("failed to encode the mapping to persist to %s: %s", d.cache, err)
 	}
@@ -103,9 +123,105 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		return fmt.Errorf("failed to persist the mapping to %s: %s", d.cache, err)
 	}
 
+	// Recorded only once the write is through, so that a store which failed is
+	// written to again by the next refresh rather than being taken for holding
+	// a mapping it never received.
+	d.persisted = persistedSnapshot{hash: hash, builtAt: builtAt}
+
 	klog.V(4).Infof("persisted LDAP mapping of %d users to %s", len(mapping), d.cache)
 
 	return nil
+}
+
+// persistedSnapshot is what the store is taken to hold: the fingerprint of the
+// mapping last written to it, and the build time written alongside that.
+//
+// Written only by the refresh path, which Refresh serialises, and by restore
+// before the first refresh.
+type persistedSnapshot struct {
+	hash    string
+	builtAt time.Time
+}
+
+// ageing reports whether a mapping that has not changed should be written again
+// anyway, to carry the build time recorded with it forwards.
+//
+// Only maxAge makes that time matter, and it is measured by the proxy that
+// reads the snapshot back rather than by this one. A mapping confirmed against
+// the directories every refresh interval for a week is still recorded as a week
+// old if it was never rewritten in that time, and would be thrown away at
+// exactly the restart it exists for. Rewriting it once it is halfway to being
+// rejected keeps it servable without going back to writing on every refresh.
+func (p persistedSnapshot) ageing(now time.Time, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+
+	return now.Sub(p.builtAt) >= maxAge/2
+}
+
+// contentHash fingerprints everything a snapshot holds apart from when it was
+// built, so that a refresh which rebuilt the same mapping can be told from one
+// that changed it.
+//
+// The interned form it runs over is already canonical - internMapping sorts the
+// table, and the groups of a user are sorted before they are interned - so the
+// same mapping always fingerprints the same way. Usernames are walked in order
+// because a map is not, and every string is written with its length, so that a
+// group name holding a separator cannot pass for two fields.
+func (s *Snapshot) contentHash() string {
+	h := sha256.New()
+
+	buf := appendHashed(nil, s.MappingHash)
+	buf = appendCounts(buf, s.Version, s.Groups, len(s.Backends), len(s.GroupTable), len(s.Users))
+	h.Write(buf)
+
+	for _, b := range s.Backends {
+		buf = appendHashed(buf[:0], b.Name)
+		buf = appendCounts(buf, b.Users, b.Groups)
+		h.Write(buf)
+	}
+
+	for _, group := range s.GroupTable {
+		buf = appendHashed(buf[:0], group)
+		h.Write(buf)
+	}
+
+	usernames := make([]string, 0, len(s.Users))
+	for username := range s.Users {
+		usernames = append(usernames, username)
+	}
+	sort.Strings(usernames)
+
+	for _, username := range usernames {
+		indices := s.Users[username]
+
+		buf = appendHashed(buf[:0], username)
+		buf = appendCounts(buf, indices...)
+		h.Write(buf)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// appendHashed writes a string length prefixed, so that no combination of
+// values can be arranged into the same bytes as a different one.
+func appendHashed(buf []byte, s string) []byte {
+	buf = strconv.AppendInt(buf, int64(len(s)), 10)
+	buf = append(buf, ':')
+
+	return append(buf, s...)
+}
+
+// appendCounts writes numbers separated from each other and terminated, for the
+// same reason.
+func appendCounts(buf []byte, counts ...int) []byte {
+	for _, count := range counts {
+		buf = strconv.AppendInt(buf, int64(count), 10)
+		buf = append(buf, ',')
+	}
+
+	return append(buf, ';')
 }
 
 // restore installs the persisted mapping, if there is a usable one, and
@@ -136,6 +252,11 @@ func (d *Directory) restore() bool {
 	}
 
 	d.seedCounts(snapshot.Backends)
+
+	// The store is already holding this, so a first refresh that rebuilds the
+	// same mapping - which is what a restart that changed nothing but the
+	// process does - has no reason to write it back.
+	d.persisted = persistedSnapshot{hash: snapshot.contentHash(), builtAt: snapshot.BuiltAt}
 
 	finalise(mapping)
 

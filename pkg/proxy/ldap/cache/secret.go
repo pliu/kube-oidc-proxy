@@ -45,9 +45,10 @@ const (
 // be persisted to a file. Save refuses a mapping that does not fit rather than
 // letting the write fail.
 //
-// The whole mapping is also rewritten on every refresh, and a Secret this size
-// is not a cheap object to keep rewriting: it goes through etcd and out to
-// everything watching it.
+// There is also no partial write: any change to the mapping, however small,
+// rewrites the whole of it. A Secret this size is not a cheap object to keep
+// rewriting - it goes through etcd and out to everything watching it - which is
+// why a rebuild that changed nothing is not written at all.
 type Secret struct {
 	client kubernetes.Interface
 

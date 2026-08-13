@@ -1627,6 +1627,233 @@ func TestRefreshPersistsMapping(t *testing.T) {
 	}
 }
 
+// Group memberships change far less often than they are looked at, and there is
+// no partial write - the whole mapping goes out every time it goes out at all -
+// so a refresh that rebuilt the mapping the store already holds leaves it be.
+func TestRefreshDoesNotRewriteAnUnchangedMapping(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Errorf("expected a rebuild of the same mapping not to rewrite it, got %d saves", store.saves)
+	}
+
+	// A group alice has picked up since is a change, and has to reach the
+	// store: the whole point of skipping the write is that it was a no-op.
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+		entry("CN=devs,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"devs"}}))
+	c.entries["OU=Users,DC=example,DC=net"] = []*goldap.Entry{
+		entry("CN=alice@example.net,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"alice@example.net"},
+			"memberOf": {
+				"CN=admins,OU=Groups,DC=example,DC=net",
+				"CN=devs,OU=Groups,DC=example,DC=net",
+			},
+		}),
+	}
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 2 {
+		t.Fatalf("expected a changed mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	snapshot := new(Snapshot)
+	if err := json.Unmarshal(store.data, snapshot); err != nil {
+		t.Fatalf("unexpected error decoding the persisted mapping: %s", err)
+	}
+
+	mapping, err := snapshot.mapping()
+	if err != nil {
+		t.Fatalf("unexpected error resolving the persisted mapping: %s", err)
+	}
+	if !reflect.DeepEqual(mapping, map[string][]string{"alice@example.net": {"admins", "devs"}}) {
+		t.Errorf("expected the changed mapping to have been persisted, got %v", mapping)
+	}
+}
+
+// The mapping a proxy restores at startup is by definition the one the store
+// holds, so a restart that finds the directories unchanged does not rewrite it
+// either. Rollouts are when a mapping is most likely to be rebuilt unchanged.
+func TestRestoredMappingIsNotRewrittenWhenUnchanged(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	before, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	before.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := before.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// The proxy after the restart, which restores that mapping and then builds
+	// the same one from the directory it can still reach.
+	after, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	after.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := after.Run(stopCh); err != nil {
+		t.Fatalf("unexpected error starting: %s", err)
+	}
+
+	if store.saves != 1 {
+		t.Errorf("expected the restored mapping not to be rewritten, got %d saves", store.saves)
+	}
+
+	if groups, ok := after.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the mapping to be served, got %v (found=%t)", groups, ok)
+	}
+}
+
+// Nothing but a write moves the build time recorded with a mapping forwards, so
+// a mapping that is never rewritten ages past maxAge and is thrown away at
+// exactly the restart it exists for.
+func TestUnchangedMappingIsRewrittenBeforeItAgesOut(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	config := testConfig()
+	config.Cache = &CacheConfig{
+		Type:   CacheTypeFile,
+		File:   &FileCacheConfig{Path: filepath.Join(t.TempDir(), "mapping.json")},
+		MaxAge: *NewDuration(time.Hour),
+	}
+
+	d, err := New(config, store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	// Still inside the half of maxAge that a rewrite is held off for.
+	d.persisted.builtAt = time.Now().Add(-time.Minute * 20)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Errorf("expected a mapping well inside maxAge not to be rewritten, got %d saves", store.saves)
+	}
+
+	d.persisted.builtAt = time.Now().Add(-time.Minute * 40)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 2 {
+		t.Errorf("expected a mapping halfway to maxAge to be rewritten, got %d saves", store.saves)
+	}
+}
+
+// The fingerprint that decides whether the store already holds a mapping.
+// Missing a change is the failure that matters: the store would be left holding
+// a mapping the directories no longer agree with, and a restart would serve it.
+func TestSnapshotContentHash(t *testing.T) {
+	base := func() *Snapshot {
+		return &Snapshot{
+			Version:     snapshotVersion,
+			MappingHash: "configuration",
+			BuiltAt:     time.Now(),
+			Groups:      2,
+			Backends:    []SnapshotBackend{{Name: "ldap", Users: 2, Groups: 2}},
+			GroupTable:  []string{"admins", "devs"},
+			Users:       map[string][]int{"alice@example.net": {0}, "bob@example.net": {0, 1}},
+		}
+	}
+
+	tests := map[string]struct {
+		mutate   func(s *Snapshot)
+		expEqual bool
+	}{
+		"the same mapping built again": {
+			mutate:   func(s *Snapshot) {},
+			expEqual: true,
+		},
+		"the same mapping built at a different time": {
+			mutate:   func(s *Snapshot) { s.BuiltAt = s.BuiltAt.Add(time.Hour) },
+			expEqual: true,
+		},
+		"a user who has lost a group": {
+			mutate: func(s *Snapshot) { s.Users["bob@example.net"] = []int{0} },
+		},
+		"a user who has gained a group": {
+			mutate: func(s *Snapshot) { s.Users["alice@example.net"] = []int{0, 1} },
+		},
+		"a user who has gone": {
+			mutate: func(s *Snapshot) { delete(s.Users, "bob@example.net") },
+		},
+		"a user who is new": {
+			mutate: func(s *Snapshot) { s.Users["carol@example.net"] = []int{1} },
+		},
+		"a group that has been renamed": {
+			mutate: func(s *Snapshot) { s.GroupTable = []string{"admins", "developers"} },
+		},
+		"a backend that returned fewer users": {
+			mutate: func(s *Snapshot) { s.Backends[0].Users = 1 },
+		},
+		"a mapping built from a different configuration": {
+			mutate: func(s *Snapshot) { s.MappingHash = "other" },
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			mutated := base()
+			test.mutate(mutated)
+
+			if equal := base().contentHash() == mutated.contentHash(); equal != test.expEqual {
+				t.Errorf("expected fingerprints to be equal=%t for %s, got equal=%t",
+					test.expEqual, name, equal)
+			}
+		})
+	}
+
+	// Group names are not a fixed width, so a table that runs two of them
+	// together must not fingerprint as one that divides them elsewhere.
+	run, divided := base(), base()
+	run.GroupTable = []string{"ab", "c"}
+	divided.GroupTable = []string{"a", "bc"}
+
+	if run.contentHash() == divided.contentHash() {
+		t.Error("expected group names that concatenate the same way to fingerprint differently")
+	}
+}
+
 // The guard against an emptied backend has to survive the restart the
 // persisted mapping exists for: a proxy coming back up while a directory has
 // quietly stopped answering must not accept the degraded mapping, nor persist

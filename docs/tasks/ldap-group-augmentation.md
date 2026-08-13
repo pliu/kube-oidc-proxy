@@ -318,10 +318,25 @@ that writes a different format, if it was built from a different set of search
 bases, filters or prefixes, or if it is older than `maxAge`. Rotating a bind
 password or changing a URL does not discard it.
 
+A refresh that rebuilds the mapping already in the store does not write it
+again. Most refreshes are that - group memberships change far less often than
+they are looked at - and the whole mapping goes out every time it goes out at
+all, so on a directory that is not changing this is the difference between
+rewriting the lot every `refreshInterval` and writing nothing. It also means a
+rollout does not rewrite the mapping it just restored.
+
+The one thing that write did on its own was record how recent the mapping was.
+So when `maxAge` is set, an unchanged mapping is rewritten anyway once it is
+halfway to it, rather than being left to age out of a store it is still being
+confirmed against every `refreshInterval`. With `maxAge` unset nothing measures
+its age, and it is left alone indefinitely - the timestamp in the store then
+says when the mapping last *changed*, which is also what the "built N ago" in
+the startup log is reporting.
+
 | Field | Default | Description |
 | ----- | ------- | ----------- |
 | `type` | | **Required.** One of `none`, `file` or `kubernetesSecret`. |
-| `maxAge` | | How old a persisted mapping may be and still be served. If unset, it is served however old it is. |
+| `maxAge` | | How old a persisted mapping may be and still be served. If unset, it is served however old it is. Also makes an unchanged mapping be rewritten once it is halfway to this age. |
 | `file.path` | | Where to write the mapping. Required when `type` is `file`. |
 | `kubernetesSecret.name` | | Name of the Secret to write. Required when `type` is `kubernetesSecret`. |
 | `kubernetesSecret.namespace` | The proxy's own namespace | Namespace of that Secret. |
@@ -352,9 +367,10 @@ API server caps a Secret at 1MiB. The payload is gzipped, and holds each group
 name once rather than repeating it in every member's entry, which between them
 fit a directory of roughly 45,000 users in ten groups each - or roughly 15,000
 in thirty each. Past that the mapping is refused with an error rather than a
-failed write, and has to go to a `file` instead. Note also that the whole
-mapping is rewritten on every refresh, and every write of a Secret that size
-goes through etcd and out to everything watching it.
+failed write, and has to go to a `file` instead. Note also that a Secret that
+size is not cheap to write - it goes through etcd and out to everything watching
+it - so it is worth knowing that a rebuild which
+[changed nothing](#persisting-the-mapping) does not write at all.
 
 Prefer `file` on a volume for anything but a small directory. `kubernetesSecret`
 is for the deployment that wants no volume of its own and knows it stays well

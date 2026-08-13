@@ -121,6 +121,10 @@ type Directory struct {
 	// cache persists the built mapping. Nil when persistence is disabled.
 	cache cache.Store
 
+	// persisted is what the cache is taken to already hold, so that a refresh
+	// which rebuilds the same mapping does not rewrite it.
+	persisted persistedSnapshot
+
 	// mappingHash identifies the configuration the mapping is built from, so
 	// that a mapping persisted under a different configuration is not served.
 	mappingHash string
