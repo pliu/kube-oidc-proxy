@@ -36,14 +36,19 @@ type fakeConn struct {
 	// searches counts the base scoped searches answered by searchFn.
 	searches int
 
-	searchErr error
-	bindErr   error
+	searchErr      error
+	bindErr        error
+	startTLSErr    error
+	startTLSConfig *tls.Config
 
 	bound  bool
 	closed bool
 }
 
-func (f *fakeConn) StartTLS(*tls.Config) error { return nil }
+func (f *fakeConn) StartTLS(config *tls.Config) error {
+	f.startTLSConfig = config.Clone()
+	return f.startTLSErr
+}
 
 func (f *fakeConn) Bind(username, password string) error {
 	if f.bindErr != nil {
@@ -263,6 +268,69 @@ func TestRefreshBuildsMapping(t *testing.T) {
 	}
 	if len(stats.Backends) != 1 || stats.Backends[0].Name != "ldap" || stats.Backends[0].Users != 2 {
 		t.Errorf("expected per backend stats for 2 users of backend \"ldap\", got %+v", stats.Backends)
+	}
+}
+
+// LDAP DNs distinguish these entries, but Kubernetes RBAC sees only the
+// emitted name. Accepting both would collapse separate directory groups into
+// one authorization identity.
+func TestRefreshFailsWhenGroupsShareAnAuthorizationName(t *testing.T) {
+	c := &fakeConn{entries: map[string][]*goldap.Entry{
+		"OU=Groups,DC=example,DC=net": {
+			entry("CN=admins,OU=Internal,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
+			entry("CN=admins,OU=External,DC=example,DC=net", map[string][]string{"cn": {"admins"}}),
+		},
+	}}
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing a backend with duplicate group names")
+	}
+
+	for _, want := range []string{"admins", "OU=Internal", "OU=External", "authorization identity is ambiguous"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected the error to contain %q, got %q", want, err)
+		}
+	}
+}
+
+// Overlapping search bases can return one entry more than once. That is one
+// LDAP group and therefore one authorization identity, not a collision.
+func TestRefreshAcceptsOneGroupReturnedByOverlappingSearchBases(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	c.entries["DC=example,DC=net"] = c.entries["OU=Groups,DC=example,DC=net"]
+
+	backend := testBackend("ldap")
+	backend.GroupSearchBases = []string{"OU=Groups,DC=example,DC=net", "DC=example,DC=net"}
+
+	d := newTestDirectory(t, testConfig(backend), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("expected one group returned twice to be accepted, got %s", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected groups [admins], got %v (found=%t)", groups, ok)
+	}
+}
+
+func TestRefreshDeduplicatesRepeatedMemberOfValues(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	user := c.entries["OU=Users,DC=example,DC=net"][0]
+	for _, attribute := range user.Attributes {
+		if strings.EqualFold(attribute.Name, memberOfAttribute) {
+			attribute.Values = append(attribute.Values, attribute.Values[0])
+		}
+	}
+
+	d := newTestDirectory(t, testConfig(), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected one admins group, got %v (found=%t)", groups, ok)
 	}
 }
 
@@ -931,6 +999,66 @@ func TestRefreshFailsWhenABackendStopsReturningGroups(t *testing.T) {
 	}
 }
 
+// Counts from an earlier backend are provisional until every backend has
+// succeeded. Otherwise a failed rebuild can make a later legitimate empty
+// result look like a collapse from a mapping that was never served.
+func TestFailedLaterBackendDoesNotAdvanceEarlierBackendCounts(t *testing.T) {
+	first := &fakeConn{entries: map[string][]*goldap.Entry{}}
+	second := connWithUsers([]string{"contractors"}, map[string][]string{"bob@example.net": {"contractors"}})
+
+	d := newTestDirectory(t, testConfig(testBackend("first"), testBackend("second")), first, second)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error building the initial mapping: %s", err)
+	}
+
+	// The first backend grows, but the complete rebuild is rejected because the
+	// second backend fails afterwards.
+	first.entries = connWithUsers([]string{"admins"},
+		map[string][]string{"alice@example.net": {"admins"}}).entries
+	second.searchErr = errors.New("directory is down")
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected the rebuild with a failed second backend to fail")
+	}
+
+	// Returning to the accepted empty state is legitimate and must not be
+	// compared with the unserved intermediate result.
+	first.entries = map[string][]*goldap.Entry{}
+	second.searchErr = nil
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("expected the accepted backend counts to remain authoritative, got %s", err)
+	}
+}
+
+// A mapping is not accepted until it has been persisted. Its counts must not
+// become the safety baseline when the store rejects it.
+func TestFailedPersistenceDoesNotAdvanceBackendCounts(t *testing.T) {
+	c := &fakeConn{entries: map[string][]*goldap.Entry{}}
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error building the initial mapping: %s", err)
+	}
+
+	c.entries = connWithUsers([]string{"admins"},
+		map[string][]string{"alice@example.net": {"admins"}}).entries
+	store.saveErr = errors.New("store is down")
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected a mapping that could not be persisted to fail")
+	}
+
+	c.entries = map[string][]*goldap.Entry{}
+	store.saveErr = nil
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("expected counts from the unpersisted mapping to be discarded, got %s", err)
+	}
+}
+
 // A backend that has never returned anything is a configuration to fix, not a
 // mapping to protect. Failing on it would leave the proxy unable to start.
 func TestRefreshAcceptsABackendThatWasAlwaysEmpty(t *testing.T) {
@@ -1357,6 +1485,33 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(dialled, config.Backends[0].URLs) {
 		t.Errorf("expected both URLs to be dialled in order, got %v", dialled)
+	}
+}
+
+func TestConnectSetsTheStartTLSServerName(t *testing.T) {
+	config := testConfig()
+	config.Backends[0].URLs = []string{"ldap://ldap.example.net:389"}
+	config.Backends[0].StartTLS = true
+
+	c := &fakeConn{}
+	d := newTestDirectory(t, config, c)
+
+	w := newWatchdog(time.Minute)
+	defer w.stop()
+
+	if _, err := d.backends[0].connect(w); err != nil {
+		t.Fatalf("unexpected error connecting: %s", err)
+	}
+
+	if c.startTLSConfig == nil {
+		t.Fatal("expected StartTLS to be called")
+	}
+	if got := c.startTLSConfig.ServerName; got != "ldap.example.net" {
+		t.Errorf("expected StartTLS to verify ldap.example.net, got %q", got)
+	}
+	if d.backends[0].tlsConfig.ServerName != "" {
+		t.Errorf("expected the shared TLS config not to be mutated, got server name %q",
+			d.backends[0].tlsConfig.ServerName)
 	}
 }
 

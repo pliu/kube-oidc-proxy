@@ -141,7 +141,7 @@
           "default": "(objectClass=group)"
         },
         "groupNameAttribute": {
-          "description": "Attribute of a group entry to use as the group name.",
+          "description": "Attribute of a group entry to use as the group name. The resulting emitted name must be unique within this backend; distinct LDAP groups with the same name make the rebuild fail rather than collapse into one Kubernetes RBAC identity.",
           "type": "string",
           "minLength": 1,
           "default": "cn"

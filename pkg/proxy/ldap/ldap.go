@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -75,6 +76,20 @@ type duplicateUserError struct {
 	username string
 	first    string
 	second   string
+}
+
+// duplicateGroupError reports two entries of one backend collapsing into the
+// same Kubernetes group name. Once the DN is discarded there is no way for
+// RBAC to tell those directory groups apart.
+type duplicateGroupError struct {
+	name   string
+	first  string
+	second string
+}
+
+func (e *duplicateGroupError) Error() string {
+	return fmt.Sprintf("group name %q is held by both %q and %q, so the authorization identity is ambiguous",
+		e.name, e.first, e.second)
 }
 
 func (e *duplicateUserError) Error() string {
@@ -489,6 +504,14 @@ func (d *Directory) refresh() error {
 		return err
 	}
 
+	// The per-backend baselines describe the mapping that was accepted, not
+	// merely a search that happened to finish. A later backend or the store can
+	// still fail after an earlier backend was searched, in which case the old
+	// mapping and its baselines must remain authoritative together.
+	for i, stats := range backendStats {
+		d.backends[i].lastUsers, d.backends[i].lastGroups = stats.Users, stats.Groups
+	}
+
 	// Measured over the persisting as well as the searching, since a rebuild
 	// is not finished until the mapping it built is safe to serve.
 	took := time.Since(start)
@@ -572,7 +595,7 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
 		}
 
-		if err := b.observe(len(built), builtGroups); err != nil {
+		if err := b.checkCounts(len(built), builtGroups); err != nil {
 			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
 		}
 
@@ -769,8 +792,7 @@ func (w *watchdog) wrap(err error) error {
 	return fmt.Errorf("timed out after %s: %s", w.timeout, err)
 }
 
-// observe records what a backend returned, rejecting one that has stopped
-// returning anything at all.
+// checkCounts rejects a backend that has stopped returning anything at all.
 //
 // A search that comes back empty is not an error at the protocol level, so
 // without this a backend that answers but finds nothing is merged in as a
@@ -784,7 +806,7 @@ func (w *watchdog) wrap(err error) error {
 // threshold short of that would be a guess at how much churn is normal. A
 // directory that has legitimately been emptied is accepted once the proxy is
 // restarted and its persisted mapping removed.
-func (b *backend) observe(users, groups int) error {
+func (b *backend) checkCounts(users, groups int) error {
 	switch {
 	case b.lastUsers > 0 && users == 0:
 		return fmt.Errorf("returned no users, having returned %d at the last refresh", b.lastUsers)
@@ -793,8 +815,6 @@ func (b *backend) observe(users, groups int) error {
 		return fmt.Errorf("returned no groups, having returned %d at the last refresh", b.lastGroups)
 	}
 
-	b.lastUsers, b.lastGroups = users, groups
-
 	return nil
 }
 
@@ -802,6 +822,11 @@ func (b *backend) observe(users, groups int) error {
 // every group under the configured group search bases.
 func (b *backend) searchGroups(c conn) (map[string]string, error) {
 	groupNames := make(map[string]string)
+	type groupClaim struct {
+		key string
+		dn  string
+	}
+	claimedByName := make(map[string]groupClaim)
 
 	for _, base := range b.config.GroupSearchBases {
 		req := goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
@@ -824,7 +849,13 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 				return nil, fmt.Errorf("group %q has an invalid DN: %s", entry.DN, err)
 			}
 
-			groupNames[key] = b.config.GroupPrefix + name
+			emittedName := b.config.GroupPrefix + name
+			if claimed, ok := claimedByName[emittedName]; ok && claimed.key != key {
+				return nil, &duplicateGroupError{name: emittedName, first: claimed.dn, second: entry.DN}
+			}
+
+			claimedByName[emittedName] = groupClaim{key: key, dn: entry.DN}
+			groupNames[key] = emittedName
 		}
 	}
 
@@ -893,6 +924,7 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 			}
 
 			groups := make([]string, 0)
+			seenGroups := make(map[string]struct{})
 			for _, dn := range dns {
 				key, err := normaliseDN(dn)
 				if err != nil {
@@ -901,6 +933,11 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 				}
 
 				if name, ok := groupNames[key]; ok {
+					if _, duplicate := seenGroups[name]; duplicate {
+						continue
+					}
+
+					seenGroups[name] = struct{}{}
 					groups = append(groups, name)
 				}
 			}
@@ -931,7 +968,15 @@ func (b *backend) connect(w *watchdog) (conn, error) {
 		w.watch(c)
 
 		if b.config.StartTLS {
-			if err := c.StartTLS(b.tlsConfig); err != nil {
+			tlsConfig, err := tlsConfigForURL(b.tlsConfig, url)
+			if err != nil {
+				c.Close()
+				w.forget()
+				errs = append(errs, fmt.Sprintf("%s: StartTLS setup failed: %s", url, err))
+				continue
+			}
+
+			if err := c.StartTLS(tlsConfig); err != nil {
 				c.Close()
 				w.forget()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS failed: %s", url, err))
@@ -953,6 +998,26 @@ func (b *backend) connect(w *watchdog) (conn, error) {
 	}
 
 	return nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
+}
+
+// tlsConfigForURL gives a StartTLS handshake the server name it cannot infer
+// from an already-established TCP connection. An LDAPS dial gets this from
+// tls.DialWithDialer, but tls.Client (which go-ldap uses for StartTLS) does not.
+func tlsConfigForURL(base *tls.Config, rawURL string) (*tls.Config, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return nil, errors.New("URL has no hostname for certificate verification")
+	}
+
+	config := base.Clone()
+	config.ServerName = hostname
+
+	return config, nil
 }
 
 func (b *backend) dialLDAP(url string) (conn, error) {

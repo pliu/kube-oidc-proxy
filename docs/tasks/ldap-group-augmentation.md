@@ -75,6 +75,12 @@ overlap is not ambiguous and is accepted. A username held in *different*
 backends is not ambiguous either - that is the merge described above, and those
 groups are unioned.
 
+Two distinct group entries in one backend that produce the same group name also
+fail the rebuild. Kubernetes RBAC sees the configured group name, not the LDAP
+DN, so accepting both would collapse separate directory groups into one
+authorization identity. One group returned more than once because group search
+bases overlap is accepted, and repeated `memberOf` values are emitted only once.
+
 The initial build happens before the proxy starts serving, so that requests are
 never authorized against an empty mapping. If it fails and there is no
 [persisted mapping](#persisting-the-mapping) to fall back on, the proxy exits.
@@ -185,7 +191,7 @@ And one using every field, two directories and a persisted mapping:
 | `usernameAttribute` | `userPrincipalName` | Attribute holding the name that matches the user name of the JWT. |
 | `groupSearchBases` | | Base DN(s) to search for groups under. |
 | `groupFilter` | `(objectClass=group)` | LDAP filter selecting group entries. |
-| `groupNameAttribute` | `cn` | Attribute of a group entry to use as the group name. |
+| `groupNameAttribute` | `cn` | Attribute of a group entry to use as the group name. Its resulting value must be unique within the backend. |
 | `groupPrefix` | | Prefix prepended to every group name from this directory. |
 
 Group augmentation relies on impersonation, so it cannot be combined with
