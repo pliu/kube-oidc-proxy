@@ -10,11 +10,16 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
+	k8scache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
 )
 
@@ -33,6 +38,18 @@ const (
 
 	managedByLabel = "app.kubernetes.io/managed-by"
 	managedByValue = "kube-oidc-proxy"
+
+	// fingerprintAnnotation identifies the mapping the Secret holds. It is
+	// read on its own, without the mapping, by every proxy watching for a
+	// newer one, and compared before a write so that a Secret already holding
+	// this mapping is not rewritten by another proxy that also built it.
+	fingerprintAnnotation = "ldap.kube-oidc-proxy.jetstack.io/mapping-fingerprint"
+
+	// watchResyncPeriod is how often the watch replays what it is holding. A
+	// watch that is working needs none of this - a change arrives as it
+	// happens - so it is only a floor under how long a change could go
+	// unnoticed if one were ever dropped without the connection breaking.
+	watchResyncPeriod = time.Minute * 30
 )
 
 // Secret persists the mapping into the data of a Kubernetes Secret, so that it
@@ -52,16 +69,31 @@ const (
 type Secret struct {
 	client kubernetes.Interface
 
+	// meta reads the object without its data, which is how a proxy serving a
+	// mapping somebody else built checks for a newer one without pulling the
+	// mapping down every time it looks.
+	meta metadata.Interface
+
 	namespace string
 	name      string
 	key       string
 }
 
-var _ Store = &Secret{}
+var (
+	_ Store         = &Secret{}
+	_ Fingerprinter = &Secret{}
+	_ Watcher       = &Secret{}
 
-func NewSecret(client kubernetes.Interface, namespace, name, key string) (*Secret, error) {
+	secretResource = corev1.SchemeGroupVersion.WithResource("secrets")
+)
+
+func NewSecret(client kubernetes.Interface, meta metadata.Interface, namespace, name, key string) (*Secret, error) {
 	if client == nil {
 		return nil, errors.New("no Kubernetes client available to persist the mapping to a Secret")
+	}
+
+	if meta == nil {
+		return nil, errors.New("no Kubernetes metadata client available to check the Secret holding the mapping")
 	}
 
 	if name == "" {
@@ -85,6 +117,7 @@ func NewSecret(client kubernetes.Interface, namespace, name, key string) (*Secre
 
 	return &Secret{
 		client:    client,
+		meta:      meta,
 		namespace: namespace,
 		name:      name,
 		key:       key,
@@ -133,7 +166,84 @@ func (s *Secret) Load(ctx context.Context) ([]byte, error) {
 	return decompressed, nil
 }
 
-func (s *Secret) Save(ctx context.Context, data []byte) error {
+// Fingerprint returns the mapping the Secret is holding, read without the
+// mapping itself: the request asks for object metadata alone, so a proxy
+// polling for a newer mapping does not pull a megabyte off the wire to find
+// out that nothing has changed.
+func (s *Secret) Fingerprint(ctx context.Context) (string, error) {
+	meta, err := s.meta.Resource(secretResource).Namespace(s.namespace).
+		Get(ctx, s.name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get the metadata of Secret %s/%s: %s", s.namespace, s.name, err)
+	}
+
+	// Metadata says nothing about whether the key holds anything, so a Secret
+	// that exists without the mapping in it reports the empty fingerprint of a
+	// Secret written by something else. Either way there is nothing to serve
+	// and nothing worth fetching.
+	fingerprint, ok := meta.Annotations[fingerprintAnnotation]
+	if !ok {
+		return "", ErrNotFound
+	}
+
+	return fingerprint, nil
+}
+
+// Watch reports every change to the Secret until stopCh is closed.
+//
+// Only the metadata of the object is watched, so what arrives on a change is
+// the fingerprint rather than the mapping - the mapping is fetched afterwards,
+// and only when the fingerprint says it is worth fetching. The list and watch
+// are narrowed to this one Secret by a field selector, though note that RBAC
+// cannot be: a role granting watch grants it over every Secret in the
+// namespace, whatever the request then asks for.
+func (s *Secret) Watch(stopCh <-chan struct{}, onChange func(fingerprint string)) error {
+	informer := metadatainformer.NewFilteredMetadataInformer(s.meta, secretResource, s.namespace,
+		watchResyncPeriod, k8scache.Indexers{},
+		func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", s.name).String()
+		},
+	).Informer()
+
+	changed := func(object interface{}) {
+		meta, ok := object.(*metav1.PartialObjectMetadata)
+		if !ok || meta.Name != s.name {
+			return
+		}
+
+		fingerprint, ok := meta.Annotations[fingerprintAnnotation]
+		if !ok {
+			// A Secret with no fingerprint on it holds no mapping of ours, and
+			// telling the caller it now holds "" would have it throw away a
+			// good mapping for an empty one.
+			return
+		}
+
+		onChange(fingerprint)
+	}
+
+	if _, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
+		AddFunc:    changed,
+		UpdateFunc: func(_, object interface{}) { changed(object) },
+	}); err != nil {
+		return fmt.Errorf("failed to watch Secret %s/%s: %s", s.namespace, s.name, err)
+	}
+
+	go informer.Run(stopCh)
+
+	// Returning before the first list is complete would leave the caller
+	// unable to tell "nothing published yet" from "not looking yet".
+	if !k8scache.WaitForCacheSync(stopCh, informer.HasSynced) {
+		return fmt.Errorf("gave up waiting to watch Secret %s/%s", s.namespace, s.name)
+	}
+
+	return nil
+}
+
+func (s *Secret) Save(ctx context.Context, data []byte, fingerprint string) error {
 	compressed, err := compress(data)
 	if err != nil {
 		return fmt.Errorf("failed to compress the mapping: %s", err)
@@ -155,9 +265,10 @@ func (s *Secret) Save(ctx context.Context, data []byte) error {
 		if apierrors.IsNotFound(err) {
 			_, err = secrets.Create(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      s.name,
-					Namespace: s.namespace,
-					Labels:    map[string]string{managedByLabel: managedByValue},
+					Name:        s.name,
+					Namespace:   s.namespace,
+					Labels:      map[string]string{managedByLabel: managedByValue},
+					Annotations: map[string]string{fingerprintAnnotation: fingerprint},
 				},
 				Data: map[string][]byte{s.key: compressed},
 			}, metav1.CreateOptions{})
@@ -183,6 +294,14 @@ func (s *Secret) Save(ctx context.Context, data []byte) error {
 			secret.Data = make(map[string][]byte, 1)
 		}
 		secret.Data[s.key] = compressed
+
+		// Stamped in the same write as the mapping it describes, so the two
+		// cannot come apart: whoever reads the annotation next is told about
+		// the mapping that is actually in the object.
+		if secret.Annotations == nil {
+			secret.Annotations = make(map[string]string, 1)
+		}
+		secret.Annotations[fingerprintAnnotation] = fingerprint
 
 		if _, err := secrets.Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
 			if apierrors.IsConflict(err) {

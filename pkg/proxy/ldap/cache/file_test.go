@@ -22,7 +22,7 @@ func TestFileRoundTrips(t *testing.T) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 
-	if err := store.Save(context.Background(), []byte("first")); err != nil {
+	if err := store.Save(context.Background(), []byte("first"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -34,7 +34,7 @@ func TestFileRoundTrips(t *testing.T) {
 		t.Errorf("expected \"first\", got %q", data)
 	}
 
-	if err := store.Save(context.Background(), []byte("second")); err != nil {
+	if err := store.Save(context.Background(), []byte("second"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -57,7 +57,7 @@ func TestFileIsWrittenPrivately(t *testing.T) {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -80,7 +80,7 @@ func TestFileCreatesItsDirectory(t *testing.T) {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -99,7 +99,7 @@ func TestFileSaveLeavesNoTemporaryFilesBehind(t *testing.T) {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 

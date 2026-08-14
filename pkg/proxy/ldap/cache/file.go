@@ -47,7 +47,12 @@ func (f *File) Load(_ context.Context) ([]byte, error) {
 // Save writes to a temporary file in the same directory and renames it over
 // the target, so that a crash part way through a write cannot leave a half
 // written mapping to be read back at startup.
-func (f *File) Save(_ context.Context, data []byte) error {
+//
+// The fingerprint is ignored. Keeping it beside the mapping would mean a
+// second file that can disagree with the first, and a reader of a file - which
+// is local, and served from the page cache - loses little by reading the
+// mapping itself to find out whether it changed.
+func (f *File) Save(_ context.Context, data []byte, _ string) error {
 	dir := filepath.Dir(f.path)
 
 	if err := os.MkdirAll(dir, 0700); err != nil {

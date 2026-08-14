@@ -2,11 +2,13 @@
 package app
 
 import (
+	"errors"
 	"strconv"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
@@ -110,23 +112,50 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			// augmented from, if configured. Left nil when they are not, so
 			// that the proxy keeps taking groups from the token.
 			var ldapDirectory proxy.GroupAugmenter
+			var ldapReadiness []probe.NamedCheck
 			if opts.LDAP.Enabled() {
 				ldapConfig, err := opts.LDAP.Config(opts.OIDCAuthentication.UsernamePrefix)
 				if err != nil {
 					return err
 				}
 
-				// The store the built mapping is persisted to. Nil when the
-				// configuration does not ask for it to be persisted.
-				ldapCache, err := ldap.NewCacheStore(ldapConfig.Cache, kubeclient)
+				// Reads a Secret without its data, so that a proxy serving a
+				// mapping another one built can check for a newer one without
+				// pulling the whole mapping down every time it looks.
+				metaclient, err := metadata.NewForConfig(restConfig)
 				if err != nil {
 					return err
 				}
 
-				ldapDirectory, err = ldap.New(ldapConfig, ldapCache)
+				// The store the built mapping is persisted to. Nil when the
+				// configuration does not ask for it to be persisted.
+				ldapCache, err := ldap.NewCacheStore(ldapConfig.Cache, kubeclient, metaclient)
 				if err != nil {
 					return err
 				}
+
+				directory, err := ldap.New(ldapConfig, ldapCache)
+				if err != nil {
+					return err
+				}
+
+				ldapDirectory = directory
+
+				// A proxy that has not got hold of a mapping yet would answer
+				// every request by stripping the user of their groups, so it
+				// stays out of its Service until it has one. This is what a
+				// reader waits on while the builder is part way through its
+				// first sweep of the directories.
+				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
+					Name: "ldap mapping",
+					Check: func() error {
+						if !directory.HasMapping() {
+							return errors.New("no LDAP user to group mapping to serve yet")
+						}
+
+						return nil
+					},
+				})
 			}
 
 			// Initialise proxy with OIDC token authenticator
@@ -144,7 +173,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 
 			// Start readiness probe
 			if err := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
-				fakeJWT, p.OIDCTokenAuthenticator()); err != nil {
+				fakeJWT, p.OIDCTokenAuthenticator(), ldapReadiness...); err != nil {
 				return err
 			}
 

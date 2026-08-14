@@ -28,7 +28,15 @@ type HealthCheck struct {
 	ready bool
 }
 
-func Run(port, fakeJWT string, oidcAuther authenticator.Token) error {
+// NamedCheck is a readiness check beyond the ones the proxy always makes. It
+// is published under its own name, so that a pod sitting out of its Service
+// says which condition it is waiting on rather than only that it is not ready.
+type NamedCheck struct {
+	Name  string
+	Check func() error
+}
+
+func Run(port, fakeJWT string, oidcAuther authenticator.Token, checks ...NamedCheck) error {
 	h := &HealthCheck{
 		handler:    healthcheck.NewHandler(),
 		oidcAuther: oidcAuther,
@@ -36,6 +44,10 @@ func Run(port, fakeJWT string, oidcAuther authenticator.Token) error {
 	}
 
 	h.handler.AddReadinessCheck("secure serving", h.Check)
+
+	for _, check := range checks {
+		h.handler.AddReadinessCheck(check.Name, check.Check)
+	}
 
 	// Metrics are served beside the probes rather than on the secure port,
 	// where every path that is not handled by the proxy itself is forwarded to

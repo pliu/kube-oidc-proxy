@@ -5,16 +5,21 @@
   "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["backends", "cache"],
+  "required": ["cache"],
   "properties": {
+    "role": {
+      "description": "The part this proxy plays in building and serving the mapping. 'standalone' builds, persists and serves it alone. 'builder' builds and persists it for readers to serve, and is the only writer of the store and the only role holding directory credentials. 'reader' never reaches a directory: it serves what a builder persisted, and is configured without backends. 'builder' and 'reader' share their store across separate deployments, so both require a 'kubernetesSecret' cache; a file cannot be relied on to be shared between pods.",
+      "enum": ["standalone", "builder", "reader"],
+      "default": "standalone"
+    },
     "backends": {
-      "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups.",
+      "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups. Required unless the role is 'reader', which must not configure any.",
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/backend" }
     },
     "refreshInterval": {
-      "description": "How often the mapping is rebuilt from the directories.",
+      "description": "How often the mapping is rebuilt from the directories. Not used by a 'reader'.",
       "$ref": "#/$defs/duration",
       "default": "10m"
     },
@@ -24,10 +29,31 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "cache": {
-      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup. Required: without a persisted mapping the proxy has nothing to fall back on and refuses to start while a directory is unreachable, so turning persistence off is stated explicitly with a type of 'none' rather than reached by leaving this out.",
+      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup. Required: without a persisted mapping the proxy has nothing to fall back on and refuses to start while a directory is unreachable, so turning persistence off is stated explicitly with a type of 'none' rather than reached by leaving this out. For a 'reader' it is not a fallback but the only source of the mapping, so it cannot be 'none'.",
       "$ref": "#/$defs/cache"
     }
   },
+  "allOf": [
+    {
+      "if": { "not": { "properties": { "role": { "const": "reader" } }, "required": ["role"] } },
+      "then": { "required": ["backends"] }
+    },
+    {
+      "if": { "properties": { "role": { "const": "reader" } }, "required": ["role"] },
+      "then": { "properties": { "backends": false } }
+    },
+    {
+      "if": { "properties": { "role": { "enum": ["builder", "reader"] } }, "required": ["role"] },
+      "then": {
+        "properties": {
+          "cache": {
+            "properties": { "type": { "const": "kubernetesSecret" } },
+            "required": ["type"]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "duration": {
       "type": "string",

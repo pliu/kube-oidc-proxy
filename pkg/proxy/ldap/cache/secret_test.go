@@ -8,12 +8,14 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	metadatafake "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -22,12 +24,39 @@ func testSecretStore(t *testing.T, objects ...runtime.Object) (*Secret, *fake.Cl
 
 	client := fake.NewSimpleClientset(objects...)
 
-	store, err := NewSecret(client, "kube-oidc-proxy", "ldap-mapping", "mapping.json.gz")
+	store, err := NewSecret(client, testMetadataClient(objects...),
+		"kube-oidc-proxy", "ldap-mapping", "mapping.json.gz")
 	if err != nil {
 		t.Fatalf("unexpected error building store: %s", err)
 	}
 
 	return store, client
+}
+
+// testMetadataClient gives the metadata only view of the same objects. The two
+// clients are separate fakes, so a write through one is not seen by the other:
+// a test of what the metadata view reports seeds it here rather than saving
+// through the store first.
+func testMetadataClient(objects ...runtime.Object) *metadatafake.FakeMetadataClient {
+	scheme := metadatafake.NewTestScheme()
+	if err := metav1.AddMetaToScheme(scheme); err != nil {
+		panic(err)
+	}
+
+	partial := make([]runtime.Object, 0, len(objects))
+	for _, object := range objects {
+		secret, ok := object.(*corev1.Secret)
+		if !ok {
+			continue
+		}
+
+		partial = append(partial, &metav1.PartialObjectMetadata{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: *secret.ObjectMeta.DeepCopy(),
+		})
+	}
+
+	return metadatafake.NewSimpleMetadataClient(scheme, partial...)
 }
 
 func TestSecretRoundTrips(t *testing.T) {
@@ -38,7 +67,7 @@ func TestSecretRoundTrips(t *testing.T) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 
-	if err := store.Save(context.Background(), []byte("first")); err != nil {
+	if err := store.Save(context.Background(), []byte("first"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -68,7 +97,7 @@ func TestSecretRoundTrips(t *testing.T) {
 		t.Errorf("expected the persisted mapping to be gzipped, got %q", stored)
 	}
 
-	if err := store.Save(context.Background(), []byte("second")); err != nil {
+	if err := store.Save(context.Background(), []byte("second"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -81,6 +110,151 @@ func TestSecretRoundTrips(t *testing.T) {
 	}
 }
 
+// The fingerprint has to reach the object, since it is the only thing a proxy
+// serving this mapping has to go on when deciding whether to fetch it again.
+func TestSecretSaveStampsTheFingerprint(t *testing.T) {
+	store, client := testSecretStore(t)
+
+	if err := store.Save(context.Background(), []byte("first"), "fingerprint-one"); err != nil {
+		t.Fatalf("unexpected error saving: %s", err)
+	}
+
+	secret, err := client.CoreV1().Secrets("kube-oidc-proxy").Get(
+		context.Background(), "ldap-mapping", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error getting the Secret: %s", err)
+	}
+
+	if got := secret.Annotations[fingerprintAnnotation]; got != "fingerprint-one" {
+		t.Errorf("expected the created Secret to carry the fingerprint, got %q", got)
+	}
+
+	// And on the update path, where the annotation has to be replaced rather
+	// than left describing the mapping that was there before.
+	if err := store.Save(context.Background(), []byte("second"), "fingerprint-two"); err != nil {
+		t.Fatalf("unexpected error saving: %s", err)
+	}
+
+	secret, err = client.CoreV1().Secrets("kube-oidc-proxy").Get(
+		context.Background(), "ldap-mapping", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error getting the Secret: %s", err)
+	}
+
+	if got := secret.Annotations[fingerprintAnnotation]; got != "fingerprint-two" {
+		t.Errorf("expected the updated Secret to carry the new fingerprint, got %q", got)
+	}
+}
+
+// Reading the fingerprint must not read the mapping with it: this runs on
+// every poll of every proxy serving the mapping, and the whole point of it is
+// that it does not move a megabyte to answer "no change".
+func TestSecretFingerprint(t *testing.T) {
+	held := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ldap-mapping",
+			Namespace:   "kube-oidc-proxy",
+			Annotations: map[string]string{fingerprintAnnotation: "fingerprint-one"},
+		},
+		Data: map[string][]byte{"mapping.json.gz": []byte("mapping")},
+	}
+
+	store, client := testSecretStore(t, held)
+
+	fingerprint, err := store.Fingerprint(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error reading the fingerprint: %s", err)
+	}
+	if fingerprint != "fingerprint-one" {
+		t.Errorf("expected the fingerprint of the Secret, got %q", fingerprint)
+	}
+
+	// Nothing may have been asked of the client that holds the data.
+	for _, action := range client.Actions() {
+		t.Errorf("expected the fingerprint to be read from metadata alone, got a %s of %s",
+			action.GetVerb(), action.GetResource().Resource)
+	}
+
+	// A Secret somebody else made, with no mapping of ours in it, is nothing to
+	// serve and nothing to fetch.
+	unstamped, _ := testSecretStore(t, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ldap-mapping", Namespace: "kube-oidc-proxy"},
+	})
+
+	if _, err := unstamped.Fingerprint(context.Background()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for a Secret carrying no fingerprint, got %v", err)
+	}
+
+	// And neither is a Secret that does not exist at all, which is the ordinary
+	// state before the builder has finished its first sweep.
+	missing, _ := testSecretStore(t)
+
+	if _, err := missing.Fingerprint(context.Background()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for a Secret that does not exist, got %v", err)
+	}
+}
+
+// What a reader is built on: the builder publishes, and the proxies serving
+// the mapping are told, rather than finding out when they next look.
+func TestSecretWatchReportsPublishedMappings(t *testing.T) {
+	held := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ldap-mapping",
+			Namespace:   "kube-oidc-proxy",
+			Annotations: map[string]string{fingerprintAnnotation: "fingerprint-one"},
+		},
+		Data: map[string][]byte{"mapping.json.gz": []byte("mapping")},
+	}
+
+	meta := testMetadataClient(held)
+
+	store, err := NewSecret(fake.NewSimpleClientset(held), meta,
+		"kube-oidc-proxy", "ldap-mapping", "mapping.json.gz")
+	if err != nil {
+		t.Fatalf("unexpected error building store: %s", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	changes := make(chan string, 8)
+	if err := store.Watch(stopCh, func(fingerprint string) { changes <- fingerprint }); err != nil {
+		t.Fatalf("unexpected error watching: %s", err)
+	}
+
+	// What is already published arrives first, so a reader that starts after
+	// the builder is not left waiting for the next change to happen.
+	select {
+	case got := <-changes:
+		if got != "fingerprint-one" {
+			t.Errorf("expected the published fingerprint, got %q", got)
+		}
+	case <-time.After(time.Second * 10):
+		t.Fatal("expected the mapping already published to be reported")
+	}
+
+	// And then the builder publishes a new one.
+	if err := meta.Tracker().Update(secretResource, &metav1.PartialObjectMetadata{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ldap-mapping",
+			Namespace:   "kube-oidc-proxy",
+			Annotations: map[string]string{fingerprintAnnotation: "fingerprint-two"},
+		},
+	}, "kube-oidc-proxy"); err != nil {
+		t.Fatalf("unexpected error publishing a new mapping: %s", err)
+	}
+
+	select {
+	case got := <-changes:
+		if got != "fingerprint-two" {
+			t.Errorf("expected the newly published fingerprint, got %q", got)
+		}
+	case <-time.After(time.Second * 10):
+		t.Fatal("expected the newly published mapping to be reported")
+	}
+}
+
 // The proxy must not stamp on the other keys of a Secret it shares.
 func TestSecretSaveKeepsOtherKeys(t *testing.T) {
 	store, client := testSecretStore(t, &corev1.Secret{
@@ -88,7 +262,7 @@ func TestSecretSaveKeepsOtherKeys(t *testing.T) {
 		Data:       map[string][]byte{"unrelated": []byte("keep me")},
 	})
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("unexpected error saving: %s", err)
 	}
 
@@ -150,7 +324,7 @@ func TestSecretSaveRetriesOnConflict(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("expected the conflicting save to be retried, got %s", err)
 	}
 
@@ -190,7 +364,7 @@ func TestSecretSaveHandlesALostCreateRace(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if err := store.Save(context.Background(), []byte("mapping")); err != nil {
+	if err := store.Save(context.Background(), []byte("mapping"), ""); err != nil {
 		t.Fatalf("expected the lost create race to be retried as an update, got %s", err)
 	}
 
@@ -215,7 +389,7 @@ func TestSecretSaveRejectsAnOversizedMapping(t *testing.T) {
 		t.Fatalf("unexpected error building an oversized mapping: %s", err)
 	}
 
-	err := store.Save(context.Background(), oversized)
+	err := store.Save(context.Background(), oversized, "")
 	if err == nil {
 		t.Fatal("expected an error saving an oversized mapping")
 	}
@@ -244,9 +418,9 @@ func TestNewSecretValidatesItsArguments(t *testing.T) {
 			// pass the untyped nil the caller would.
 			var err error
 			if test.client == nil {
-				_, err = NewSecret(nil, test.namespace, test.name, test.key)
+				_, err = NewSecret(nil, testMetadataClient(), test.namespace, test.name, test.key)
 			} else {
-				_, err = NewSecret(test.client, test.namespace, test.name, test.key)
+				_, err = NewSecret(test.client, testMetadataClient(), test.namespace, test.name, test.key)
 			}
 
 			if err == nil {
@@ -265,7 +439,8 @@ func TestNewSecretValidatesItsArguments(t *testing.T) {
 func TestNewSecretDefaultsTheNamespace(t *testing.T) {
 	t.Setenv(namespaceEnvVar, "from-the-environment")
 
-	store, err := NewSecret(fake.NewSimpleClientset(), "", "ldap-mapping", "mapping.json.gz")
+	store, err := NewSecret(fake.NewSimpleClientset(), testMetadataClient(),
+		"", "ldap-mapping", "mapping.json.gz")
 	if err != nil {
 		t.Fatalf("unexpected error building store: %s", err)
 	}

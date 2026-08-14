@@ -42,6 +42,40 @@ const (
 	DefaultSecretKey          = "mapping.json.gz"
 )
 
+// Role is the part a proxy plays in building and serving the mapping. It is a
+// property of how the proxy is deployed rather than of the directories, so two
+// deployments sharing one store are told apart by this and by nothing else.
+type Role string
+
+const (
+	// RoleStandalone builds the mapping, persists it and serves it. This is
+	// the default, and everything a single deployment needs.
+	RoleStandalone Role = "standalone"
+
+	// RoleBuilder builds the mapping and persists it for readers to serve,
+	// as well as serving it itself. Exactly one deployment should hold this
+	// role: it is the only writer of the store, and the only place the
+	// credentials of the directories have to exist.
+	RoleBuilder Role = "builder"
+
+	// RoleReader never reaches a directory at all. It serves what a builder
+	// persisted, and is told by the store when a new mapping is published. It
+	// is configured without backends, so a proxy taking user traffic holds no
+	// bind credentials and no description of the directory layout.
+	RoleReader Role = "reader"
+)
+
+// Builds reports whether this role rebuilds the mapping from the directories.
+func (r Role) Builds() bool {
+	return r != RoleReader
+}
+
+// Persists reports whether this role writes the mapping to the store. A reader
+// only ever reads it, so a store shared by a deployment has one writer.
+func (r Role) Persists() bool {
+	return r != RoleReader
+}
+
 // CacheType selects the store the built mapping is persisted to.
 type CacheType string
 
@@ -53,10 +87,15 @@ const (
 
 // Config is the decoded contents of an LDAP configuration file.
 type Config struct {
+	// Role is the part this proxy plays in building and serving the mapping.
+	// Defaults to "standalone", which builds and serves it alone.
+	Role Role `json:"role,omitempty"`
+
 	// Backends are the directories the mapping is built from. The mapping of
 	// every backend is merged into one, so a user held in more than one
-	// directory ends up with the union of their groups.
-	Backends []*BackendConfig `json:"backends"`
+	// directory ends up with the union of their groups. Not configured for a
+	// reader, which never reaches a directory.
+	Backends []*BackendConfig `json:"backends,omitempty"`
 
 	// RefreshInterval is a pointer so that a file asking for a refresh
 	// interval of "0s" is rejected rather than quietly defaulted, which would
@@ -259,6 +298,10 @@ func ValidateSchema(data []byte) error {
 
 // SetDefaults fills in the fields a configuration file is allowed to leave out.
 func (c *Config) SetDefaults() {
+	if c.Role == "" {
+		c.Role = RoleStandalone
+	}
+
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)
 	}
@@ -304,8 +347,40 @@ func (c *Config) SetDefaults() {
 func (c *Config) Validate() error {
 	var errs []error
 
-	if len(c.Backends) == 0 {
-		errs = append(errs, errors.New("at least one backend must be configured"))
+	switch c.Role {
+	case RoleStandalone, RoleBuilder:
+		if len(c.Backends) == 0 {
+			errs = append(errs, errors.New("at least one backend must be configured"))
+		}
+
+	case RoleReader:
+		// A reader serves what a builder persisted and nothing else, so
+		// backends would describe directories it will never open. Refusing
+		// them keeps the bind credentials out of the deployment that takes
+		// user traffic, which is most of the point of running one.
+		if len(c.Backends) > 0 {
+			errs = append(errs, errors.New(`backends must not be configured for the "reader" role, `+
+				"which serves the mapping a builder persisted rather than building one"))
+		}
+
+	default:
+		errs = append(errs, fmt.Errorf("unknown role %q, must be one of %q, %q or %q",
+			c.Role, RoleStandalone, RoleBuilder, RoleReader))
+	}
+
+	// A builder and the readers of what it builds are separate deployments, so
+	// the store between them has to be one they can both actually reach. A
+	// file is whatever the pod has mounted: it might be a shared volume, and it
+	// might be a path in each pod's own filesystem, in which case the builder
+	// would write to one file and every reader would sit waiting on another.
+	// Nothing in the configuration can tell the two apart, so only a Secret is
+	// allowed to be the thing they share.
+	if c.Role == RoleBuilder || c.Role == RoleReader {
+		if c.Cache == nil || c.Cache.Type != CacheTypeKubernetesSecret {
+			errs = append(errs, fmt.Errorf(`the %q role needs a %q cache: it is shared between `+
+				"separate deployments, and a file is not something they can be relied on to share",
+				c.Role, CacheTypeKubernetesSecret))
+		}
 	}
 
 	names := make(map[string]struct{}, len(c.Backends))

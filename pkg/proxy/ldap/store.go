@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
@@ -12,9 +13,9 @@ import (
 // NewCacheStore builds the store the mapping is persisted to. It returns a nil
 // store, and no error, when persistence is not configured.
 //
-// The client is only needed by the Kubernetes Secret store, and may be nil
+// The clients are only needed by the Kubernetes Secret store, and may be nil
 // otherwise.
-func NewCacheStore(config *CacheConfig, client kubernetes.Interface) (cache.Store, error) {
+func NewCacheStore(config *CacheConfig, client kubernetes.Interface, meta metadata.Interface) (cache.Store, error) {
 	if !config.Enabled() {
 		return nil, nil
 	}
@@ -32,7 +33,7 @@ func NewCacheStore(config *CacheConfig, client kubernetes.Interface) (cache.Stor
 			return nil, fmt.Errorf("no kubernetesSecret configured for the %q mapping cache", config.Type)
 		}
 
-		return cache.NewSecret(client,
+		return cache.NewSecret(client, meta,
 			config.KubernetesSecret.Namespace,
 			config.KubernetesSecret.Name,
 			config.KubernetesSecret.Key)

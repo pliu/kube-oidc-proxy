@@ -1543,21 +1543,41 @@ func TestFinaliseSortsGroups(t *testing.T) {
 	}
 }
 
-// memoryStore is a cache.Store that keeps the payload in memory.
+// memoryStore is a cache.Store that keeps the payload in memory. It reports
+// the fingerprint it was last given, as a shared store does, so that what the
+// store holds is what decides whether a mapping is written again.
+// It is guarded, since a store is shared: a builder writing it and a reader
+// reading it are two proxies on two goroutines, as they would be in two pods.
 type memoryStore struct {
-	data []byte
+	mu sync.Mutex
 
-	loadErr error
-	saveErr error
+	data        []byte
+	fingerprint string
+
+	loadErr        error
+	saveErr        error
+	fingerprintErr error
 
 	// onSave runs inside Save, so that a test can see what was being served at
 	// the moment the mapping was written.
 	onSave func()
 
-	saves int
+	saves  int
+	loads  int
+	probes int
 }
 
+var (
+	_ cache.Store         = &memoryStore{}
+	_ cache.Fingerprinter = &memoryStore{}
+)
+
 func (m *memoryStore) Load(_ context.Context) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.loads++
+
 	if m.loadErr != nil {
 		return nil, m.loadErr
 	}
@@ -1567,21 +1587,91 @@ func (m *memoryStore) Load(_ context.Context) ([]byte, error) {
 	return m.data, nil
 }
 
-func (m *memoryStore) Save(_ context.Context, data []byte) error {
+func (m *memoryStore) Save(_ context.Context, data []byte, fingerprint string) error {
+	m.mu.Lock()
+
 	m.saves++
+	onSave, saveErr := m.onSave, m.saveErr
 
-	if m.onSave != nil {
-		m.onSave()
+	m.mu.Unlock()
+
+	// Outside the lock, since it runs arbitrary test code that may go back
+	// into the store.
+	if onSave != nil {
+		onSave()
 	}
 
-	if m.saveErr != nil {
-		return m.saveErr
+	if saveErr != nil {
+		return saveErr
 	}
-	m.data = data
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.data, m.fingerprint = data, fingerprint
+
 	return nil
 }
 
+func (m *memoryStore) Fingerprint(_ context.Context) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.probes++
+
+	if m.fingerprintErr != nil {
+		return "", m.fingerprintErr
+	}
+	if m.data == nil {
+		return "", cache.ErrNotFound
+	}
+	return m.fingerprint, nil
+}
+
 func (m *memoryStore) String() string { return "memory" }
+
+// watchingStore is a memoryStore that reports its changes rather than waiting
+// to be asked, as the Secret store does.
+type watchingStore struct {
+	*memoryStore
+
+	mu       sync.Mutex
+	watchers []func(string)
+}
+
+var (
+	_ cache.Store   = &watchingStore{}
+	_ cache.Watcher = &watchingStore{}
+)
+
+func newWatchingStore() *watchingStore {
+	return &watchingStore{memoryStore: new(memoryStore)}
+}
+
+func (w *watchingStore) Watch(_ <-chan struct{}, onChange func(string)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.watchers = append(w.watchers, onChange)
+
+	return nil
+}
+
+func (w *watchingStore) Save(ctx context.Context, data []byte, fingerprint string) error {
+	if err := w.memoryStore.Save(ctx, data, fingerprint); err != nil {
+		return err
+	}
+
+	w.mu.Lock()
+	watchers := append([]func(string){}, w.watchers...)
+	w.mu.Unlock()
+
+	for _, onChange := range watchers {
+		onChange(fingerprint)
+	}
+
+	return nil
+}
 
 func TestRefreshPersistsMapping(t *testing.T) {
 	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
@@ -1690,6 +1780,397 @@ func TestRefreshDoesNotRewriteAnUnchangedMapping(t *testing.T) {
 	}
 }
 
+// readerConfig is the whole of what a reader is configured with: somewhere to
+// read the mapping from, and nothing else. No directories, no bind
+// credentials, no description of the tree - which is the point of the role.
+func readerConfig() *Config {
+	return &Config{
+		Role: RoleReader,
+		Cache: &CacheConfig{
+			Type:             CacheTypeKubernetesSecret,
+			KubernetesSecret: &SecretCacheConfig{Name: "mapping"},
+		},
+	}
+}
+
+// builderConfig is the deployment on the other side of that store: the one
+// that holds the credentials, reaches the directories, and publishes what it
+// builds for the readers to serve.
+func builderConfig() *Config {
+	config := testConfig()
+
+	config.Role = RoleBuilder
+	config.Cache = &CacheConfig{
+		Type:             CacheTypeKubernetesSecret,
+		KubernetesSecret: &SecretCacheConfig{Name: "mapping"},
+	}
+
+	return config
+}
+
+// A reader serves what a builder published without ever opening a directory.
+func TestReaderServesTheMappingTheBuilderPublished(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := newWatchingStore()
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	// A reader has nothing to dial with, so anything that reached a directory
+	// would panic rather than quietly work.
+	if len(reader.backends) != 0 {
+		t.Fatalf("expected a reader to hold no backends, got %d", len(reader.backends))
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := reader.Run(stopCh); err != nil {
+		t.Fatalf("unexpected error starting the reader: %s", err)
+	}
+
+	groups, ok := reader.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the published mapping to be served, got %v (found=%t)", groups, ok)
+	}
+
+	if stats := reader.Stats(); stats.Source != SourceCache {
+		t.Errorf("expected the mapping to be sourced from %q, got %q", SourceCache, stats.Source)
+	}
+
+	// Nothing a reader does may reach the store as a write. It is the one
+	// guarantee the role exists to make.
+	if store.saves != 1 {
+		t.Errorf("expected the reader not to have written to the store, got %d saves", store.saves)
+	}
+}
+
+// A reader takes no traffic until it has a mapping: with an empty one it would
+// answer every request by stripping the user of every group they hold. It
+// waits rather than exiting, because what it is waiting for is a builder part
+// way through its first sweep, and it picks the mapping up as it is published
+// rather than at the next poll.
+func TestReaderIsNotReadyUntilAMappingIsPublished(t *testing.T) {
+	store := newWatchingStore()
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if err := reader.Run(stopCh); err != nil {
+		t.Fatalf("expected a reader with nothing published to start anyway, got %s", err)
+	}
+
+	if reader.HasMapping() {
+		t.Error("expected a reader with nothing published to have no mapping to serve")
+	}
+
+	// The builder finishes its first sweep and publishes.
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// Which the reader is told about, rather than finding out when it next
+	// happens to look.
+	if !reader.HasMapping() {
+		t.Fatal("expected the reader to pick up the published mapping")
+	}
+
+	if groups, ok := reader.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the published mapping to be served, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A reader does not rebuild, so it never passes through the path that reports
+// a rebuild. Left at that it would sit at 0 for its whole life and an alert on
+// it would fire on every reader in the deployment, for good.
+func TestReaderReportsWhetherItIsKeepingUp(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := newWatchingStore()
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// A reader that starts with a mapping already published, and then watches
+	// it never change, is keeping up perfectly well.
+	if err := reader.Run(stopCh); err != nil {
+		t.Fatalf("unexpected error starting the reader: %s", err)
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 1 {
+		t.Errorf("expected a reader serving the published mapping to report 1, got %v", got)
+	}
+
+	// And one that can no longer reach the store has stopped keeping up, even
+	// though it carries on serving what it already has.
+	store.memoryStore.mu.Lock()
+	store.fingerprintErr = errors.New("store is down")
+	store.memoryStore.mu.Unlock()
+
+	if err := reader.Refresh(); err == nil {
+		t.Fatal("expected a refresh against an unreadable store to fail")
+	}
+
+	if got := testutil.ToFloat64(lastRefreshSuccess); got != 0 {
+		t.Errorf("expected a reader that cannot reach the store to report 0, got %v", got)
+	}
+}
+
+// A store it cannot read at all is a misconfiguration - the wrong name, or no
+// permission to read it - and it would leave the proxy unready for good rather
+// than converging. That fails where somebody is watching.
+func TestReaderFailsToStartWhenTheStoreCannotBeRead(t *testing.T) {
+	store := &memoryStore{loadErr: errors.New("secrets \"mapping\" is forbidden")}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	err = reader.Run(stopCh)
+	if err == nil {
+		t.Fatal("expected a reader that cannot read the store to fail to start")
+	}
+	if !strings.Contains(err.Error(), "forbidden") {
+		t.Errorf("expected the error to carry the reason, got %q", err)
+	}
+}
+
+// A reader is told when a new mapping is published rather than going looking,
+// so a store with nothing to tell it would leave it serving the mapping it
+// started with until something restarted it. Configuration does not allow one,
+// and this is the guard behind that.
+func TestReaderRefusesAStoreThatCannotReportChanges(t *testing.T) {
+	store := new(memoryStore)
+
+	if _, ok := cache.Store(store).(cache.Watcher); ok {
+		t.Fatal("expected the plain store not to be watchable, which is the case under test")
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	err = reader.Run(stopCh)
+	if err == nil {
+		t.Fatal("expected a reader to refuse a store that cannot report its changes")
+	}
+	if !strings.Contains(err.Error(), "cannot report when the mapping it holds changes") {
+		t.Errorf("expected the error to say why, got %q", err)
+	}
+}
+
+// Picking up a change must not mean fetching the mapping to find out whether
+// there was one: the fingerprint is what says so, and it is read on its own.
+func TestReaderFetchesTheMappingOnlyWhenItChanges(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	if err := reader.load(); err != nil {
+		t.Fatalf("unexpected error loading: %s", err)
+	}
+
+	loads := store.loads
+
+	for range 5 {
+		if err := reader.reload(); err != nil {
+			t.Fatalf("unexpected error reloading: %s", err)
+		}
+	}
+
+	if store.loads != loads {
+		t.Errorf("expected an unchanged mapping not to be fetched again, got %d fetches",
+			store.loads-loads)
+	}
+	if store.probes < 5 {
+		t.Errorf("expected each poll to have asked for the fingerprint, got %d", store.probes)
+	}
+
+	// A rebuild that changed something has to reach the reader.
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+		entry("CN=devs,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"devs"}}))
+	c.entries["OU=Users,DC=example,DC=net"] = []*goldap.Entry{
+		entry("CN=alice@example.net,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"alice@example.net"},
+			"memberOf": {
+				"CN=admins,OU=Groups,DC=example,DC=net",
+				"CN=devs,OU=Groups,DC=example,DC=net",
+			},
+		}),
+	}
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if err := reader.reload(); err != nil {
+		t.Fatalf("unexpected error reloading: %s", err)
+	}
+
+	if store.loads != loads+1 {
+		t.Errorf("expected the changed mapping to have been fetched, got %d fetches", store.loads-loads)
+	}
+
+	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins", "devs"}) {
+		t.Errorf("expected the changed mapping to be served, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A reader cannot rebuild anything, so the most it can do when asked is go and
+// see whether the builder has published something newer. Refreshing what every
+// proxy serves means asking the builder, which is why the refresh endpoint is
+// routed to it.
+func TestReaderRefreshLooksForANewMapping(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	if err := reader.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing the reader: %s", err)
+	}
+
+	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the published mapping to have been picked up, got %v (found=%t)", groups, ok)
+	}
+
+	if store.saves != 1 {
+		t.Errorf("expected a reader refresh not to write to the store, got %d saves", store.saves)
+	}
+}
+
+// A store is a shared object, so "has this changed?" is a question about the
+// store rather than about what this proxy last wrote to it. A proxy that
+// trusted its own memory here would leave a mapping it had been overwritten
+// with in place for as long as neither side changed, which is to say for good.
+func TestRefreshRewritesAMappingSomethingElseOverwrote(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	// Something else - another proxy sharing this store, or a hand written
+	// object - replaces what is in it. This proxy still holds the mapping it
+	// wrote, and would skip the write if it went by that alone.
+	store.data, store.fingerprint = []byte("someone else's mapping"), "a-different-mapping"
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if store.saves != 2 {
+		t.Errorf("expected the overwritten mapping to have been put back, got %d saves", store.saves)
+	}
+	if store.probes == 0 {
+		t.Error("expected the store to have been asked which mapping it holds")
+	}
+
+	snapshot := new(Snapshot)
+	if err := json.Unmarshal(store.data, snapshot); err != nil {
+		t.Fatalf("unexpected error decoding the persisted mapping: %s", err)
+	}
+
+	mapping, err := snapshot.mapping()
+	if err != nil {
+		t.Fatalf("unexpected error resolving the persisted mapping: %s", err)
+	}
+	if !reflect.DeepEqual(mapping, map[string][]string{"alice@example.net": {"admins"}}) {
+		t.Errorf("expected the built mapping to be back in the store, got %v", mapping)
+	}
+}
+
 // The mapping a proxy restores at startup is by definition the one the store
 // holds, so a restart that finds the directories unchanged does not rewrite it
 // either. Rollouts are when a mapping is most likely to be rebuilt unchanged.
@@ -1761,7 +2242,7 @@ func TestUnchangedMappingIsRewrittenBeforeItAgesOut(t *testing.T) {
 	}
 
 	// Still inside the half of maxAge that a rewrite is held off for.
-	d.persisted.builtAt = time.Now().Add(-time.Minute * 20)
+	d.persisted.Store(&persistedSnapshot{hash: d.held().hash, builtAt: time.Now().Add(-time.Minute * 20)})
 
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
@@ -1770,13 +2251,27 @@ func TestUnchangedMappingIsRewrittenBeforeItAgesOut(t *testing.T) {
 		t.Errorf("expected a mapping well inside maxAge not to be rewritten, got %d saves", store.saves)
 	}
 
-	d.persisted.builtAt = time.Now().Add(-time.Minute * 40)
+	d.persisted.Store(&persistedSnapshot{hash: d.held().hash, builtAt: time.Now().Add(-time.Minute * 40)})
 
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
 	}
 	if store.saves != 2 {
 		t.Errorf("expected a mapping halfway to maxAge to be rewritten, got %d saves", store.saves)
+	}
+}
+
+// internedSnapshot is a snapshot of the given mapping as it would be persisted,
+// with everything else about it held constant.
+func internedSnapshot(mapping map[string][]string) *Snapshot {
+	table, users := internMapping(mapping)
+
+	return &Snapshot{
+		Version:     snapshotVersion,
+		MappingHash: "configuration",
+		BuiltAt:     time.Now(),
+		GroupTable:  table,
+		Users:       users,
 	}
 }
 
@@ -1841,6 +2336,32 @@ func TestSnapshotContentHash(t *testing.T) {
 					test.expEqual, name, equal)
 			}
 		})
+	}
+
+	// The same mapping is the same mapping however it was assembled: the same
+	// users holding the same groups fingerprints the same way, whatever order
+	// the groups of a user came back from a directory in.
+	shuffled := internedSnapshot(map[string][]string{
+		"alice@example.net": {"admins"},
+		"bob@example.net":   {"devs", "admins"},
+	})
+	ordered := internedSnapshot(map[string][]string{
+		"bob@example.net":   {"admins", "devs"},
+		"alice@example.net": {"admins"},
+	})
+
+	if shuffled.contentHash() != ordered.contentHash() {
+		t.Error("expected the same users holding the same groups to fingerprint the same way")
+	}
+
+	// And a user who actually holds a different group does not.
+	different := internedSnapshot(map[string][]string{
+		"alice@example.net": {"admins"},
+		"bob@example.net":   {"admins", "ops"},
+	})
+
+	if ordered.contentHash() == different.contentHash() {
+		t.Error("expected a user holding a different group to fingerprint differently")
 	}
 
 	// Group names are not a fixed width, so a table that runs two of them

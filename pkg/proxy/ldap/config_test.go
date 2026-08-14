@@ -59,6 +59,49 @@ func TestParseConfigAppliesDefaults(t *testing.T) {
 	}
 }
 
+// A reader is configured with somewhere to read from and nothing else: no
+// directories, no bind credentials, no description of the tree. That is the
+// point of the role, so it is worth holding the config to it.
+func TestParseReaderConfig(t *testing.T) {
+	document := `{
+  "role": "reader",
+  "cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "mapping"}}
+}`
+
+	config, err := ParseConfig([]byte(document))
+	if err != nil {
+		t.Fatalf("unexpected error parsing config: %s", err)
+	}
+
+	if config.Role != RoleReader {
+		t.Errorf("expected the reader role, got %q", config.Role)
+	}
+	if len(config.Backends) != 0 {
+		t.Errorf("expected a reader to hold no backends, got %d", len(config.Backends))
+	}
+
+	if config.Role.Builds() {
+		t.Error("expected a reader not to build the mapping")
+	}
+	if config.Role.Persists() {
+		t.Error("expected a reader not to write to the store")
+	}
+
+	// A file that says nothing about its role gets the behaviour it had before
+	// there were any: building, persisting and serving on its own.
+	standalone, err := ParseConfig([]byte(minimalConfig))
+	if err != nil {
+		t.Fatalf("unexpected error parsing config: %s", err)
+	}
+
+	if standalone.Role != RoleStandalone {
+		t.Errorf("expected an unstated role to default to %q, got %q", RoleStandalone, standalone.Role)
+	}
+	if !standalone.Role.Builds() || !standalone.Role.Persists() {
+		t.Error("expected a standalone proxy to both build and persist the mapping")
+	}
+}
+
 func TestParseConfigReadsEveryField(t *testing.T) {
 	document := `{
   "backends": [
@@ -219,6 +262,49 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "kubernetesSecret"}}`,
+			"kubernetesSecret",
+		},
+		"an unknown role": {
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "none"}, "role": "leader"}`,
+			"must be one of",
+		},
+		// The reader role exists so that the deployment taking user traffic
+		// holds no directory credentials. Backends in its file would mean it
+		// had been handed some after all.
+		"a reader configured with backends": {
+			`{"role": "reader",
+			  "backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "mapping"}}}`,
+			"backends",
+		},
+		// For every other role the store is a fallback. For a reader it is the
+		// only place a mapping ever comes from.
+		"a reader with persistence turned off": {
+			`{"role": "reader", "cache": {"type": "none"}}`,
+			"kubernetesSecret",
+		},
+		"a reader with no cache at all": {
+			`{"role": "reader"}`,
+			"cache",
+		},
+		// A builder and its readers are separate deployments, and a file is
+		// whatever each pod happens to have mounted. Allowing one would let a
+		// builder write to a file no reader will ever see.
+		"a reader reading from a file": {
+			`{"role": "reader", "cache": {"type": "file", "file": {"path": "/var/lib/mapping.json"}}}`,
+			"kubernetesSecret",
+		},
+		"a builder writing to a file": {
+			`{"role": "builder",
+			  "backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"type": "file", "file": {"path": "/var/lib/mapping.json"}}}`,
 			"kubernetesSecret",
 		},
 		"a Secret name that is not a valid object name": {

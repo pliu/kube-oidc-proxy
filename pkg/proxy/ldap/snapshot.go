@@ -79,6 +79,14 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		return nil
 	}
 
+	// Said here as well as by the role never reaching a rebuild, because "one
+	// writer" is the property the whole split rests on: a reader that wrote
+	// would be overwriting the builder with a mapping it got from the builder,
+	// and nothing downstream would notice.
+	if !d.config.Role.Persists() {
+		return nil
+	}
+
 	persisted := make([]SnapshotBackend, 0, len(backends))
 	for _, b := range backends {
 		persisted = append(persisted, SnapshotBackend{Name: b.Name, Users: b.Users, Groups: b.Groups})
@@ -104,7 +112,11 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 	// is not changing this is the difference between rewriting megabytes every
 	// refresh interval and writing nothing.
 	hash := snapshot.contentHash()
-	if hash == d.persisted.hash && !d.persisted.ageing(builtAt, d.maxCacheAge()) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
+	defer cancel()
+
+	if d.storeHolds(ctx, hash) && !d.held().ageing(builtAt, d.maxCacheAge()) {
 		klog.V(4).Infof("LDAP mapping of %d users is the one already persisted to %s, leaving it",
 			len(mapping), d.cache)
 
@@ -116,21 +128,49 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		return fmt.Errorf("failed to encode the mapping to persist to %s: %s", d.cache, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
-	defer cancel()
-
-	if err := d.cache.Save(ctx, data); err != nil {
+	if err := d.cache.Save(ctx, data, hash); err != nil {
 		return fmt.Errorf("failed to persist the mapping to %s: %s", d.cache, err)
 	}
 
 	// Recorded only once the write is through, so that a store which failed is
 	// written to again by the next refresh rather than being taken for holding
 	// a mapping it never received.
-	d.persisted = persistedSnapshot{hash: hash, builtAt: builtAt}
+	d.persisted.Store(&persistedSnapshot{hash: hash, builtAt: builtAt})
 
 	klog.V(4).Infof("persisted LDAP mapping of %d users to %s", len(mapping), d.cache)
 
 	return nil
+}
+
+// storeHolds reports whether the store is already holding the mapping with
+// this fingerprint.
+//
+// A store that can be asked is asked, rather than taken at the word of what
+// this proxy last wrote to it. What this proxy wrote is only the same thing
+// while it is the only one writing, and a store is a shared object: another
+// proxy sharing it can have written over the top at any point, and believing
+// otherwise would leave the two disagreeing for as long as neither mapping
+// changed - which is to say, indefinitely.
+//
+// A store that cannot say, or that fails to, is written to. Writing a mapping
+// the store already holds costs a write; skipping one it does not hold loses
+// the mapping.
+func (d *Directory) storeHolds(ctx context.Context, hash string) bool {
+	fingerprinter, ok := d.cache.(cache.Fingerprinter)
+	if !ok {
+		return hash == d.held().hash
+	}
+
+	held, err := fingerprinter.Fingerprint(ctx)
+	if errors.Is(err, cache.ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		klog.V(2).Infof("failed to check which LDAP mapping %s holds, persisting anyway: %s", d.cache, err)
+		return false
+	}
+
+	return held != "" && held == hash
 }
 
 // persistedSnapshot is what the store is taken to hold: the fingerprint of the
@@ -141,6 +181,15 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 type persistedSnapshot struct {
 	hash    string
 	builtAt time.Time
+}
+
+// held is what the store is taken to be holding, never nil.
+func (d *Directory) held() persistedSnapshot {
+	if persisted := d.persisted.Load(); persisted != nil {
+		return *persisted
+	}
+
+	return persistedSnapshot{}
 }
 
 // ageing reports whether a mapping that has not changed should be written again
@@ -232,31 +281,42 @@ func (d *Directory) restore() bool {
 		return false
 	}
 
+	if err := d.load(); err != nil {
+		if errors.Is(err, cache.ErrNotFound) {
+			klog.V(2).Infof("no LDAP mapping persisted in %s yet", d.cache)
+		} else {
+			klog.Errorf("ignoring the LDAP mapping persisted in %s: %s", d.cache, err)
+		}
+
+		return false
+	}
+
+	return true
+}
+
+// load installs the mapping the store is holding. It is how a proxy that does
+// not build one gets everything it serves, and how one that does gets what it
+// serves until its first rebuild finishes.
+func (d *Directory) load() error {
 	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
 	defer cancel()
 
 	data, err := d.cache.Load(ctx)
-	if errors.Is(err, cache.ErrNotFound) {
-		klog.V(2).Infof("no LDAP mapping persisted in %s yet", d.cache)
-		return false
-	}
 	if err != nil {
-		klog.Errorf("failed to load the LDAP mapping persisted in %s: %s", d.cache, err)
-		return false
+		return err
 	}
 
 	snapshot, mapping, err := d.decodeSnapshot(data)
 	if err != nil {
-		klog.Errorf("ignoring the LDAP mapping persisted in %s: %s", d.cache, err)
-		return false
+		return err
 	}
 
 	d.seedCounts(snapshot.Backends)
 
-	// The store is already holding this, so a first refresh that rebuilds the
-	// same mapping - which is what a restart that changed nothing but the
-	// process does - has no reason to write it back.
-	d.persisted = persistedSnapshot{hash: snapshot.contentHash(), builtAt: snapshot.BuiltAt}
+	// The store is already holding this, so neither a rebuild that produces the
+	// same mapping nor a poll that finds the same fingerprint has any reason to
+	// go back to it.
+	d.persisted.Store(&persistedSnapshot{hash: snapshot.contentHash(), builtAt: snapshot.BuiltAt})
 
 	finalise(mapping)
 
@@ -271,7 +331,36 @@ func (d *Directory) restore() bool {
 	klog.Infof("loaded LDAP mapping of %d users built %s ago from %s",
 		len(mapping), time.Since(snapshot.BuiltAt).Truncate(time.Second), d.cache)
 
-	return true
+	return nil
+}
+
+// reload installs the mapping the store is holding, if it is not already the
+// one being served. It is what a reader does in place of a rebuild.
+//
+// The check is made against the fingerprint the store reports, which for a
+// Secret is read without the mapping attached, so the ordinary case - a poll
+// that finds nothing new - costs one request for the metadata of one object
+// rather than a copy of the whole mapping.
+func (d *Directory) reload() error {
+	fingerprinter, ok := d.cache.(cache.Fingerprinter)
+	if !ok {
+		return d.load()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
+	defer cancel()
+
+	held, err := fingerprinter.Fingerprint(ctx)
+	if err != nil {
+		return err
+	}
+
+	if held != "" && held == d.held().hash && d.HasMapping() {
+		klog.V(4).Infof("LDAP mapping in %s is the one being served", d.cache)
+		return nil
+	}
+
+	return d.load()
 }
 
 // seedCounts primes the per backend counts from a restored snapshot, so that a
@@ -313,7 +402,11 @@ func (d *Directory) decodeSnapshot(data []byte) (*Snapshot, map[string][]string,
 			snapshot.Version, snapshotVersion)
 	}
 
-	if snapshot.MappingHash != d.mappingHash {
+	// A reader holds no backends, so it has no configuration of its own to
+	// compare this against. The builder that wrote the snapshot is the
+	// authority on whether it describes the directories it was built from -
+	// it is the only thing that ever reached them.
+	if d.config.Role.Builds() && snapshot.MappingHash != d.mappingHash {
 		return nil, nil, errors.New("it was built from a different backend configuration")
 	}
 
@@ -369,6 +462,13 @@ func internMapping(mapping map[string][]string) ([]string, map[string][]int) {
 		for _, group := range groups {
 			indices = append(indices, index[group])
 		}
+
+		// Sorted so that one mapping has one interned form, whatever order the
+		// groups of a user arrived in. Callers sort them first anyway, but that
+		// makes this canonical by convention rather than by construction, and
+		// the fingerprint taken over it is what decides whether a mapping is
+		// written and whether every proxy serving it fetches it again.
+		sort.Ints(indices)
 
 		users[username] = indices
 	}
