@@ -347,6 +347,13 @@ all, so on a directory that is not changing this is the difference between
 rewriting the lot every `refreshInterval` and writing nothing. It also means a
 rollout does not rewrite the mapping it just restored.
 
+"The same mapping" means the same users holding the same groups, not the same
+directory. A group created or deleted that nobody in the user search bases
+belongs to does not change what anyone is impersonated as, so it is not a
+change and nothing is written - even though it moves the group count reported
+below. The other way round, a user gaining or losing a group is always a write,
+since that is the mapping itself.
+
 The one thing that write did on its own was record how recent the mapping was.
 So when `maxAge` is set, an unchanged mapping is rewritten anyway once it is
 halfway to it, rather than being left to age out of a store it is still being
@@ -663,6 +670,13 @@ $ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
 `source` is where the mapping being served came from: `directory`, or `cache` if
 it was loaded from the store - after a failed startup refresh, or on every
 mapping if this proxy is a [reader](#splitting-the-builder-from-the-proxies).
+
+`groups` is how many groups were found under the group search bases, summed
+over the backends. It is not the number of distinct group names anyone holds:
+a group nobody in the user search bases belongs to is counted, and a group two
+backends both return is counted by each. What it measures is the group search
+having returned something, which is the check described in
+[How it works](#how-it-works). `users` is the size of the mapping itself.
 
 With the builder split from the proxies, this endpoint has to reach the builder
 to rebuild anything, which is a matter of [routing](#refreshing). On a reader it

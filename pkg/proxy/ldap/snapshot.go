@@ -209,9 +209,25 @@ func (p persistedSnapshot) ageing(now time.Time, maxAge time.Duration) bool {
 	return now.Sub(p.builtAt) >= maxAge/2
 }
 
-// contentHash fingerprints everything a snapshot holds apart from when it was
-// built, so that a refresh which rebuilt the same mapping can be told from one
-// that changed it.
+// contentHash fingerprints the mapping a snapshot carries, together with what
+// decides whether this proxy can load it back at all - the format version and
+// the configuration it was built from - so that a refresh which rebuilt the
+// mapping already in the store has nothing to write.
+//
+// The per backend counts are deliberately left out. They describe the searches
+// that produced the mapping rather than the mapping itself, and the group count
+// is every group under the search bases, including ones no user in them belongs
+// to. Hashing them makes a directory change that alters nobody's groups -
+// creating an empty group, say - rewrite the whole store for a mapping that is
+// byte for byte the one it already holds. Which backends contributed is still
+// covered, so a snapshot written before the counts were recorded at all is not
+// mistaken for one that carries them and left without them for good.
+//
+// Leaving them out cannot hide a change that matters. The counts are read back
+// only to prime the guard on a backend that has stopped returning anything,
+// which asks whether they have fallen to zero rather than what they are; and a
+// backend whose users fell to zero has lost its entries from the mapping, which
+// is hashed, so that write happens anyway.
 //
 // The interned form it runs over is already canonical - internMapping sorts the
 // table, and the groups of a user are sorted before they are interned - so the
@@ -222,12 +238,11 @@ func (s *Snapshot) contentHash() string {
 	h := sha256.New()
 
 	buf := appendHashed(nil, s.MappingHash)
-	buf = appendCounts(buf, s.Version, s.Groups, len(s.Backends), len(s.GroupTable), len(s.Users))
+	buf = appendCounts(buf, s.Version, len(s.Backends), len(s.GroupTable), len(s.Users))
 	h.Write(buf)
 
 	for _, b := range s.Backends {
 		buf = appendHashed(buf[:0], b.Name)
-		buf = appendCounts(buf, b.Users, b.Groups)
 		h.Write(buf)
 	}
 

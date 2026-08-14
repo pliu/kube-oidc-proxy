@@ -2145,6 +2145,57 @@ func TestRefreshDoesNotRewriteAnUnchangedMapping(t *testing.T) {
 	}
 }
 
+// A group nobody is a member of is not part of the mapping, so creating one
+// leaves every user holding exactly what they held before. The store is not
+// rewritten for it.
+//
+// It reaches the refresh at all because the group search counts every group
+// under the search bases, members or not - that count is what says the search
+// returned something. Letting it decide whether the mapping changed would
+// rewrite the whole payload for a directory edit that changes nobody's access,
+// and on a builder would wake every reader to fetch what it already has.
+func TestRefreshDoesNotRewriteForAGroupNobodyBelongsTo(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	d, err := New(testConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
+	}
+
+	before := d.Stats().Groups
+
+	// The group exists in the directory; nobody's memberOf names it.
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+		entry("CN=nobody-here,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"nobody-here"}}))
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if got := d.Stats().Groups; got != before+1 {
+		t.Errorf("expected the group search to have counted the new group, got %d then %d", before, got)
+	}
+
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Fatalf("expected alice to hold the groups she held before, got %v (found=%t)", groups, ok)
+	}
+
+	if store.saves != 1 {
+		t.Errorf("expected a group nobody belongs to not to rewrite the mapping, got %d saves", store.saves)
+	}
+}
+
 // readerConfig is the whole of what a reader is configured with: somewhere to
 // read the mapping from, and nothing else. No directories, no bind
 // credentials, no description of the tree - which is the point of the role.
@@ -2779,11 +2830,45 @@ func TestSnapshotContentHash(t *testing.T) {
 		"a group that has been renamed": {
 			mutate: func(s *Snapshot) { s.GroupTable = []string{"admins", "developers"} },
 		},
+		// The counts describe the searches rather than the mapping. A directory
+		// that gained or lost a group nobody belongs to hands back the mapping
+		// already in the store, and rewriting it would cost the whole payload -
+		// and, on a builder, wake every reader to fetch what it already has.
+		"a group nobody belongs to, added to the directory": {
+			mutate: func(s *Snapshot) {
+				s.Groups = 3
+				s.Backends[0].Groups = 3
+			},
+			expEqual: true,
+		},
+		// A backend whose users really did fall away loses its entries from the
+		// mapping, which is hashed, so the write still happens. The count on its
+		// own moving says only that the snapshot was written by a proxy that
+		// counted differently.
 		"a backend that returned fewer users": {
-			mutate: func(s *Snapshot) { s.Backends[0].Users = 1 },
+			mutate:   func(s *Snapshot) { s.Backends[0].Users = 1 },
+			expEqual: true,
+		},
+		"a user who has gone, as that backend's count falls with them": {
+			mutate: func(s *Snapshot) {
+				delete(s.Users, "bob@example.net")
+				s.Backends[0].Users = 1
+			},
+		},
+		// Left unhashed, a snapshot written before the counts were recorded
+		// would fingerprint as one that carries them, and the guard they prime
+		// would stay unprimed however many times the mapping was rebuilt.
+		"a snapshot carrying no per backend counts at all": {
+			mutate: func(s *Snapshot) { s.Backends = nil },
+		},
+		"a mapping built by a differently named backend": {
+			mutate: func(s *Snapshot) { s.Backends[0].Name = "other" },
 		},
 		"a mapping built from a different configuration": {
 			mutate: func(s *Snapshot) { s.MappingHash = "other" },
+		},
+		"a mapping written in a different format": {
+			mutate: func(s *Snapshot) { s.Version = snapshotVersion + 1 },
 		},
 	}
 

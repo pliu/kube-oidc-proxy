@@ -608,7 +608,11 @@ func (d *Directory) Stats() *Stats {
 }
 
 // build searches every backend and returns the merged username -> groups
-// mapping, along with the number of distinct groups that were considered.
+// mapping, along with how many groups were considered: the sum over the
+// backends of the groups found under their search bases. That is not the number
+// of distinct group names in the mapping - it counts a group no user in the
+// search bases belongs to, and counts a group twice if two backends both found
+// it - so nothing that decides what is served is derived from it.
 //
 // A backend that cannot be searched, or that has stopped returning anything at
 // all, fails the whole refresh. Merging what the healthy backends returned
@@ -725,7 +729,9 @@ func finalise(mapping map[string][]string) {
 }
 
 // build searches this backend and returns a username -> groups mapping, along
-// with the number of distinct groups that were considered.
+// with how many distinct groups were found under its group search bases. A
+// group nobody in the user search bases belongs to is counted, since what this
+// measures is the search having returned something rather than the mapping.
 func (b *backend) build() (map[string][]string, int, error) {
 	// A directory that accepts a connection and then stops answering would
 	// otherwise hold a refresh here for as long as the process runs: go-ldap
