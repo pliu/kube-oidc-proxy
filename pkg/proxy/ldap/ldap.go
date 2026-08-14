@@ -244,7 +244,8 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 	// an absence an alert cannot tell from a backend that never ran.
 	registerMetrics()
 	for _, b := range backends {
-		backendDuplicateUsers.WithLabelValues(b.config.Name).Set(0)
+		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(0)
+		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(0)
 	}
 
 	return d, nil
@@ -582,38 +583,66 @@ func (d *Directory) Stats() *Stats {
 // would quietly drop the groups a user holds in the other one, which is worse
 // than serving a mapping that is a refresh interval out of date.
 func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
+	type result struct {
+		mapping map[string][]string
+		groups  int
+		stats   BackendStats
+		err     error
+	}
+
+	// Backends are independent directories. Search them together so a refresh
+	// takes roughly as long as the slowest backend rather than the sum of all of
+	// them. Results stay in configuration order, which keeps errors, statistics
+	// and the persisted snapshot deterministic.
+	results := make([]result, len(d.backends))
+	var wg sync.WaitGroup
+	for i, b := range d.backends {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			start := time.Now()
+			built, builtGroups, err := b.build()
+			if err != nil {
+				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
+				return
+			}
+
+			if err := b.checkCounts(len(built), builtGroups); err != nil {
+				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
+				return
+			}
+
+			took := time.Since(start)
+			backendRefreshDuration.WithLabelValues(b.config.Name).Observe(took.Seconds())
+			results[i] = result{
+				mapping: built,
+				groups:  builtGroups,
+				stats: BackendStats{
+					Name:     b.config.Name,
+					Users:    len(built),
+					Groups:   builtGroups,
+					Duration: took.String(),
+				},
+			}
+
+			klog.V(4).Infof("built LDAP mapping from backend %q: %d users, %d groups (%s)",
+				b.config.Name, len(built), builtGroups, took)
+		}()
+	}
+	wg.Wait()
+
 	mapping := make(map[string][]string)
-	stats := make([]BackendStats, 0, len(d.backends))
-
+	stats := make([]BackendStats, 0, len(results))
 	var groups int
-
-	for _, b := range d.backends {
-		start := time.Now()
-
-		built, builtGroups, err := b.build()
-		if err != nil {
-			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
+	for _, result := range results {
+		if result.err != nil {
+			return nil, 0, nil, result.err
 		}
 
-		if err := b.checkCounts(len(built), builtGroups); err != nil {
-			return nil, 0, nil, fmt.Errorf("backend %q: %s", b.config.Name, err)
-		}
-
-		merge(mapping, built)
-		groups += builtGroups
-
-		took := time.Since(start)
-		backendRefreshDuration.WithLabelValues(b.config.Name).Observe(took.Seconds())
-
-		stats = append(stats, BackendStats{
-			Name:     b.config.Name,
-			Users:    len(built),
-			Groups:   builtGroups,
-			Duration: took.String(),
-		})
-
-		klog.V(4).Infof("built LDAP mapping from backend %q: %d users, %d groups (%s)",
-			b.config.Name, len(built), builtGroups, time.Since(start))
+		merge(mapping, result.mapping)
+		groups += result.groups
+		stats = append(stats, result.stats)
 	}
 
 	finalise(mapping)
@@ -683,8 +712,14 @@ func (b *backend) build() (map[string][]string, int, error) {
 	// pulled, so the mapping is restricted to the intended part of the tree.
 	groupNames, err := b.searchGroups(c)
 	if err != nil {
+		var duplicate *duplicateGroupError
+		if errors.As(err, &duplicate) {
+			backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(1)
+		}
+
 		return nil, 0, w.wrap(err)
 	}
+	backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(0)
 
 	mapping, err := b.searchUsers(c, groupNames)
 	if err != nil {
@@ -692,13 +727,13 @@ func (b *backend) build() (map[string][]string, int, error) {
 		// worth telling apart from a directory that is merely unreachable.
 		var duplicate *duplicateUserError
 		if errors.As(err, &duplicate) {
-			backendDuplicateUsers.WithLabelValues(b.config.Name).Set(1)
+			backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(1)
 		}
 
 		return nil, 0, w.wrap(err)
 	}
 
-	backendDuplicateUsers.WithLabelValues(b.config.Name).Set(0)
+	backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(0)
 
 	return mapping, len(groupNames), nil
 }

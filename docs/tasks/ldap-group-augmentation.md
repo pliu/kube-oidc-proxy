@@ -25,6 +25,11 @@ configured backend:
 The mappings of every backend are then merged into one: a user held in more than
 one directory ends up with the union of their groups.
 
+Configured backends are searched in parallel, so a rebuild takes roughly as
+long as its slowest backend rather than the sum of every backend's search time.
+The complete set of results is still validated and merged as one mapping: any
+backend failure rejects the rebuild and leaves the previous mapping serving.
+
 The mapping is rebuilt on an interval (10 minutes by default) and swapped in
 atomically, so a request always reads a complete, consistent mapping. If a
 rebuild fails, the previous mapping is kept in place and serving continues.
@@ -580,13 +585,13 @@ picked up. Two gauges are published for alerting on that, in Prometheus format
 at `/metrics` on the readiness probe listener - `--readiness-probe-port`, 8080
 by default, beside `/ready` and `/live`. That listener is plain HTTP with no
 authentication, so the metrics are readable by anything that can reach the pod
-on that port. They carry no request or user data; the only label value is the
-name of a configured backend.
+on that port. They carry no request or user data; label values identify a
+configured backend and, for duplicate values, whether it was a user or group.
 
 | Metric | Type | Description |
 | ------ | ---- | ----------- |
 | `kube_oidc_proxy_ldap_last_refresh_success` | gauge | `1` if the mapping being served is the one this proxy last went and got, `0` if that failed. |
-| `kube_oidc_proxy_ldap_backend_duplicate_users{backend}` | gauge | `1` if two entries of this backend claim one username, which fails the rebuild. |
+| `kube_oidc_proxy_ldap_backend_duplicate_values{backend,kind}` | gauge | `1` if two entries of this backend claim one authorization value, which fails the rebuild. `kind` is `user` or `group`. |
 | `kube_oidc_proxy_ldap_refresh_duration_seconds` | histogram | How long a complete rebuild took, across every backend. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend}` | histogram | How long searching one backend took, so that one slow directory can be told from a rebuild that is slow all over. |
 
@@ -617,17 +622,17 @@ cannot be written to therefore shows up as a failed refresh, not as a slow one.
 
 None of the `_ldap_` series exist unless `--ldap-config-file` is set, so a proxy
 running without augmentation does not report a permanent zero for a rebuild it
-is never going to do. `backend_duplicate_users` is published as `0` for every
-configured backend from startup, so an alert can tell "no duplicates" from a
-backend that has not been searched yet.
+is never going to do. Both `kind` series of `backend_duplicate_values` are
+published as `0` for every configured backend from startup, so an alert can
+tell "no duplicates" from a backend that has not been searched yet.
 
-An unreachable directory leaves `backend_duplicate_users` where it was rather
-than clearing it, since a search that did not run says nothing about what the
-directory holds. Alert on `last_refresh_success` for that instead:
+An unreachable directory leaves each `backend_duplicate_values` series where it
+was rather than clearing it, since a search that did not run says nothing about
+what the directory holds. Alert on `last_refresh_success` for that instead:
 
 ```
 kube_oidc_proxy_ldap_last_refresh_success == 0
-kube_oidc_proxy_ldap_backend_duplicate_users > 0
+kube_oidc_proxy_ldap_backend_duplicate_values > 0
 histogram_quantile(0.9, rate(kube_oidc_proxy_ldap_backend_refresh_duration_seconds_bucket[1h])) > 60
 ```
 

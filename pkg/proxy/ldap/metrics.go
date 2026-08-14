@@ -7,7 +7,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const metricsNamespace = "kube_oidc_proxy_ldap"
+const (
+	metricsNamespace = "kube_oidc_proxy_ldap"
+
+	duplicateKindUser  = "user"
+	duplicateKindGroup = "group"
+)
 
 var (
 	// lastRefreshSuccess is 1 when the mapping being served is the one this
@@ -27,15 +32,15 @@ var (
 			"or picked up from the builder - and 0 if that failed.",
 	})
 
-	// backendDuplicateUsers is 1 for a backend whose last rebuild found two
-	// entries claiming one username. That fails the rebuild, so it is a
-	// directory to fix rather than a transient condition, and it stays set
-	// until a rebuild of that backend gets through the user search.
-	backendDuplicateUsers = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	// backendDuplicateValues is 1 for a backend whose last rebuild found two
+	// entries claiming one username or emitted group name. Either fails the
+	// rebuild, so it is a directory to fix rather than a transient condition.
+	// Each kind stays set until a rebuild gets through its corresponding search.
+	backendDuplicateValues = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
-		Name:      "backend_duplicate_users",
-		Help:      "1 if two entries of this backend claim one username, which fails the rebuild.",
-	}, []string{"backend"})
+		Name:      "backend_duplicate_values",
+		Help:      "1 if two entries of this backend claim one user or group authorization value, which fails the rebuild.",
+	}, []string{"backend", "kind"})
 
 	// refreshDuration and backendRefreshDuration record only rebuilds that
 	// succeeded. A rebuild that failed is mostly a measure of how long it took
@@ -69,6 +74,6 @@ var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 // last_refresh_success of 0 that nothing will ever set. Registering once keeps
 // building more than one Directory, as the tests do, from panicking.
 var registerMetrics = sync.OnceFunc(func() {
-	prometheus.MustRegister(lastRefreshSuccess, backendDuplicateUsers,
+	prometheus.MustRegister(lastRefreshSuccess, backendDuplicateValues,
 		refreshDuration, backendRefreshDuration)
 })

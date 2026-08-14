@@ -529,7 +529,8 @@ func TestBackendDuplicateUsersGauge(t *testing.T) {
 
 	d := newTestDirectory(t, testConfig(testBackend("corp")), c)
 
-	gauge := backendDuplicateUsers.WithLabelValues("corp")
+	gauge := backendDuplicateValues.WithLabelValues("corp", duplicateKindUser)
+	groupGauge := backendDuplicateValues.WithLabelValues("corp", duplicateKindGroup)
 
 	// The series exists from the start, so that "no duplicates" is a zero
 	// rather than an absence.
@@ -548,6 +549,9 @@ func TestBackendDuplicateUsersGauge(t *testing.T) {
 
 	if got := testutil.ToFloat64(gauge); got != 1 {
 		t.Errorf("expected a backend holding one username twice to report 1, got %v", got)
+	}
+	if got := testutil.ToFloat64(groupGauge); got != 0 {
+		t.Errorf("expected duplicate users not to set the group series, got %v", got)
 	}
 
 	// An unreachable directory says nothing about whether it holds duplicates,
@@ -572,6 +576,50 @@ func TestBackendDuplicateUsersGauge(t *testing.T) {
 
 	if got := testutil.ToFloat64(gauge); got != 0 {
 		t.Errorf("expected a cleaned up backend to report 0, got %v", got)
+	}
+}
+
+// Distinct LDAP groups with one emitted name collapse into one Kubernetes RBAC
+// identity, and need the same durable signal as duplicate usernames.
+func TestBackendDuplicateGroupsGauge(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	d := newTestDirectory(t, testConfig(testBackend("groups-corp")), c)
+
+	gauge := backendDuplicateValues.WithLabelValues("groups-corp", duplicateKindGroup)
+	userGauge := backendDuplicateValues.WithLabelValues("groups-corp", duplicateKindUser)
+	if got := testutil.ToFloat64(gauge); got != 0 {
+		t.Errorf("expected a backend with no duplicate groups to report 0, got %v", got)
+	}
+
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
+		entry("CN=other-admins,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"admins"}}))
+
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing a directory with duplicate emitted group names")
+	}
+	if got := testutil.ToFloat64(gauge); got != 1 {
+		t.Errorf("expected duplicate groups to report 1, got %v", got)
+	}
+	if got := testutil.ToFloat64(userGauge); got != 0 {
+		t.Errorf("expected duplicate groups not to set the user series, got %v", got)
+	}
+
+	// A failed search cannot establish that the duplicate was removed.
+	c.searchErr = errors.New("directory is down")
+	if err := d.Refresh(); err == nil {
+		t.Fatal("expected an error refreshing against a broken directory")
+	}
+	if got := testutil.ToFloat64(gauge); got != 1 {
+		t.Errorf("expected an unreachable backend to leave the group gauge alone, got %v", got)
+	}
+
+	c.searchErr = nil
+	c.entries["OU=Groups,DC=example,DC=net"] = c.entries["OU=Groups,DC=example,DC=net"][:1]
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing the cleaned up directory: %s", err)
+	}
+	if got := testutil.ToFloat64(gauge); got != 0 {
+		t.Errorf("expected cleaned up duplicate groups to report 0, got %v", got)
 	}
 }
 
@@ -670,6 +718,51 @@ type gatedConn struct {
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+func TestRefreshSearchesBackendsConcurrently(t *testing.T) {
+	first := &gatedConn{
+		fakeConn: connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}}),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	second := &gatedConn{
+		fakeConn: connWithUsers([]string{"devs"}, map[string][]string{"bob@example.net": {"devs"}}),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(first.release)
+			close(second.release)
+		}
+	}()
+
+	d := newTestDirectory(t, testConfig(testBackend("first-parallel"), testBackend("second-parallel")),
+		first, second)
+
+	done := make(chan error, 1)
+	go func() { done <- d.Refresh() }()
+
+	for name, entered := range map[string]<-chan struct{}{
+		"first":  first.entered,
+		"second": second.entered,
+	} {
+		select {
+		case <-entered:
+		case <-time.After(time.Second * 5):
+			t.Fatalf("expected the %s backend to start before either backend was released", name)
+		}
+	}
+
+	close(first.release)
+	close(second.release)
+	released = true
+
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error refreshing parallel backends: %s", err)
+	}
 }
 
 func (g *gatedConn) SearchWithPaging(req *goldap.SearchRequest, size uint32) (*goldap.SearchResult, error) {
