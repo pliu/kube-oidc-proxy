@@ -35,7 +35,11 @@ type fakeAugmenter struct {
 
 	refreshErr   error
 	refreshCount int
+
+	refreshEndpointDisabled bool
 }
+
+func (f *fakeAugmenter) RefreshEndpointEnabled() bool { return !f.refreshEndpointDisabled }
 
 func (f *fakeAugmenter) CanRefresh(username string) bool {
 	if len(f.refreshUsers) == 0 {
@@ -194,6 +198,32 @@ func TestLDAPRefreshEndpoint(t *testing.T) {
 
 	if stats.Users != 1 {
 		t.Errorf("expected stats of 1 user, got %d", stats.Users)
+	}
+}
+
+func TestLDAPReaderDoesNotServeRefreshEndpoint(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{
+		mapping:                 map[string][]string{"alice@example.net": {"admins"}},
+		refreshEndpointDisabled: true,
+	}
+	p.ldapDirectory = directory
+
+	// A reader treats the path like any other request and sends it to the API
+	// server with the groups from the mapping it serves.
+	p.fakeRT.expUser = "alice@example.net"
+	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
+
+	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
+		&user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
+	}
+	if directory.refreshCount != 0 {
+		t.Errorf("expected the reader not to refresh, got %d refreshes", directory.refreshCount)
 	}
 }
 

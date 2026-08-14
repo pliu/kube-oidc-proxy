@@ -529,9 +529,9 @@ A refresh that reaches the builder rebuilds, publishes, and reaches every reader
 within about as long as the write takes. The response comes back when the
 builder is done, which is a moment before the readers have caught up.
 
-A refresh that lands on a reader anyway - through the Service, or straight at a
-pod - makes it go and look for a newer mapping rather than pretending it can
-rebuild one. It is not an error, it just does not reach the directories.
+Readers do not serve the refresh endpoint. A request to that path on a reader is
+handled like any other request and passed to the API server rather than causing
+a store reload. Route the exact path to the builder as shown above.
 
 ### Readiness
 

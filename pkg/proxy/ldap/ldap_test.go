@@ -1878,6 +1878,31 @@ func (m *memoryStore) Fingerprint(_ context.Context) (string, error) {
 
 func (m *memoryStore) String() string { return "memory" }
 
+// gatedLoadStore captures one payload and then holds its Load in flight. A
+// later Save can therefore publish a newer payload while a reader is still
+// installing the captured one.
+type gatedLoadStore struct {
+	*memoryStore
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedLoadStore) Load(ctx context.Context) ([]byte, error) {
+	data, err := g.memoryStore.Load(ctx)
+	if err != nil || g.entered == nil {
+		return data, err
+	}
+
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+
+	return data, nil
+}
+
 // watchingStore is a memoryStore that reports its changes rather than waiting
 // to be asked, as the Secret store does.
 type watchingStore struct {
@@ -2364,6 +2389,102 @@ func TestReaderRefreshLooksForANewMapping(t *testing.T) {
 
 	if store.saves != 1 {
 		t.Errorf("expected a reader refresh not to write to the store, got %d saves", store.saves)
+	}
+}
+
+// A watch notification that arrives while an older load is in flight must
+// queue one more reload. Merely joining the old load would acknowledge the
+// notification while leaving the reader on the mapping captured before it.
+func TestReaderDoesNotLoseAPublicationDuringAnInflightLoad(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+	store := &gatedLoadStore{memoryStore: new(memoryStore)}
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error publishing the initial mapping: %s", err)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+	if err := reader.load(); err != nil {
+		t.Fatalf("unexpected error loading the initial mapping: %s", err)
+	}
+
+	// Publish B without a watcher involved, then hold a reader load after it
+	// has captured B but before it installs it.
+	c.entries = connWithUsers([]string{"admins", "devs"},
+		map[string][]string{"alice@example.net": {"admins", "devs"}}).entries
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error publishing mapping B: %s", err)
+	}
+
+	store.entered = make(chan struct{})
+	store.release = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(store.release)
+		}
+	}()
+
+	results := make(chan error, 2)
+	go func() { results <- reader.Refresh() }()
+
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second * 5):
+		t.Fatal("expected the reader load of mapping B to start")
+	}
+
+	// Publish C, then deliver the equivalent of its watch notification while
+	// the load of B is still in flight.
+	c.entries = connWithUsers([]string{"admins", "devs", "ops"},
+		map[string][]string{"alice@example.net": {"admins", "devs", "ops"}}).entries
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error publishing mapping C: %s", err)
+	}
+	go func() { results <- reader.Refresh() }()
+
+	// Wait until the notification has joined the in-flight call and marked the
+	// follow-up reload before letting the old load finish.
+	deadline := time.NewTimer(time.Second * 5)
+	tick := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer tick.Stop()
+	for {
+		reader.refreshMu.Lock()
+		pending := reader.inflight != nil && reader.inflight.pending
+		reader.refreshMu.Unlock()
+		if pending {
+			break
+		}
+
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("expected the newer publication to queue a follow-up reload")
+		}
+	}
+
+	close(store.release)
+	released = true
+
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("unexpected error refreshing reader: %s", err)
+		}
+	}
+
+	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins", "devs", "ops"}) {
+		t.Errorf("expected the publication made during the old load to be served, got %v (found=%t)",
+			groups, ok)
 	}
 }
 

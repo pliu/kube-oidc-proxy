@@ -93,7 +93,8 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 // API server path, so it can never shadow a request meant for Kubernetes.
 func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath {
+		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath ||
+			!p.ldapDirectory.RefreshEndpointEnabled() {
 			handler.ServeHTTP(rw, req)
 			return
 		}

@@ -79,6 +79,11 @@ type GroupAugmenter interface {
 	// CanRefresh reports whether the given user may trigger a refresh.
 	CanRefresh(username string) bool
 
+	// RefreshEndpointEnabled reports whether this augmenter can rebuild the
+	// mapping requested by the refresh endpoint. Readers update from their
+	// store internally, but do not expose that endpoint to clients.
+	RefreshEndpointEnabled() bool
+
 	// Refresh rebuilds the mapping on demand.
 	Refresh() error
 

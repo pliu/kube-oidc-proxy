@@ -415,22 +415,32 @@ func (d *Directory) HasMapping() bool {
 // refreshCall is one rebuild, along with the result every caller waiting on it
 // is given.
 type refreshCall struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	pending bool
 }
 
 // Refresh rebuilds the user -> group mapping from every backend and atomically
 // swaps it in. The previous mapping is left in place if the rebuild fails.
 //
 // A caller arriving while a rebuild is running joins it and takes its result
-// rather than queueing another. Merely serialising them would turn a burst of
-// requests to the refresh endpoint into that many complete rebuilds run back
-// to back, each searching every directory again for an answer the one before
-// it already had - and by default any authenticated user may ask for one.
+// rather than queueing another. Merely serialising builders would turn a burst
+// of requests to the refresh endpoint into that many complete rebuilds run
+// back to back, each searching every directory again for an answer the one
+// before it already had - and by default any authenticated user may ask for
+// one. A reader is different: a caller joining an older store load marks one
+// follow-up reload pending, because it may be carrying a newer publication.
 func (d *Directory) Refresh() error {
 	d.refreshMu.Lock()
 
 	if call := d.inflight; call != nil {
+		// A reader notification carries information newer than whatever load
+		// was already in flight. Joining that load is not enough: it may have
+		// captured the old store contents before the publication arrived. Mark
+		// one more reload pending so the notification cannot be lost.
+		if !d.config.Role.Builds() {
+			call.pending = true
+		}
 		d.refreshMu.Unlock()
 
 		<-call.done
@@ -443,14 +453,23 @@ func (d *Directory) Refresh() error {
 
 	d.refreshMu.Unlock()
 
-	call.err = d.refresh()
+	for {
+		call.err = d.refresh()
 
-	// Cleared before the waiters are released, so that a caller arriving as
-	// this one finishes starts a rebuild of its own rather than being handed
-	// the result of one that is already over.
-	d.refreshMu.Lock()
-	d.inflight = nil
-	d.refreshMu.Unlock()
+		d.refreshMu.Lock()
+		if call.pending {
+			call.pending = false
+			d.refreshMu.Unlock()
+			continue
+		}
+
+		// Cleared before the waiters are released, so that a caller arriving as
+		// this one finishes starts a rebuild of its own rather than being handed
+		// the result of one that is already over.
+		d.inflight = nil
+		d.refreshMu.Unlock()
+		break
+	}
 
 	close(call.done)
 
@@ -556,6 +575,13 @@ func (d *Directory) CanRefresh(username string) bool {
 
 	_, ok := d.refreshUsers[usernameKey(username, d.config.UsernamePrefix)]
 	return ok
+}
+
+// RefreshEndpointEnabled reports whether this proxy reaches the directories
+// and can therefore serve the endpoint that asks for a rebuild. Readers learn
+// about published mappings through their store watcher instead.
+func (d *Directory) RefreshEndpointEnabled() bool {
+	return d.config.Role.Builds()
 }
 
 // usernameKey returns the one directory identity represented by a username.
