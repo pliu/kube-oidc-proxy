@@ -1461,6 +1461,98 @@ func TestRefreshAppliesGroupPrefix(t *testing.T) {
 	}
 }
 
+// Kubernetes treats system: as reserved. A directory group of that name must
+// not become an impersonation group, or creating it in a searched OU would
+// grant cluster privileges.
+func TestRefreshSkipsKubernetesSystemGroups(t *testing.T) {
+	c := connWithUsers([]string{"admins", "system:masters", "system:authenticated"},
+		map[string][]string{"alice@example.net": {"admins", "system:masters", "system:authenticated"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected only admins, got %v (found=%t)", groups, ok)
+	}
+
+	if stats := d.Stats(); stats.Groups != 1 || stats.Backends[0].Groups != 1 {
+		t.Errorf("expected stats to count only the impersonated group, got %+v", stats)
+	}
+}
+
+// A prefix that keeps the emitted name out of the reserved namespace is the
+// intended way to pull a directory group that happens to be called system:.
+func TestRefreshKeepsPrefixedSystemGroupNames(t *testing.T) {
+	c := connWithUsers([]string{"system:masters"},
+		map[string][]string{"alice@example.net": {"system:masters"}})
+
+	backend := testBackend("ldap")
+	backend.GroupPrefix = "ldap:"
+
+	d := newTestDirectory(t, testConfig(backend), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"ldap:system:masters"}) {
+		t.Errorf("expected the prefixed group to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// A rebuild that still finds group objects, but none that survive filtering,
+// is an emptied mapping and must not replace one that had groups.
+func TestRefreshFailsWhenFilteringRemovesEveryGroup(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	c.entries["OU=Groups,DC=example,DC=net"] = []*goldap.Entry{
+		entry("CN=system:masters,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"system:masters"}}),
+	}
+	c.entries["OU=Users,DC=example,DC=net"] = []*goldap.Entry{
+		entry("CN=alice,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"alice@example.net"},
+			"memberOf":          {"CN=system:masters,OU=Groups,DC=example,DC=net"},
+		}),
+	}
+
+	err := d.Refresh()
+	if err == nil {
+		t.Fatal("expected an error refreshing after every group was filtered out")
+	}
+	if !strings.Contains(err.Error(), "returned no groups") {
+		t.Errorf("expected the error to say what was empty, got %q", err)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the previous mapping to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
+// Kubernetes group names are case sensitive; only the reserved lowercase
+// prefix is privileged.
+func TestRefreshKeepsSystemGroupNamesOfADifferentCase(t *testing.T) {
+	c := connWithUsers([]string{"System:masters"},
+		map[string][]string{"alice@example.net": {"System:masters"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups, ok := d.Groups("alice@example.net")
+	if !ok || !reflect.DeepEqual(groups, []string{"System:masters"}) {
+		t.Errorf("expected the non-reserved name to be kept, got %v (found=%t)", groups, ok)
+	}
+}
+
 // The username of a request carries the OIDC username prefix, the directory
 // does not.
 func TestGroupsStripsUsernamePrefix(t *testing.T) {

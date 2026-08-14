@@ -197,7 +197,7 @@ And one using every field, two directories and a persisted mapping:
 | `groupSearchBases` | | Base DN(s) to search for groups under. |
 | `groupFilter` | `(objectClass=group)` | LDAP filter selecting group entries. |
 | `groupNameAttribute` | `cn` | Attribute of a group entry to use as the group name. Its resulting value must be unique within the backend. |
-| `groupPrefix` | | Prefix prepended to every group name from this directory. |
+| `groupPrefix` | | Prefix prepended to every group name from this directory. Must not begin with `system:`. |
 
 Group augmentation relies on impersonation, so it cannot be combined with
 `--disable-impersonation`.
@@ -256,6 +256,12 @@ entry there, or an RBAC binding against their user name rather than a group.
 those groups did not come from the OIDC issuer. Use `groupPrefix` if the group
 names need a prefix to match your RBAC bindings, or to keep two directories that
 name their groups the same way apart.
+
+Kubernetes reserves the `system:` prefix for built-in groups such as
+`system:masters`. A directory group whose emitted name - the name attribute plus
+any `groupPrefix` - begins with `system:` is skipped rather than impersonated,
+so a group created in a searched OU cannot grant cluster privileges. A
+`groupPrefix` that itself begins with `system:` is rejected at startup.
 
 ### Large directories
 

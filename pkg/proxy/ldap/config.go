@@ -444,6 +444,11 @@ func (b *BackendConfig) validate(id string) []error {
 		errs = append(errs, fmt.Errorf("%s: timeout must be a positive duration", id))
 	}
 
+	if strings.HasPrefix(b.GroupPrefix, kubernetesSystemGroupPrefix) {
+		errs = append(errs, fmt.Errorf("%s: groupPrefix %q uses the reserved %s prefix",
+			id, b.GroupPrefix, kubernetesSystemGroupPrefix))
+	}
+
 	return errs
 }
 

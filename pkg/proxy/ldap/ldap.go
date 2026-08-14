@@ -62,6 +62,12 @@ const (
 	// being served came from.
 	SourceDirectory = "directory"
 	SourceCache     = "cache"
+
+	// kubernetesSystemGroupPrefix is reserved by Kubernetes for built-in
+	// groups such as system:masters. Impersonating a caller as a member of
+	// those groups would grant privileges the directory must not be able to
+	// confer.
+	kubernetesSystemGroupPrefix = "system:"
 )
 
 // ErrNoBackends is returned when there is no directory to build a mapping
@@ -911,6 +917,12 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 			}
 
 			emittedName := b.config.GroupPrefix + name
+			if strings.HasPrefix(emittedName, kubernetesSystemGroupPrefix) {
+				klog.Warningf("skipping group %q: emitted name %q uses the reserved %s prefix",
+					entry.DN, emittedName, kubernetesSystemGroupPrefix)
+				continue
+			}
+
 			if claimed, ok := claimedByName[emittedName]; ok && claimed.key != key {
 				return nil, &duplicateGroupError{name: emittedName, first: claimed.dn, second: entry.DN}
 			}

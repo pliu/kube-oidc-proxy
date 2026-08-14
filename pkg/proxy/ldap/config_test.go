@@ -389,6 +389,14 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "cache": {"type": "none"}}`,
 			"timeout must be a positive duration",
 		},
+		"a groupPrefix that uses the reserved system: prefix": {
+			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
+			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"],
+			  "groupPrefix": "system:"}],
+			  "cache": {"type": "none"}}`,
+			"reserved system: prefix",
+		},
 	}
 
 	for name, test := range tests {
