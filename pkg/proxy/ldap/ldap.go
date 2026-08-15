@@ -203,6 +203,12 @@ type backend struct {
 	// that wrote it, so it is swapped rather than written into.
 	lastGroupNames atomic.Pointer[map[string]string]
 
+	// groupBaseKeys are the configured group search bases, normalised the same
+	// way a DN read from the directory is. A group a single user refresh has
+	// never heard of is only worth looking at if it lives under one of them,
+	// and that is a comparison rather than a search.
+	groupBaseKeys []string
+
 	dial func(url string) (conn, error)
 }
 
@@ -291,6 +297,19 @@ func newBackend(config *BackendConfig) (*backend, error) {
 		bindPassword: bindPassword,
 	}
 	b.dial = b.dialLDAP
+
+	// Parsed here rather than on the path that uses them, so that a search base
+	// which is not a DN at all is reported where somebody is watching instead
+	// of once per refresh of a user.
+	for _, base := range config.GroupSearchBases {
+		key, err := normaliseDN(base)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: groupSearchBase %q is not a valid DN: %s",
+				config.Name, base, err)
+		}
+
+		b.groupBaseKeys = append(b.groupBaseKeys, key)
+	}
 
 	return b, nil
 }
@@ -1050,7 +1069,7 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 				return nil, err
 			}
 
-			groups, err := groupsFromDNs(entry.DN, dns, groupNames)
+			groups, err := groupsFromDNs(entry.DN, dns, groupNames, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -1067,7 +1086,13 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 // search bases. A group named twice - by two DNs that normalise the same way -
 // is given once, since a user must not be impersonated as a member of it
 // twice.
-func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string) ([]string, error) {
+//
+// unknown is asked about a DN that groupNames does not hold, and returns the
+// name to give it or "" to leave it out. A rebuild passes nil: it has just read
+// every group there is, so a DN it does not recognise is one that lives outside
+// the search bases and is meant to be dropped.
+func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
+	unknown func(groupDN, key string) (string, error)) ([]string, error) {
 	groups := make([]string, 0)
 	seen := make(map[string]struct{})
 
@@ -1080,7 +1105,17 @@ func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string) (
 
 		name, ok := groupNames[key]
 		if !ok {
-			continue
+			if unknown == nil {
+				continue
+			}
+
+			if name, err = unknown(groupDN, key); err != nil {
+				return nil, err
+			}
+
+			if name == "" {
+				continue
+			}
 		}
 
 		if _, duplicate := seen[name]; duplicate {

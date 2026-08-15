@@ -723,12 +723,26 @@ $ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
 Every backend is searched for that one user and the results merged, exactly as
 a rebuild merges the whole of each - a user held in more than one directory
 ends up with the union of their groups, and a backend that cannot be searched
-fails the refresh rather than being left out of it. The one difference is that
-their `memberOf` is resolved against the group names of the last rebuild rather
-than by sweeping every group search base again, which is most of what makes
-this cheaper. A group created *since* that rebuild is therefore not one this
-can put a user in; that membership is picked up by the next rebuild, along with
-the group itself.
+fails the refresh rather than being left out of it. The difference is in how
+their `memberOf` is resolved: against the group names of the last rebuild
+rather than by sweeping every group search base again, which is most of what
+makes this cheaper.
+
+A group the last rebuild did not find - one created since, which is exactly
+what somebody adding a user to a new group is asking to have picked up - is
+looked up on its own rather than dropped, and is held to the same rules the
+sweep holds a group to. It has to live under a configured group search base,
+match the `groupFilter`, carry a `groupNameAttribute`, and not use the reserved
+`system:` prefix; anything else is left out just as a rebuild would leave it
+out. A new group taking the name of one already in the mapping fails the
+refresh, as it fails a rebuild: once the DN is discarded, RBAC cannot tell two
+directory groups of one name apart.
+
+Only a DN under a search base costs a search, so the groups a user holds
+elsewhere in the tree - which is most of them, on a large directory - are
+dropped by comparison alone. A refresh that would have to look up more than 100
+of them is refused: a mapping that far out of date wants a full rebuild rather
+than a search per group.
 
 If what it found differs from what is being served, the mapping is persisted
 and then swapped in - the same order a rebuild uses, so the store is never

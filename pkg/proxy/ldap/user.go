@@ -13,6 +13,11 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// maxGroupDiscoveries bounds the groups one refresh of a user will look up
+// individually, so that a mapping far enough out of date cannot turn refreshing
+// one user into a search per group they hold.
+const maxGroupDiscoveries = 100
+
 // ErrNoMapping is returned by RefreshUser before there is a mapping to update.
 // Nothing serves requests in that state, so it is only reachable by a caller
 // that got to the endpoint before the first rebuild finished.
@@ -207,11 +212,11 @@ func (d *Directory) searchUser(key string) ([]string, bool, error) {
 // hold in it. The second return value reports whether the backend holds them
 // at all.
 //
-// The groups are resolved against the group names of the last rebuild rather
-// than by sweeping the group search bases again, which is what makes refreshing
-// one user cheaper than rebuilding everybody. A group created since that
-// rebuild is therefore not one this can put a user in: their membership of it
-// is picked up by the next rebuild, along with the group itself.
+// The groups they are a member of are resolved against the group names of the
+// last rebuild rather than by sweeping the group search bases again, which is
+// most of what makes refreshing one user cheaper than rebuilding everybody. A
+// group the last rebuild did not find is looked up on its own - see
+// discoverGroup, and the reason a refresh would be useless without it.
 func (b *backend) searchUser(username string) ([]string, bool, error) {
 	groupNames := b.lastGroupNames.Load()
 	if groupNames == nil {
@@ -287,7 +292,7 @@ func (b *backend) searchUser(username string) ([]string, bool, error) {
 				return nil, false, w.wrap(err)
 			}
 
-			groups, err = groupsFromDNs(entry.DN, dns, *groupNames)
+			groups, err = groupsFromDNs(entry.DN, dns, *groupNames, b.discoverGroup(c, *groupNames))
 			if err != nil {
 				return nil, false, w.wrap(err)
 			}
@@ -299,6 +304,105 @@ func (b *backend) searchUser(username string) ([]string, bool, error) {
 	}
 
 	return groups, true, nil
+}
+
+// discoverGroup answers for a group the last rebuild did not find.
+//
+// Adding a user to a group that was created since then is the change somebody
+// is most likely to be asking to have picked up, so resolving their membership
+// only against what that rebuild found would leave the refresh doing nothing in
+// the case it exists for. The group is looked up on its own instead, which is
+// one search for a DN rather than another sweep of the search bases.
+//
+// It is held to the same rules the sweep holds a group to: it must live under a
+// configured group search base, match the group filter, carry a name, not use
+// the reserved system: prefix, and not collide with the name of a group already
+// in the mapping. A DN that fails any of those is left out, exactly as it would
+// have been by a rebuild - except a collision, which fails the refresh as it
+// fails a rebuild, since there is no answer to give.
+func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(string, string) (string, error) {
+	var discovered int
+
+	return func(groupDN, key string) (string, error) {
+		// A user is routinely a member of groups outside the search bases, and
+		// those are meant to be dropped. Answering that from the DN costs
+		// nothing, and leaves the searches below for the DNs that could
+		// genuinely be a group this proxy has not heard of yet.
+		if !b.underGroupSearchBase(key) {
+			return "", nil
+		}
+
+		// A refresh that has to discover this many groups is looking at a
+		// mapping too far out of date for one user to be the right unit of
+		// work, and would be searching the directory once per group to catch
+		// up. Say so rather than quietly returning some of them.
+		if discovered == maxGroupDiscoveries {
+			return "", fmt.Errorf("more than %d groups of %q are missing from the last rebuild, "+
+				"so refresh the whole mapping rather than one user", maxGroupDiscoveries, groupDN)
+		}
+		discovered++
+
+		req := goldap.NewSearchRequest(groupDN, goldap.ScopeBaseObject, goldap.NeverDerefAliases,
+			0, b.timeLimit(), false, b.config.GroupFilter, []string{b.config.GroupNameAttribute}, nil)
+
+		res, err := c.Search(req)
+		if err != nil {
+			// A memberOf naming a group that has since been deleted is an
+			// ordinary state, not a directory that cannot be searched.
+			if goldap.IsErrorWithCode(err, goldap.LDAPResultNoSuchObject) {
+				klog.V(4).Infof("group %q of backend %q no longer exists", groupDN, b.config.Name)
+				return "", nil
+			}
+
+			return "", fmt.Errorf("failed to look up group %q: %s", groupDN, err)
+		}
+
+		if len(res.Entries) == 0 {
+			// Under a search base, but not a group as this backend defines
+			// one. A rebuild would not have mapped it either.
+			return "", nil
+		}
+
+		name := attributeValue(res.Entries[0], b.config.GroupNameAttribute)
+		if name == "" {
+			klog.V(4).Infof("skipping group %q with no %q attribute", groupDN, b.config.GroupNameAttribute)
+			return "", nil
+		}
+
+		emitted := b.config.GroupPrefix + name
+		if strings.HasPrefix(emitted, kubernetesSystemGroupPrefix) {
+			klog.Warningf("skipping group %q: emitted name %q uses the reserved %s prefix",
+				groupDN, emitted, kubernetesSystemGroupPrefix)
+			return "", nil
+		}
+
+		// Once the DN is discarded there is no way for RBAC to tell two
+		// directory groups of one name apart, so a new group taking the name of
+		// one already in the mapping is the ambiguity a rebuild refuses.
+		for existing, existingName := range groupNames {
+			if existingName == emitted && existing != key {
+				return "", &duplicateGroupError{name: emitted, first: existing, second: groupDN}
+			}
+		}
+
+		klog.V(2).Infof("group %q of backend %q was created since the last rebuild, mapping it to %q",
+			groupDN, b.config.Name, emitted)
+
+		return emitted, nil
+	}
+}
+
+// underGroupSearchBase reports whether a normalised DN lies under one of the
+// configured group search bases, which is the same restriction the sweep gets
+// from searching those bases and nothing else.
+func (b *backend) underGroupSearchBase(key string) bool {
+	for _, base := range b.groupBaseKeys {
+		if key == base || strings.HasSuffix(key, ","+base) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // equalGroups reports whether two group lists hold the same names. Both are

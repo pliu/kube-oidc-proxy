@@ -4,6 +4,7 @@ package ldap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -37,6 +38,18 @@ func addUser(c *fakeConn, username string, groups ...string) {
 			"userPrincipalName": {username},
 			"memberOf":          dns,
 		}))
+}
+
+// addGroup puts a group into a fake connection after it has been built from,
+// as a directory gaining one between rebuilds does. It is resolvable both by a
+// sweep of the search base and by a base scoped search for its own DN, which is
+// how a real directory answers for it.
+func addGroup(c *fakeConn, name string) {
+	dn := "CN=" + name + ",OU=Groups,DC=example,DC=net"
+	group := entry(dn, map[string][]string{"cn": {name}})
+
+	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"], group)
+	c.entries[dn] = []*goldap.Entry{group}
 }
 
 func TestRefreshUserFindsAUserTheMappingDoesNotHold(t *testing.T) {
@@ -168,7 +181,11 @@ func TestRefreshUserRefusesAnAmbiguousUser(t *testing.T) {
 	}
 }
 
-func TestRefreshUserResolvesGroupsOfTheLastRebuild(t *testing.T) {
+// Adding a user to a group that was created since the last rebuild is the
+// change somebody is most likely to be asking to have picked up, so resolving
+// their membership only against what that rebuild found would leave the refresh
+// doing nothing in the case it exists for.
+func TestRefreshUserFindsAGroupCreatedSinceTheLastRebuild(t *testing.T) {
 	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
 
 	d := newTestDirectory(t, testConfig(), c)
@@ -177,13 +194,49 @@ func TestRefreshUserResolvesGroupsOfTheLastRebuild(t *testing.T) {
 		t.Fatalf("unexpected error refreshing: %s", err)
 	}
 
-	// A group created since the rebuild is not one a single user refresh can
-	// resolve: it is picked up by the next rebuild, along with the group
-	// itself.
-	c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
-		entry("CN=new,OU=Groups,DC=example,DC=net", map[string][]string{"cn": {"new"}}))
-
+	addGroup(c, "new")
 	addUser(c, "bob@example.net", "admins", "new")
+
+	if _, err := d.RefreshUser(context.Background(), "bob@example.net"); err != nil {
+		t.Fatalf("unexpected error refreshing the user: %s", err)
+	}
+
+	groups, _ := d.Groups("bob@example.net")
+	if exp := []string{"admins", "new"}; !reflect.DeepEqual(groups, exp) {
+		t.Errorf("unexpected groups, exp=%v got=%v", exp, groups)
+	}
+}
+
+// A group outside the configured search bases is not mapped onto a user by a
+// rebuild, and is not mapped onto them by a refresh either - and answering that
+// from the DN means no search is made for it at all.
+func TestRefreshUserIgnoresGroupsOutsideTheSearchBases(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// Held in an OU the configuration does not name, and resolvable if anybody
+	// were to go looking for it.
+	outside := "CN=everyone,OU=Other,DC=example,DC=net"
+	c.entries[outside] = []*goldap.Entry{
+		entry(outside, map[string][]string{"cn": {"everyone"}}),
+	}
+
+	c.entries["OU=Users,DC=example,DC=net"] = append(c.entries["OU=Users,DC=example,DC=net"],
+		entry("CN=bob@example.net,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"bob@example.net"},
+			"memberOf":          {"CN=admins,OU=Groups,DC=example,DC=net", outside},
+		}))
+
+	var searched []string
+	c.searchFn = func(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+		searched = append(searched, req.BaseDN)
+		return &goldap.SearchResult{Entries: c.entries[req.BaseDN]}, nil
+	}
 
 	if _, err := d.RefreshUser(context.Background(), "bob@example.net"); err != nil {
 		t.Fatalf("unexpected error refreshing the user: %s", err)
@@ -194,13 +247,128 @@ func TestRefreshUserResolvesGroupsOfTheLastRebuild(t *testing.T) {
 		t.Errorf("unexpected groups, exp=%v got=%v", exp, groups)
 	}
 
+	for _, base := range searched {
+		if base == outside {
+			t.Error("expected a group outside the search bases to be answered without a search")
+		}
+	}
+}
+
+// A DN under a group search base that the group filter does not select is not a
+// group as this backend defines one, and a rebuild would not have mapped it.
+func TestRefreshUserIgnoresANonGroupUnderTheSearchBase(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
 	}
 
-	groups, _ = d.Groups("bob@example.net")
-	if exp := []string{"admins", "new"}; !reflect.DeepEqual(groups, exp) {
-		t.Errorf("expected the rebuild to pick up the new group, exp=%v got=%v", exp, groups)
+	// Under the base, but the base scoped search for it comes back empty, as
+	// it does for an entry the filter does not match.
+	addUser(c, "bob@example.net", "admins", "notagroup")
+
+	if _, err := d.RefreshUser(context.Background(), "bob@example.net"); err != nil {
+		t.Fatalf("unexpected error refreshing the user: %s", err)
+	}
+
+	groups, _ := d.Groups("bob@example.net")
+	if exp := []string{"admins"}; !reflect.DeepEqual(groups, exp) {
+		t.Errorf("unexpected groups, exp=%v got=%v", exp, groups)
+	}
+}
+
+// A memberOf naming a group that has since been deleted is an ordinary state,
+// not a directory that cannot be searched.
+func TestRefreshUserIgnoresADeletedGroup(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	addUser(c, "bob@example.net", "admins", "gone")
+
+	c.searchFn = func(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+		if req.BaseDN == "CN=gone,OU=Groups,DC=example,DC=net" {
+			return nil, goldap.NewError(goldap.LDAPResultNoSuchObject, errors.New("no such object"))
+		}
+
+		return &goldap.SearchResult{Entries: c.entries[req.BaseDN]}, nil
+	}
+
+	if _, err := d.RefreshUser(context.Background(), "bob@example.net"); err != nil {
+		t.Fatalf("unexpected error refreshing the user: %s", err)
+	}
+
+	groups, _ := d.Groups("bob@example.net")
+	if exp := []string{"admins"}; !reflect.DeepEqual(groups, exp) {
+		t.Errorf("unexpected groups, exp=%v got=%v", exp, groups)
+	}
+}
+
+// Once the DN is discarded there is no way for RBAC to tell two directory
+// groups of one name apart, so a new group taking the name of one already in
+// the mapping is the ambiguity a rebuild refuses.
+func TestRefreshUserRefusesANewGroupOfAnExistingName(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	// A second entry, elsewhere under the search base, emitting "admins" too.
+	clash := "CN=admins,OU=Nested,OU=Groups,DC=example,DC=net"
+	c.entries[clash] = []*goldap.Entry{entry(clash, map[string][]string{"cn": {"admins"}})}
+
+	c.entries["OU=Users,DC=example,DC=net"] = append(c.entries["OU=Users,DC=example,DC=net"],
+		entry("CN=bob@example.net,OU=Users,DC=example,DC=net", map[string][]string{
+			"userPrincipalName": {"bob@example.net"},
+			"memberOf":          {clash},
+		}))
+
+	_, err := d.RefreshUser(context.Background(), "bob@example.net")
+	if err == nil {
+		t.Fatal("expected an error for two groups of one name, got none")
+	}
+
+	if exp := "the authorization identity is ambiguous"; !strings.Contains(err.Error(), exp) {
+		t.Errorf("expected an error containing %q, got %q", exp, err)
+	}
+}
+
+// A refresh that has to discover this many groups is looking at a mapping too
+// far out of date for one user to be the right unit of work.
+func TestRefreshUserRefusesTooManyMissingGroups(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	d := newTestDirectory(t, testConfig(), c)
+
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	groups := make([]string, 0, maxGroupDiscoveries+1)
+	for i := 0; i <= maxGroupDiscoveries; i++ {
+		name := fmt.Sprintf("new-%d", i)
+		addGroup(c, name)
+		groups = append(groups, name)
+	}
+
+	addUser(c, "bob@example.net", groups...)
+
+	_, err := d.RefreshUser(context.Background(), "bob@example.net")
+	if err == nil {
+		t.Fatal("expected an error for a mapping this far out of date, got none")
+	}
+
+	if exp := "refresh the whole mapping rather than one user"; !strings.Contains(err.Error(), exp) {
+		t.Errorf("expected an error containing %q, got %q", exp, err)
 	}
 }
 
