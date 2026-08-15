@@ -145,10 +145,6 @@
           "type": "string",
           "minLength": 1,
           "default": "cn"
-        },
-        "groupPrefix": {
-          "description": "Prefix prepended to every group name pulled from this directory. Use it to keep the groups of two directories apart. Must not itself begin with 'system:', which Kubernetes reserves for built-in groups.",
-          "type": "string"
         }
       }
     },

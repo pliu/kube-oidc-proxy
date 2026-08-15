@@ -385,28 +385,6 @@ func TestRefreshMergesBackends(t *testing.T) {
 	}
 }
 
-// Group prefixes are how two directories that name their groups the same way
-// are kept apart.
-func TestRefreshMergesBackendsWithPrefixes(t *testing.T) {
-	first := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
-	second := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
-
-	firstBackend, secondBackend := testBackend("first"), testBackend("second")
-	firstBackend.GroupPrefix = "first:"
-	secondBackend.GroupPrefix = "second:"
-
-	d := newTestDirectory(t, testConfig(firstBackend, secondBackend), first, second)
-
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-
-	groups, _ := d.Groups("alice@example.net")
-	if !reflect.DeepEqual(groups, []string{"first:admins", "second:admins"}) {
-		t.Errorf("expected both prefixed groups, got %v", groups)
-	}
-}
-
 // Merging only what the reachable backends returned would quietly drop the
 // groups a user holds in the unreachable one.
 func TestRefreshFailsWhenABackendIsDown(t *testing.T) {
@@ -1443,24 +1421,6 @@ func TestParseRangeOption(t *testing.T) {
 	}
 }
 
-func TestRefreshAppliesGroupPrefix(t *testing.T) {
-	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
-
-	backend := testBackend("ldap")
-	backend.GroupPrefix = "ldap:"
-
-	d := newTestDirectory(t, testConfig(backend), c)
-
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-
-	groups, _ := d.Groups("alice@example.net")
-	if !reflect.DeepEqual(groups, []string{"ldap:admins"}) {
-		t.Errorf("expected groups [ldap:admins], got %v", groups)
-	}
-}
-
 // Kubernetes treats system: as reserved. A directory group of that name must
 // not become an impersonation group, or creating it in a searched OU would
 // grant cluster privileges.
@@ -1480,26 +1440,6 @@ func TestRefreshSkipsKubernetesSystemGroups(t *testing.T) {
 
 	if stats := d.Stats(); stats.Groups != 1 || stats.Backends[0].Groups != 1 {
 		t.Errorf("expected stats to count only the impersonated group, got %+v", stats)
-	}
-}
-
-// A prefix that keeps the emitted name out of the reserved namespace is the
-// intended way to pull a directory group that happens to be called system:.
-func TestRefreshKeepsPrefixedSystemGroupNames(t *testing.T) {
-	c := connWithUsers([]string{"system:masters"},
-		map[string][]string{"alice@example.net": {"system:masters"}})
-
-	backend := testBackend("ldap")
-	backend.GroupPrefix = "ldap:"
-
-	d := newTestDirectory(t, testConfig(backend), c)
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-
-	groups, ok := d.Groups("alice@example.net")
-	if !ok || !reflect.DeepEqual(groups, []string{"ldap:system:masters"}) {
-		t.Errorf("expected the prefixed group to be kept, got %v (found=%t)", groups, ok)
 	}
 }
 
@@ -3357,7 +3297,6 @@ func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
 		"a changed group search base": {
 			func(c *Config) { c.Backends[0].GroupSearchBases = []string{"OU=Other,DC=example,DC=net"} }, true,
 		},
-		"a changed group prefix":  {func(c *Config) { c.Backends[0].GroupPrefix = "ldap:" }, true},
 		"a changed user filter":   {func(c *Config) { c.Backends[0].UserFilter = "(objectClass=person)" }, true},
 		"an added backend":        {func(c *Config) { c.Backends = append(c.Backends, testBackend("second")) }, true},
 		"a rotated password":      {func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},

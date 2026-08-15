@@ -66,10 +66,27 @@ func (d *Directory) RefreshUser(ctx context.Context, username string) (*UserStat
 		return nil, ErrNoMapping
 	}
 
-	// Checked before the directories are searched rather than after, since
-	// that is the only point at which the answer changes anything: go-ldap
-	// takes no context, so a search that has started runs to the backend
-	// timeout whether or not the caller is still there.
+	// Checked before waiting behind another update, and again after it. go-ldap
+	// takes no context, so a search that has started runs to the backend timeout
+	// whether or not the caller is still there.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Cover the search as well as the persist-and-swap. If only the latter were
+	// serialised, this search could capture an old membership, wait for a newer
+	// full rebuild to land, and then publish the old membership over it. On a
+	// builder that regression would be persisted and sent to every reader.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-d.updateGate:
+	}
+	defer func() { d.updateGate <- struct{}{} }()
+
+	// Cancellation and the gate becoming available can happen together, in
+	// which case select may choose either. Do not start the directory search if
+	// the caller was already gone when the wait ended.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -105,12 +122,10 @@ func (d *Directory) RefreshUser(ctx context.Context, username string) (*UserStat
 // it first so that the store is never older than what requests are answered
 // from - the same order a rebuild uses, and for the same reason.
 func (d *Directory) applyUser(key string, groups []string, found bool) (bool, error) {
-	// Held across the persist as well as the swap, so that this cannot write
-	// an older mapping over a rebuild that landed while it was working, and so
-	// that a burst of refreshes of one user costs one write rather than one
-	// each: whichever gets here second finds nothing left to change.
-	d.applyMu.Lock()
-	defer d.applyMu.Unlock()
+	// RefreshUser holds updateGate across the search, persist and swap, so the
+	// mapping cannot move underneath this copy and a burst of refreshes of one
+	// user costs one write rather than one each: whichever gets here second
+	// finds nothing left to change.
 
 	mapping := *d.mapping.Load()
 
@@ -369,10 +384,9 @@ func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(strin
 			return "", nil
 		}
 
-		emitted := b.config.GroupPrefix + name
-		if strings.HasPrefix(emitted, kubernetesSystemGroupPrefix) {
-			klog.Warningf("skipping group %q: emitted name %q uses the reserved %s prefix",
-				groupDN, emitted, kubernetesSystemGroupPrefix)
+		if strings.HasPrefix(name, kubernetesSystemGroupPrefix) {
+			klog.Warningf("skipping group %q: name %q uses the reserved %s prefix",
+				groupDN, name, kubernetesSystemGroupPrefix)
 			return "", nil
 		}
 
@@ -380,15 +394,15 @@ func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(strin
 		// directory groups of one name apart, so a new group taking the name of
 		// one already in the mapping is the ambiguity a rebuild refuses.
 		for existing, existingName := range groupNames {
-			if existingName == emitted && existing != key {
-				return "", &duplicateGroupError{name: emitted, first: existing, second: groupDN}
+			if existingName == name && existing != key {
+				return "", &duplicateGroupError{name: name, first: existing, second: groupDN}
 			}
 		}
 
 		klog.V(2).Infof("group %q of backend %q was created since the last rebuild, mapping it to %q",
-			groupDN, b.config.Name, emitted)
+			groupDN, b.config.Name, name)
 
-		return emitted, nil
+		return name, nil
 	}
 }
 

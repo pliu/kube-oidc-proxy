@@ -143,7 +143,6 @@ type BackendConfig struct {
 	GroupSearchBases   []string `json:"groupSearchBases"`
 	GroupFilter        string   `json:"groupFilter,omitempty"`
 	GroupNameAttribute string   `json:"groupNameAttribute,omitempty"`
-	GroupPrefix        string   `json:"groupPrefix,omitempty"`
 }
 
 type CacheConfig struct {
@@ -444,11 +443,6 @@ func (b *BackendConfig) validate(id string) []error {
 		errs = append(errs, fmt.Errorf("%s: timeout must be a positive duration", id))
 	}
 
-	if strings.HasPrefix(b.GroupPrefix, kubernetesSystemGroupPrefix) {
-		errs = append(errs, fmt.Errorf("%s: groupPrefix %q uses the reserved %s prefix",
-			id, b.GroupPrefix, kubernetesSystemGroupPrefix))
-	}
-
 	return errs
 }
 
@@ -520,7 +514,6 @@ func (c *Config) mappingHash() string {
 		GroupSearchBases   []string `json:"groupSearchBases"`
 		GroupFilter        string   `json:"groupFilter"`
 		GroupNameAttribute string   `json:"groupNameAttribute"`
-		GroupPrefix        string   `json:"groupPrefix"`
 	}
 
 	backends := make([]backend, 0, len(c.Backends))
@@ -537,7 +530,6 @@ func (c *Config) mappingHash() string {
 			GroupSearchBases:   b.GroupSearchBases,
 			GroupFilter:        b.GroupFilter,
 			GroupNameAttribute: b.GroupNameAttribute,
-			GroupPrefix:        b.GroupPrefix,
 		})
 	}
 

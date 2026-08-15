@@ -9,9 +9,37 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	goldap "github.com/go-ldap/ldap/v3"
 )
+
+// gatedUserSearchConn holds a single-user search after the directory has
+// answered it, so a test can try to run a full rebuild before that older
+// answer is applied.
+type gatedUserSearchConn struct {
+	*fakeConn
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedUserSearchConn) Search(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+	result, err := g.fakeConn.Search(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.BaseDN == "OU=Users,DC=example,DC=net" {
+		g.once.Do(func() {
+			close(g.entered)
+			<-g.release
+		})
+	}
+
+	return result, nil
+}
 
 // persistingConfig is a standalone proxy that writes what it builds, which is
 // what a single user refresh has to update as well as the mapping in memory.
@@ -592,55 +620,109 @@ func TestRefreshUserRefusesAReader(t *testing.T) {
 	}
 }
 
-// A rebuild landing while one user is being refreshed must not lose either of
-// them: whichever finishes second writes a mapping that accounts for the first.
+// A single-user search that read an older directory state must not land after a
+// newer full rebuild and publish the old membership over it. On a builder that
+// stale publication would also be sent to every reader.
 func TestRefreshUserAndRebuildDoNotOverwriteEachOther(t *testing.T) {
-	c := connWithUsers([]string{"admins", "devs"}, map[string][]string{
+	initial := connWithUsers([]string{"admins", "devs"}, map[string][]string{
 		"alice@example.net": {"admins"},
 	})
+	store := &memoryStore{}
 
-	d := newTestDirectory(t, testConfig(), c)
+	d, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	d.backends[0].dial = func(string) (conn, error) { return initial, nil }
 
 	if err := d.Refresh(); err != nil {
 		t.Fatalf("unexpected error refreshing: %s", err)
 	}
 
-	addUser(c, "bob@example.net", "devs")
+	stale := &gatedUserSearchConn{
+		fakeConn: connWithUsers([]string{"admins", "devs"}, map[string][]string{
+			"alice@example.net": {"admins"},
+		}),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	fresh := connWithUsers([]string{"admins", "devs"}, map[string][]string{
+		"alice@example.net": {"admins", "devs"},
+	})
 
-	// A rebuild and a single user refresh dial separately, so give each its
-	// own connection over the same entries rather than having them share the
-	// bookkeeping of one fake.
+	// The user refresh dials first and receives the old answer. Once it is held
+	// there, the full rebuild tries to dial and must wait for the whole user
+	// refresh to finish, not merely for its persist-and-swap.
+	var dialMu sync.Mutex
+	var dials int
+	fullDialed := make(chan struct{})
 	d.backends[0].dial = func(string) (conn, error) {
-		return &fakeConn{entries: c.entries}, nil
+		dialMu.Lock()
+		defer dialMu.Unlock()
+
+		dials++
+		if dials == 1 {
+			return stale, nil
+		}
+		if dials == 2 {
+			close(fullDialed)
+		}
+
+		return fresh, nil
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	userResult := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-
-		if _, err := d.RefreshUser(context.Background(), "bob@example.net"); err != nil {
-			t.Errorf("unexpected error refreshing the user: %s", err)
-		}
+		_, err := d.RefreshUser(context.Background(), "alice@example.net")
+		userResult <- err
 	}()
 
-	go func() {
-		defer wg.Done()
+	select {
+	case <-stale.entered:
+	case <-time.After(time.Second * 5):
+		t.Fatal("expected the single-user search to start")
+	}
 
-		if err := d.Refresh(); err != nil {
-			t.Errorf("unexpected error refreshing: %s", err)
-		}
+	rebuildResult := make(chan error, 1)
+	go func() {
+		rebuildResult <- d.Refresh()
 	}()
 
-	wg.Wait()
+	rebuildOvertookUser := false
+	select {
+	case <-fullDialed:
+		rebuildOvertookUser = true
+	case <-time.After(time.Millisecond * 250):
+	}
 
-	// Both were looking at a directory holding both users, so whichever order
-	// they landed in, that is what is being served.
-	for _, username := range []string{"alice@example.net", "bob@example.net"} {
-		if _, ok := d.Groups(username); !ok {
-			t.Errorf("expected %q to be served", username)
-		}
+	close(stale.release)
+
+	if err := <-userResult; err != nil {
+		t.Fatalf("unexpected error refreshing the user: %s", err)
+	}
+	if err := <-rebuildResult; err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	if rebuildOvertookUser {
+		t.Error("the full rebuild reached the directory while the older single-user refresh was still in flight")
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins", "devs"}) {
+		t.Errorf("expected the newer full rebuild to remain authoritative, got %v (found=%t)", groups, ok)
+	}
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+	if err := reader.load(); err != nil {
+		t.Fatalf("unexpected error loading the published mapping: %s", err)
+	}
+	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins", "devs"}) {
+		t.Errorf("expected the reader to receive the newer full rebuild, got %v (found=%t)", groups, ok)
 	}
 }
 
@@ -816,5 +898,34 @@ func TestRefreshUserAddsAGroupToAUserAlreadyMapped(t *testing.T) {
 				t.Errorf("unexpected groups, exp=%v got=%v", exp, got)
 			}
 		})
+	}
+}
+
+// A group created after the last rebuild is looked up by a single-user
+// refresh, so the reserved Kubernetes namespace has to be enforced on that
+// path as well as during a full group sweep.
+func TestRefreshUserSkipsNewKubernetesSystemGroup(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{
+		"alice@example.net": {"admins"},
+	})
+
+	d := newTestDirectory(t, testConfig(), c)
+	if err := d.Refresh(); err != nil {
+		t.Fatalf("unexpected error refreshing: %s", err)
+	}
+
+	addGroup(c, "system:masters")
+	addToGroup(t, c, "alice@example.net", "system:masters")
+
+	stats, err := d.RefreshUser(context.Background(), "alice@example.net")
+	if err != nil {
+		t.Fatalf("unexpected error refreshing the user: %s", err)
+	}
+	if stats.Changed {
+		t.Errorf("expected the reserved group not to change the mapping, got %+v", stats)
+	}
+
+	if groups, ok := d.Groups("alice@example.net"); !ok || !reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected only admins, got %v (found=%t)", groups, ok)
 	}
 }

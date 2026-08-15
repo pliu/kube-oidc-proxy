@@ -117,16 +117,14 @@ func TestParseConfigReadsEveryField(t *testing.T) {
       "usernameAttribute": "sAMAccountName",
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"],
       "groupFilter": "(objectClass=groupOfNames)",
-      "groupNameAttribute": "name",
-      "groupPrefix": "corp:"
+      "groupNameAttribute": "name"
     },
     {
       "name": "partners",
       "urls": ["ldap://partners.example.net:389"],
       "insecureSkipTLSVerify": true,
       "userSearchBases": ["OU=Users,DC=partners,DC=net"],
-      "groupSearchBases": ["OU=Groups,DC=partners,DC=net"],
-      "groupPrefix": "partners:"
+      "groupSearchBases": ["OU=Groups,DC=partners,DC=net"]
     }
   ],
   "refreshInterval": "1h30m",
@@ -149,9 +147,6 @@ func TestParseConfigReadsEveryField(t *testing.T) {
 
 	if got := config.Backends[0].URLs; !reflect.DeepEqual(got, []string{"ldaps://one.example.net:636", "ldaps://two.example.net:636"}) {
 		t.Errorf("expected both URLs, got %v", got)
-	}
-	if got := config.Backends[1].GroupPrefix; got != "partners:" {
-		t.Errorf("expected a group prefix of \"partners:\", got %q", got)
 	}
 	if got := config.RefreshInterval.Duration(); got != time.Hour+time.Minute*30 {
 		t.Errorf("expected a refresh interval of 1h30m, got %s", got)
@@ -389,13 +384,13 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "cache": {"type": "none"}}`,
 			"timeout must be a positive duration",
 		},
-		"a groupPrefix that uses the reserved system: prefix": {
+		"a removed groupPrefix field": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"],
-			  "groupPrefix": "system:"}],
+			  "groupPrefix": "ldap:"}],
 			  "cache": {"type": "none"}}`,
-			"reserved system: prefix",
+			"groupPrefix",
 		},
 	}
 

@@ -160,10 +160,13 @@ type Directory struct {
 	mapping atomic.Pointer[map[string][]string]
 	stats   atomic.Pointer[Stats]
 
-	// applyMu serialises persisting a mapping against swapping it in, so that
-	// a single user refresh and a rebuild cannot interleave and leave the
-	// store holding the mapping that lost.
-	applyMu sync.Mutex
+	// updateGate serialises every directory read that can replace some or all of
+	// the mapping. The apply itself is not enough to serialise: a single-user
+	// refresh can finish an older search after a newer full rebuild has landed,
+	// and would otherwise publish its stale result over the rebuild. A channel
+	// rather than a mutex lets a single-user request stop waiting when its
+	// context is cancelled.
+	updateGate chan struct{}
 
 	// refreshMu guards inflight. It is not held across a rebuild.
 	refreshMu sync.Mutex
@@ -258,7 +261,9 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 		cache:        store,
 		mappingHash:  config.mappingHash(),
 		refreshUsers: refreshUsers,
+		updateGate:   make(chan struct{}, 1),
 	}
+	d.updateGate <- struct{}{}
 
 	empty := make(map[string][]string)
 	d.mapping.Store(&empty)
@@ -545,6 +550,12 @@ func (d *Directory) refresh() error {
 		return nil
 	}
 
+	// Held across the directory read as well as the publication. Serialising
+	// only persist-and-swap would allow an older single-user search to land
+	// after this rebuild and regress that user in the builder and every reader.
+	<-d.updateGate
+	defer func() { d.updateGate <- struct{}{} }()
+
 	start := time.Now()
 
 	built, err := d.build()
@@ -556,12 +567,6 @@ func (d *Directory) refresh() error {
 
 		return err
 	}
-
-	// Held from the persist through the swap, so that a single user refresh
-	// working at the same time cannot write its mapping over this one, or this
-	// one over its.
-	d.applyMu.Lock()
-	defer d.applyMu.Unlock()
 
 	if err := d.persist(built.mapping, built.groups, start, built.stats); err != nil {
 		lastRefreshSuccess.Set(0)
@@ -989,19 +994,18 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 				return nil, fmt.Errorf("group %q has an invalid DN: %s", entry.DN, err)
 			}
 
-			emittedName := b.config.GroupPrefix + name
-			if strings.HasPrefix(emittedName, kubernetesSystemGroupPrefix) {
-				klog.Warningf("skipping group %q: emitted name %q uses the reserved %s prefix",
-					entry.DN, emittedName, kubernetesSystemGroupPrefix)
+			if strings.HasPrefix(name, kubernetesSystemGroupPrefix) {
+				klog.Warningf("skipping group %q: name %q uses the reserved %s prefix",
+					entry.DN, name, kubernetesSystemGroupPrefix)
 				continue
 			}
 
-			if claimed, ok := claimedByName[emittedName]; ok && claimed.key != key {
-				return nil, &duplicateGroupError{name: emittedName, first: claimed.dn, second: entry.DN}
+			if claimed, ok := claimedByName[name]; ok && claimed.key != key {
+				return nil, &duplicateGroupError{name: name, first: claimed.dn, second: entry.DN}
 			}
 
-			claimedByName[emittedName] = groupClaim{key: key, dn: entry.DN}
-			groupNames[key] = emittedName
+			claimedByName[name] = groupClaim{key: key, dn: entry.DN}
+			groupNames[key] = name
 		}
 	}
 
