@@ -37,6 +37,11 @@ const (
 	// LDAPRefreshPath is the path an authenticated user can POST to in order to
 	// trigger a rebuild of the LDAP user to group mapping.
 	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
+
+	// LDAPRefreshUserParam names the one user to refresh, for a caller who
+	// knows what changed in the directory and does not need every other user
+	// searched for again to pick it up.
+	LDAPRefreshUserParam = "user"
 )
 
 var (
@@ -86,6 +91,10 @@ type GroupAugmenter interface {
 
 	// Refresh rebuilds the mapping on demand.
 	Refresh() error
+
+	// RefreshUser re-searches the directories for one user and persists the
+	// mapping if what it found differs from what is being served.
+	RefreshUser(context ctx.Context, username string) (*ldap.UserStats, error)
 
 	Stats() *ldap.Stats
 }

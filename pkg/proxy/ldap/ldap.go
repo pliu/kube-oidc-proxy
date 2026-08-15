@@ -160,6 +160,11 @@ type Directory struct {
 	mapping atomic.Pointer[map[string][]string]
 	stats   atomic.Pointer[Stats]
 
+	// applyMu serialises persisting a mapping against swapping it in, so that
+	// a single user refresh and a rebuild cannot interleave and leave the
+	// store holding the mapping that lost.
+	applyMu sync.Mutex
+
 	// refreshMu guards inflight. It is not held across a rebuild.
 	refreshMu sync.Mutex
 
@@ -188,6 +193,15 @@ type backend struct {
 	// by restore before the first refresh.
 	lastUsers  int
 	lastGroups int
+
+	// lastGroupNames is the normalised group DN -> emitted name mapping of the
+	// last accepted refresh. Refreshing one user resolves their memberOf
+	// against it rather than sweeping every group search base again, which is
+	// most of what makes that cheaper than rebuilding everybody.
+	//
+	// Read while a refresh of a single user runs, which is not the goroutine
+	// that wrote it, so it is swapped rather than written into.
+	lastGroupNames atomic.Pointer[map[string]string]
 
 	dial func(url string) (conn, error)
 }
@@ -514,7 +528,7 @@ func (d *Directory) refresh() error {
 
 	start := time.Now()
 
-	mapping, groups, backendStats, err := d.build()
+	built, err := d.build()
 	if err != nil {
 		// A failed rebuild is not an outage - the previous mapping keeps
 		// serving - so nothing else surfaces that group changes have stopped
@@ -524,7 +538,13 @@ func (d *Directory) refresh() error {
 		return err
 	}
 
-	if err := d.persist(mapping, groups, start, backendStats); err != nil {
+	// Held from the persist through the swap, so that a single user refresh
+	// working at the same time cannot write its mapping over this one, or this
+	// one over its.
+	d.applyMu.Lock()
+	defer d.applyMu.Unlock()
+
+	if err := d.persist(built.mapping, built.groups, start, built.stats); err != nil {
 		lastRefreshSuccess.Set(0)
 
 		return err
@@ -534,8 +554,9 @@ func (d *Directory) refresh() error {
 	// merely a search that happened to finish. A later backend or the store can
 	// still fail after an earlier backend was searched, in which case the old
 	// mapping and its baselines must remain authoritative together.
-	for i, stats := range backendStats {
+	for i, stats := range built.stats {
 		d.backends[i].lastUsers, d.backends[i].lastGroups = stats.Users, stats.Groups
+		d.backends[i].lastGroupNames.Store(&built.groupNames[i])
 	}
 
 	// Measured over the persisting as well as the searching, since a rebuild
@@ -545,18 +566,19 @@ func (d *Directory) refresh() error {
 	lastRefreshSuccess.Set(1)
 	refreshDuration.Observe(took.Seconds())
 
-	d.mapping.Store(&mapping)
+	d.mapping.Store(&built.mapping)
+
 	d.stats.Store(&Stats{
-		Users:       len(mapping),
-		Groups:      groups,
+		Users:       len(built.mapping),
+		Groups:      built.groups,
 		LastRefresh: start,
 		Duration:    took.String(),
 		Source:      SourceDirectory,
-		Backends:    backendStats,
+		Backends:    built.stats,
 	})
 
 	klog.V(2).Infof("refreshed LDAP mapping from %d backends: %d users, %d groups (%s)",
-		len(d.backends), len(mapping), groups, took)
+		len(d.backends), len(built.mapping), built.groups, took)
 
 	return nil
 }
@@ -618,12 +640,30 @@ func (d *Directory) Stats() *Stats {
 // all, fails the whole refresh. Merging what the healthy backends returned
 // would quietly drop the groups a user holds in the other one, which is worse
 // than serving a mapping that is a refresh interval out of date.
-func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
+// buildResult is one rebuild of the mapping, in configuration order per
+// backend, kept together so that everything a refresh has to record about it
+// moves as one thing.
+type buildResult struct {
+	mapping map[string][]string
+	groups  int
+	stats   []BackendStats
+
+	// groupNames is the group DN -> emitted name mapping each backend resolved
+	// its users against, which a refresh that is accepted leaves on the
+	// backends for single user searches to use.
+	groupNames []map[string]string
+}
+
+func (d *Directory) build() (*buildResult, error) {
 	type result struct {
 		mapping map[string][]string
 		groups  int
 		stats   BackendStats
 		err     error
+
+		// groupNames is kept so that a refresh which is accepted can leave it
+		// on the backend for the single user searches to resolve against.
+		groupNames map[string]string
 	}
 
 	// Backends are independent directories. Search them together so a refresh
@@ -638,12 +678,13 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 			defer wg.Done()
 
 			start := time.Now()
-			built, builtGroups, err := b.build()
+			built, builtGroupNames, err := b.build()
 			if err != nil {
 				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
 				return
 			}
 
+			builtGroups := len(builtGroupNames)
 			if err := b.checkCounts(len(built), builtGroups); err != nil {
 				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
 				return
@@ -652,8 +693,9 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 			took := time.Since(start)
 			backendRefreshDuration.WithLabelValues(b.config.Name).Observe(took.Seconds())
 			results[i] = result{
-				mapping: built,
-				groups:  builtGroups,
+				mapping:    built,
+				groups:     builtGroups,
+				groupNames: builtGroupNames,
 				stats: BackendStats{
 					Name:     b.config.Name,
 					Users:    len(built),
@@ -668,22 +710,26 @@ func (d *Directory) build() (map[string][]string, int, []BackendStats, error) {
 	}
 	wg.Wait()
 
-	mapping := make(map[string][]string)
-	stats := make([]BackendStats, 0, len(results))
-	var groups int
-	for _, result := range results {
-		if result.err != nil {
-			return nil, 0, nil, result.err
-		}
-
-		merge(mapping, result.mapping)
-		groups += result.groups
-		stats = append(stats, result.stats)
+	built := &buildResult{
+		mapping:    make(map[string][]string),
+		stats:      make([]BackendStats, 0, len(results)),
+		groupNames: make([]map[string]string, 0, len(results)),
 	}
 
-	finalise(mapping)
+	for _, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
 
-	return mapping, groups, stats, nil
+		merge(built.mapping, result.mapping)
+		built.groups += result.groups
+		built.stats = append(built.stats, result.stats)
+		built.groupNames = append(built.groupNames, result.groupNames)
+	}
+
+	finalise(built.mapping)
+
+	return built, nil
 }
 
 // merge folds the mapping of one backend into the combined mapping. A user
@@ -729,10 +775,12 @@ func finalise(mapping map[string][]string) {
 }
 
 // build searches this backend and returns a username -> groups mapping, along
-// with how many distinct groups were found under its group search bases. A
-// group nobody in the user search bases belongs to is counted, since what this
-// measures is the search having returned something rather than the mapping.
-func (b *backend) build() (map[string][]string, int, error) {
+// with the normalised group DN -> emitted name mapping it was resolved against.
+// The size of that mapping is how many distinct groups were found under the
+// group search bases: a group nobody in the user search bases belongs to is
+// counted, since what it measures is the search having returned something
+// rather than the mapping.
+func (b *backend) build() (map[string][]string, map[string]string, error) {
 	// A directory that accepts a connection and then stops answering would
 	// otherwise hold a refresh here for as long as the process runs: go-ldap
 	// waits for a response on a channel with no deadline of its own, so
@@ -742,7 +790,7 @@ func (b *backend) build() (map[string][]string, int, error) {
 
 	c, err := b.connect(w)
 	if err != nil {
-		return nil, 0, w.wrap(err)
+		return nil, nil, w.wrap(err)
 	}
 	defer c.Close()
 
@@ -755,7 +803,7 @@ func (b *backend) build() (map[string][]string, int, error) {
 			backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(1)
 		}
 
-		return nil, 0, w.wrap(err)
+		return nil, nil, w.wrap(err)
 	}
 	backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(0)
 
@@ -768,12 +816,12 @@ func (b *backend) build() (map[string][]string, int, error) {
 			backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(1)
 		}
 
-		return nil, 0, w.wrap(err)
+		return nil, nil, w.wrap(err)
 	}
 
 	backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(0)
 
-	return mapping, len(groupNames), nil
+	return mapping, groupNames, nil
 }
 
 // watchdog closes a connection that a backend has not finished with in time.
@@ -1002,23 +1050,9 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 				return nil, err
 			}
 
-			groups := make([]string, 0)
-			seenGroups := make(map[string]struct{})
-			for _, dn := range dns {
-				key, err := normaliseDN(dn)
-				if err != nil {
-					return nil, fmt.Errorf("user %q has an invalid %s DN %q: %s",
-						entry.DN, memberOfAttribute, dn, err)
-				}
-
-				if name, ok := groupNames[key]; ok {
-					if _, duplicate := seenGroups[name]; duplicate {
-						continue
-					}
-
-					seenGroups[name] = struct{}{}
-					groups = append(groups, name)
-				}
+			groups, err := groupsFromDNs(entry.DN, dns, groupNames)
+			if err != nil {
+				return nil, err
 			}
 
 			mapping[key] = groups
@@ -1026,6 +1060,38 @@ func (b *backend) searchUsers(c conn, groupNames map[string]string) (map[string]
 	}
 
 	return mapping, nil
+}
+
+// groupsFromDNs turns the memberOf of one entry into the group names it is to
+// be given, keeping only the groups that were found under the configured group
+// search bases. A group named twice - by two DNs that normalise the same way -
+// is given once, since a user must not be impersonated as a member of it
+// twice.
+func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string) ([]string, error) {
+	groups := make([]string, 0)
+	seen := make(map[string]struct{})
+
+	for _, groupDN := range memberOf {
+		key, err := normaliseDN(groupDN)
+		if err != nil {
+			return nil, fmt.Errorf("user %q has an invalid %s DN %q: %s",
+				dn, memberOfAttribute, groupDN, err)
+		}
+
+		name, ok := groupNames[key]
+		if !ok {
+			continue
+		}
+
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+
+		seen[name] = struct{}{}
+		groups = append(groups, name)
+	}
+
+	return groups, nil
 }
 
 // connect dials the configured URLs in order, returning the first connection

@@ -37,6 +37,13 @@ type fakeAugmenter struct {
 	refreshCount int
 
 	refreshEndpointDisabled bool
+
+	// directory is what a search for one user finds, standing in for the
+	// directories being searched for somebody the mapping does not hold.
+	directory map[string][]string
+
+	directoryErr error
+	userRefresh  []string
 }
 
 func (f *fakeAugmenter) RefreshEndpointEnabled() bool { return !f.refreshEndpointDisabled }
@@ -58,6 +65,23 @@ func (f *fakeAugmenter) CanRefresh(username string) bool {
 func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
 	groups, ok := f.mapping[username]
 	return groups, ok
+}
+
+func (f *fakeAugmenter) RefreshUser(_ gocontext.Context, username string) (*ldap.UserStats, error) {
+	f.userRefresh = append(f.userRefresh, username)
+
+	if f.directoryErr != nil {
+		return nil, f.directoryErr
+	}
+
+	groups, found := f.directory[username]
+
+	return &ldap.UserStats{
+		User:    username,
+		Found:   found,
+		Groups:  len(groups),
+		Changed: found,
+	}, nil
 }
 
 func (f *fakeAugmenter) Run(stopCh <-chan struct{}) error { return nil }
@@ -198,6 +222,76 @@ func TestLDAPRefreshEndpoint(t *testing.T) {
 
 	if stats.Users != 1 {
 		t.Errorf("expected stats of 1 user, got %d", stats.Users)
+	}
+}
+
+// Refreshing one user searches the directories for them alone rather than
+// sweeping the whole of every one, which is what makes a change to a single
+// user cheap enough to ask for as soon as it is made.
+func TestLDAPRefreshEndpointRefreshesOneUser(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{
+		mapping:   map[string][]string{"alice@example.net": {"admins"}},
+		directory: map[string][]string{"bob@example.net": {"devs", "admins"}},
+	}
+	p.ldapDirectory = directory
+
+	req := newADRequest(LDAPRefreshPath, http.MethodPost)
+	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
+
+	resp := serveWithAD(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
+	}
+
+	if exp := []string{"bob@example.net"}; !reflect.DeepEqual(directory.userRefresh, exp) {
+		t.Errorf("expected the named user to have been refreshed, exp=%v got=%v",
+			exp, directory.userRefresh)
+	}
+
+	// Everybody else is left alone: the whole point is not rebuilding them.
+	if directory.refreshCount != 0 {
+		t.Errorf("expected no rebuild of the whole mapping, got %d", directory.refreshCount)
+	}
+
+	var stats ldap.UserStats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode response: %s", err)
+	}
+
+	if !stats.Found || !stats.Changed || stats.Groups != 2 {
+		t.Errorf("unexpected stats: %+v", stats)
+	}
+
+	// How many groups they hold, not which: by default any authenticated user
+	// may call this, and naming them would make it a way of reading the group
+	// membership of anybody whose username can be guessed.
+	if stats.User != "bob@example.net" {
+		t.Errorf("expected the refreshed user to be named, got %q", stats.User)
+	}
+}
+
+func TestLDAPRefreshEndpointReportsAFailedUserRefresh(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	directory := &fakeAugmenter{
+		mapping:      map[string][]string{"alice@example.net": {"admins"}},
+		directoryErr: errors.New("directory is unreachable"),
+	}
+	p.ldapDirectory = directory
+
+	req := newADRequest(LDAPRefreshPath, http.MethodPost)
+	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
+
+	resp := serveWithAD(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("got unexpected response code, exp=%d got=%d",
+			http.StatusInternalServerError, resp.StatusCode)
 	}
 }
 

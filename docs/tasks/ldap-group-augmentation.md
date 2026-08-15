@@ -34,6 +34,11 @@ The mapping is rebuilt on an interval (10 minutes by default) and swapped in
 atomically, so a request always reads a complete, consistent mapping. If a
 rebuild fails, the previous mapping is kept in place and serving continues.
 
+A user the directory gained since the last rebuild is in no mapping yet, and is
+given no groups until the next one. Waiting out the interval is not the only
+way to close that gap: [one user can be refreshed](#refreshing-one-user)
+without everybody being searched for again.
+
 By default every replica does all of this for itself. Past one replica you
 probably want [one of them building and the rest
 serving](#splitting-the-builder-from-the-proxies) instead.
@@ -702,3 +707,54 @@ By default any authenticated user may trigger a refresh. To restrict this to a
 set of users, set `refreshUsers`. Names are matched case insensitively, and may
 be given either as they appear in the JWT or without the
 `--oidc-username-prefix`. A user who is not in the list receives a `403`.
+
+### Refreshing one user
+
+Rebuilding everybody to pick up one group membership means searching every
+directory in full. When what changed is known, a `user` parameter refreshes
+that user alone:
+
+```
+$ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
+    "https://kube-oidc-proxy.example.net/kube-oidc-proxy/ldap/refresh?user=alice@example.net"
+{"user":"alice@example.net","found":true,"groups":12,"changed":true,"duration":"41ms"}
+```
+
+Every backend is searched for that one user and the results merged, exactly as
+a rebuild merges the whole of each - a user held in more than one directory
+ends up with the union of their groups, and a backend that cannot be searched
+fails the refresh rather than being left out of it. The one difference is that
+their `memberOf` is resolved against the group names of the last rebuild rather
+than by sweeping every group search base again, which is most of what makes
+this cheaper. A group created *since* that rebuild is therefore not one this
+can put a user in; that membership is picked up by the next rebuild, along with
+the group itself.
+
+If what it found differs from what is being served, the mapping is persisted
+and then swapped in - the same order a rebuild uses, so the store is never
+older than what requests are answered from. A store that refuses the write
+leaves the refresh failed rather than leaving that one proxy serving something
+nothing else will ever see.
+
+There is no partial write, so this rewrites the whole mapping for one user. A
+rebuild of everybody would write exactly the same amount and search every
+directory to get there, so it is still the cheaper of the two by a wide margin,
+but it is not free: `"changed":false` means nothing was written, because the
+refresh found what was already being served.
+
+A user the directories no longer hold is *removed* from the mapping, since
+serving their old groups is serving an entry the next rebuild would drop.
+
+The response reports how many groups the user holds rather than which. By
+default any authenticated user may call this endpoint, and naming them would
+make it a way of reading the group membership of anybody whose username can be
+guessed. `refreshUsers` gates this exactly as it gates a full rebuild, and a
+burst of requests for one user costs one write rather than one each: whichever
+gets there first writes the mapping, and the rest find nothing left to change.
+
+With the builder split from the proxies this needs the same
+[routing](#refreshing) a full rebuild does - the query parameter rides along
+with the path rule shown there. It is also the only way to pick up a new user
+promptly in that topology: a reader holds no credentials and no description of
+the directory layout, so it cannot search for anybody itself, and it picks up
+the refreshed user when the builder publishes the mapping it just wrote.

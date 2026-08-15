@@ -91,6 +91,12 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 // to group mapping. It sits after authentication in the chain,
 // so only authenticated users can trigger a refresh. The path is not a valid
 // API server path, so it can never shadow a request meant for Kubernetes.
+//
+// A "user" query parameter refreshes that one user rather than everybody, which
+// searches the directories for them alone instead of sweeping the whole of
+// every one. The mapping is persisted either way: what the endpoint is for is
+// making a change to the directory take effect, and a change that is lost at
+// the next restart has not really taken effect.
 func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath ||
@@ -123,17 +129,36 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 			return
 		}
 
-		klog.V(2).Infof("LDAP refresh requested by %q (%s)",
-			requester.GetName(), remoteAddr)
+		var response interface{}
 
-		if err := p.ldapDirectory.Refresh(); err != nil {
-			klog.Errorf("failed to refresh LDAP mapping (%s): %s", remoteAddr, err)
-			http.Error(rw, "Failed to refresh LDAP mapping", http.StatusInternalServerError)
-			return
+		if user := req.URL.Query().Get(LDAPRefreshUserParam); user != "" {
+			klog.V(2).Infof("LDAP refresh of user %q requested by %q (%s)",
+				user, requester.GetName(), remoteAddr)
+
+			stats, err := p.ldapDirectory.RefreshUser(req.Context(), user)
+			if err != nil {
+				klog.Errorf("failed to refresh LDAP user %q (%s): %s", user, remoteAddr, err)
+				http.Error(rw, "Failed to refresh the LDAP mapping of that user",
+					http.StatusInternalServerError)
+				return
+			}
+
+			response = stats
+		} else {
+			klog.V(2).Infof("LDAP refresh requested by %q (%s)",
+				requester.GetName(), remoteAddr)
+
+			if err := p.ldapDirectory.Refresh(); err != nil {
+				klog.Errorf("failed to refresh LDAP mapping (%s): %s", remoteAddr, err)
+				http.Error(rw, "Failed to refresh LDAP mapping", http.StatusInternalServerError)
+				return
+			}
+
+			response = p.ldapDirectory.Stats()
 		}
 
 		rw.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(rw).Encode(p.ldapDirectory.Stats()); err != nil {
+		if err := json.NewEncoder(rw).Encode(response); err != nil {
 			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)
 		}
 	})
@@ -148,6 +173,11 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // the whole point of augmenting, and a user who is missing because a directory
 // is misconfigured would otherwise quietly regain whatever their identity
 // provider claimed for them.
+//
+// Being held in none of them can also just mean the directory gained them since
+// the last rebuild. Waiting out the interval is not the only way to pick that
+// up: the refresh endpoint takes a single user, so what changed can be
+// refreshed without everybody being searched for again.
 func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
 	groups, ok := p.ldapDirectory.Groups(u.GetName())
 	if !ok {
