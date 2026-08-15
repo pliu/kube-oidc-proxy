@@ -727,3 +727,94 @@ func TestRefreshUserStopsForACancelledCaller(t *testing.T) {
 		t.Errorf("expected no search to have been made, got %d", c.searches-searched)
 	}
 }
+
+// addToGroup adds a group to the memberOf of a user already in a fake
+// connection, as a directory does when somebody is put in a group between
+// rebuilds.
+func addToGroup(t *testing.T, c *fakeConn, username, group string) {
+	t.Helper()
+
+	dn := "CN=" + username + ",OU=Users,DC=example,DC=net"
+
+	for _, e := range c.entries["OU=Users,DC=example,DC=net"] {
+		if e.DN != dn {
+			continue
+		}
+
+		for _, attribute := range e.Attributes {
+			if attribute.Name == memberOfAttribute {
+				attribute.Values = append(attribute.Values,
+					"CN="+group+",OU=Groups,DC=example,DC=net")
+				return
+			}
+		}
+	}
+
+	t.Fatalf("test has no user %q to add to a group", username)
+}
+
+// A user already in the mapping who is put in another group holds all of them
+// after their refresh: the groups the rebuild found and the one it did not.
+func TestRefreshUserAddsAGroupToAUserAlreadyMapped(t *testing.T) {
+	tests := map[string]struct {
+		// existing says the group was there at the last rebuild, so it is in
+		// the names that rebuild recorded, rather than created since.
+		existing bool
+	}{
+		"a group that existed at the last rebuild": {existing: true},
+		"a group created since the last rebuild":   {existing: false},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			groups := []string{"a", "b"}
+			if test.existing {
+				groups = append(groups, "c")
+			}
+
+			c := connWithUsers(groups, map[string][]string{
+				"user1@example.net": {"a", "b"},
+			})
+
+			// connWithUsers only lists groups under the search base, which is
+			// how a sweep finds them. A refresh looks one up by its own DN.
+			for _, group := range groups {
+				dn := "CN=" + group + ",OU=Groups,DC=example,DC=net"
+				c.entries[dn] = []*goldap.Entry{entry(dn, map[string][]string{"cn": {group}})}
+			}
+
+			d := newTestDirectory(t, testConfig(), c)
+
+			if err := d.Refresh(); err != nil {
+				t.Fatalf("unexpected error refreshing: %s", err)
+			}
+
+			if got, _ := d.Groups("user1@example.net"); !reflect.DeepEqual(got, []string{"a", "b"}) {
+				t.Fatalf("expected the rebuild to have found a and b, got %v", got)
+			}
+
+			if !test.existing {
+				addGroup(c, "c")
+			}
+			addToGroup(t, c, "user1@example.net", "c")
+
+			stats, err := d.RefreshUser(context.Background(), "user1@example.net")
+			if err != nil {
+				t.Fatalf("unexpected error refreshing the user: %s", err)
+			}
+
+			if !stats.Found || !stats.Changed || stats.Groups != 3 {
+				t.Errorf("unexpected stats: %+v", stats)
+			}
+
+			got, ok := d.Groups("user1@example.net")
+			if !ok {
+				t.Fatal("expected the user to still be served")
+			}
+
+			if exp := []string{"a", "b", "c"}; !reflect.DeepEqual(got, exp) {
+				t.Errorf("unexpected groups, exp=%v got=%v", exp, got)
+			}
+		})
+	}
+}
