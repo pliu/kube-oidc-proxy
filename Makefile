@@ -12,7 +12,7 @@ export GO111MODULE=on
 help:  ## display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-.PHONY: help build docker_build test depend verify all clean generate
+.PHONY: help build docker_build test integration depend verify all clean generate
 
 UNAME_S := $(shell uname -s)
 GOLANGCILINT_VERSION := 1.21.0
@@ -91,6 +91,9 @@ test: generate verify ## run all go tests
 	mkdir -p $(ARTIFACTS)
 	go test -v -bench $$(go list ./pkg/... ./cmd/... | grep -v pkg/e2e) | tee $(ARTIFACTS)/go-test.stdout
 	cat $(ARTIFACTS)/go-test.stdout | go run github.com/jstemmer/go-junit-report > $(ARTIFACTS)/junit-go-test.xml
+
+integration: ## run in-process integration tests
+	go test -v --count=1 ./test/integration/...
 
 e2e: depend ## run end to end tests
 	mkdir -p $(ARTIFACTS)
