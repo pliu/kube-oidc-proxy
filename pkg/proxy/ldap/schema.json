@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jetstack/kube-oidc-proxy/schemas/ldap-config.v1.json",
-  "title": "kube-oidc-proxy Active Directory configuration",
+  "title": "kube-oidc-proxy LDAP configuration",
   "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
   "type": "object",
   "additionalProperties": false,

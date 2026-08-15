@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"k8s.io/apiserver/pkg/authentication/user"
-	authuser "k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
@@ -87,112 +86,6 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 	})
 }
 
-// withLDAPRefresh serves the endpoint that triggers a rebuild of the LDAP user
-// to group mapping. It sits after authentication in the chain,
-// so only authenticated users can trigger a refresh. The path is not a valid
-// API server path, so it can never shadow a request meant for Kubernetes.
-//
-// A "user" query parameter refreshes that one user rather than everybody, which
-// searches the directories for them alone instead of sweeping the whole of
-// every one. The mapping is persisted either way: what the endpoint is for is
-// making a change to the directory take effect, and a change that is lost at
-// the next restart has not really taken effect.
-func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath ||
-			!p.ldapDirectory.RefreshEndpointEnabled() {
-			handler.ServeHTTP(rw, req)
-			return
-		}
-
-		if req.Method != http.MethodPost {
-			rw.Header().Set("Allow", http.MethodPost)
-			http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var remoteAddr string
-		req, remoteAddr = context.RemoteAddr(req)
-
-		// A request that authenticated by token passthrough carries no user,
-		// so there is nobody to check against the allowed users.
-		requester, ok := genericapirequest.UserFrom(req.Context())
-		if !ok || len(requester.GetName()) == 0 {
-			p.handleError(rw, req, errNoName)
-			return
-		}
-
-		if !p.ldapDirectory.CanRefresh(requester.GetName()) {
-			klog.V(2).Infof("user %q is not allowed to trigger an LDAP refresh (%s)",
-				requester.GetName(), remoteAddr)
-			http.Error(rw, "Not allowed to trigger an LDAP refresh", http.StatusForbidden)
-			return
-		}
-
-		var response interface{}
-
-		if user := req.URL.Query().Get(LDAPRefreshUserParam); user != "" {
-			klog.V(2).Infof("LDAP refresh of user %q requested by %q (%s)",
-				user, requester.GetName(), remoteAddr)
-
-			stats, err := p.ldapDirectory.RefreshUser(req.Context(), user)
-			if err != nil {
-				klog.Errorf("failed to refresh LDAP user %q (%s): %s", user, remoteAddr, err)
-				http.Error(rw, "Failed to refresh the LDAP mapping of that user",
-					http.StatusInternalServerError)
-				return
-			}
-
-			response = stats
-		} else {
-			klog.V(2).Infof("LDAP refresh requested by %q (%s)",
-				requester.GetName(), remoteAddr)
-
-			if err := p.ldapDirectory.Refresh(); err != nil {
-				klog.Errorf("failed to refresh LDAP mapping (%s): %s", remoteAddr, err)
-				http.Error(rw, "Failed to refresh LDAP mapping", http.StatusInternalServerError)
-				return
-			}
-
-			response = p.ldapDirectory.Stats()
-		}
-
-		rw.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(rw).Encode(response); err != nil {
-			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)
-		}
-	})
-}
-
-// augmentGroups replaces the groups of the given user with the groups they hold
-// in the LDAP directories.
-//
-// A user held in none of them is given no groups at all, and so can do only
-// what system:authenticated allows. The groups of their token are not a
-// fallback: the directory being the only thing that decides group membership is
-// the whole point of augmenting, and a user who is missing because a directory
-// is misconfigured would otherwise quietly regain whatever their identity
-// provider claimed for them.
-//
-// Being held in none of them can also just mean the directory gained them since
-// the last rebuild. Waiting out the interval is not the only way to pick that
-// up: the refresh endpoint takes a single user, so what changed can be
-// refreshed without everybody being searched for again.
-func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
-	groups, ok := p.ldapDirectory.Groups(u.GetName())
-	if !ok {
-		klog.V(4).Infof("user %q is held in no directory, dropping the groups of their token (%s)",
-			u.GetName(), remoteAddr)
-	}
-
-	return &authuser.DefaultInfo{
-		Name:   u.GetName(),
-		UID:    u.GetUID(),
-		Groups: groups,
-		Extra:  u.GetExtra(),
-	}
-}
-
 // withImpersonateRequest adds the impersonation request handler to the chain.
 func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -203,7 +96,6 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		}
 
 		var targetForContext user.Info
-		targetForContext = nil
 
 		var remoteAddr string
 		req, remoteAddr = context.RemoteAddr(req)
@@ -217,9 +109,9 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			return
 		}
 
-		user, ok := genericapirequest.UserFrom(req.Context())
+		requester, ok := genericapirequest.UserFrom(req.Context())
 		// No name available so reject request
-		if !ok || len(user.GetName()) == 0 {
+		if !ok || len(requester.GetName()) == 0 {
 			p.handleError(rw, req, errNoName)
 			return
 		}
@@ -237,7 +129,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// wrong thing about who did the work.
 		if p.ldapDirectory != nil && p.hasImpersonation(req.Header) {
 			klog.V(2).Infof("rejecting impersonation headers from %q while groups are taken from the directory (%s)",
-				user.GetName(), remoteAddr)
+				requester.GetName(), remoteAddr)
 			p.handleError(rw, req, errImpersonationNotAccepted)
 			return
 		}
@@ -246,15 +138,15 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// This happens before the impersonation check below so that the
 		// authorization decision is made against the directory groups too.
 		if p.ldapDirectory != nil {
-			user = p.augmentGroups(user, remoteAddr)
+			requester = p.augmentGroups(requester, remoteAddr)
 		}
 
-		userForContext := user
+		userForContext := requester
 
 		if p.hasImpersonation(req.Header) {
 			// if impersonation headers are present, let's check to see
 			// if the user is authorized to perform the impersonation
-			target, err := p.subjectAccessReviewer.CheckAuthorizedForImpersonation(req, user)
+			target, err := p.subjectAccessReviewer.CheckAuthorizedForImpersonation(req, requester)
 
 			if err != nil {
 				p.handleError(rw, req, err)
@@ -263,25 +155,25 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 
 			if target != nil {
 				// TODO - store original context for logging
-				user = target
+				requester = target
 				targetForContext = target
 			}
 		}
 
 		// Ensure group contains allauthenticated builtin
 		allAuthFound := false
-		groups := user.GetGroups()
+		groups := requester.GetGroups()
 		for _, elem := range groups {
-			if elem == authuser.AllAuthenticated {
+			if elem == user.AllAuthenticated {
 				allAuthFound = true
 				break
 			}
 		}
 		if !allAuthFound {
-			groups = append(groups, authuser.AllAuthenticated)
+			groups = append(groups, user.AllAuthenticated)
 		}
 
-		extra := user.GetExtra()
+		extra := requester.GetExtra()
 
 		if extra == nil {
 			extra = make(map[string][]string)
@@ -337,7 +229,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 
 		conf := &context.ImpersonationRequest{
 			ImpersonationConfig: &transport.ImpersonationConfig{
-				UserName: user.GetName(),
+				UserName: requester.GetName(),
 				Groups:   groups,
 				Extra:    extra,
 			},
