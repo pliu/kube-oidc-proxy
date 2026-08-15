@@ -174,7 +174,13 @@ func (d *Directory) storeHolds(ctx context.Context, hash string) bool {
 }
 
 // persistedSnapshot is what the store is taken to hold: the fingerprint of the
-// mapping last written to it, and the build time written alongside that.
+// mapping it holds, and the build time recorded with it.
+//
+// The fingerprint is the one this proxy wrote, on a proxy that writes; the one
+// the store reported, on a proxy that took the mapping from a store that can
+// report it; and one computed from the payload otherwise. It is compared
+// against what the store says it holds, so which of those it is matters: see
+// loadHolding.
 //
 // Written only by the refresh path, which Refresh serialises, and by restore
 // before the first refresh.
@@ -312,7 +318,30 @@ func (d *Directory) restore() bool {
 // load installs the mapping the store is holding. It is how a proxy that does
 // not build one gets everything it serves, and how one that does gets what it
 // serves until its first rebuild finishes.
+//
+// The mapping is fingerprinted from the snapshot that was read back, which is
+// the only answer available to a caller holding nothing but the payload, and
+// the right one for a store that keeps no fingerprint of its own.
 func (d *Directory) load() error {
+	return d.loadHolding("")
+}
+
+// loadHolding installs the mapping the store is holding, recording it under the
+// fingerprint the store reported for it rather than under one computed here.
+//
+// The two are the same string only while every proxy sharing the store computes
+// it the same way, and that is a property of the binary rather than of the
+// mapping: contentHash covers the snapshot format and what can be served, so a
+// change to it - which has happened, without the format itself moving - leaves a
+// reader that recomputed disagreeing with the builder that wrote. Every
+// comparison a reader makes is against what the store reports, both the
+// fingerprint it is polled for and the one a watch delivers, so recording
+// anything else has it fetch and reinstall the whole mapping on every
+// notification and every resync until the builder next writes.
+//
+// An empty fingerprint means the caller has none to offer, and the snapshot is
+// fingerprinted here instead.
+func (d *Directory) loadHolding(fingerprint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
 	defer cancel()
 
@@ -328,10 +357,14 @@ func (d *Directory) load() error {
 
 	d.seedCounts(snapshot.Backends)
 
+	if fingerprint == "" {
+		fingerprint = snapshot.contentHash()
+	}
+
 	// The store is already holding this, so neither a rebuild that produces the
 	// same mapping nor a poll that finds the same fingerprint has any reason to
 	// go back to it.
-	d.persisted.Store(&persistedSnapshot{hash: snapshot.contentHash(), builtAt: snapshot.BuiltAt})
+	d.persisted.Store(&persistedSnapshot{hash: fingerprint, builtAt: snapshot.BuiltAt})
 
 	finalise(mapping)
 
@@ -355,7 +388,15 @@ func (d *Directory) load() error {
 // The check is made against the fingerprint the store reports, which for a
 // Secret is read without the mapping attached, so the ordinary case - a poll
 // that finds nothing new - costs one request for the metadata of one object
-// rather than a copy of the whole mapping.
+// rather than a copy of the whole mapping. That fingerprint is what the mapping
+// is then recorded under, so that the next poll compares like with like.
+//
+// It is read before the mapping rather than after, so a publication landing
+// between the two is recorded under the fingerprint of the one before it: the
+// next poll finds a mismatch and fetches a mapping it already has, which costs a
+// request. The other order loses the publication instead - the reader would
+// record a fingerprint newer than the payload it read back, and go on serving
+// the older mapping until something else changed.
 func (d *Directory) reload() error {
 	fingerprinter, ok := d.cache.(cache.Fingerprinter)
 	if !ok {
@@ -375,7 +416,7 @@ func (d *Directory) reload() error {
 		return nil
 	}
 
-	return d.load()
+	return d.loadHolding(held)
 }
 
 // seedCounts primes the per backend counts from a restored snapshot, so that a

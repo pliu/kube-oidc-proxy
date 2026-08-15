@@ -2535,6 +2535,67 @@ func TestReaderRefreshLooksForANewMapping(t *testing.T) {
 	}
 }
 
+// Everything a reader compares against is the fingerprint the store reports, so
+// that is what it has to record - not one it computed from the payload. The two
+// are the same string only while the builder and the reader compute it the same
+// way, which is a property of the binaries rather than of the mapping, and a
+// reader that recomputed would fetch and reinstall the whole mapping on every
+// notification and every resync for as long as they disagreed.
+func TestReaderRecordsTheFingerprintTheStoreReported(t *testing.T) {
+	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
+
+	store := new(memoryStore)
+
+	b, err := New(builderConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building directory: %s", err)
+	}
+	b.backends[0].dial = func(string) (conn, error) { return c, nil }
+
+	if err := b.Refresh(); err != nil {
+		t.Fatalf("unexpected error publishing the mapping: %s", err)
+	}
+
+	// A builder that fingerprints the mapping differently to this binary: the
+	// payload is the one it published, under a fingerprint the reader has no
+	// way of arriving at on its own.
+	const published = "fingerprint-from-another-build"
+	store.fingerprint = published
+
+	reader, err := New(readerConfig(), store)
+	if err != nil {
+		t.Fatalf("unexpected error building reader: %s", err)
+	}
+
+	if err := reader.reload(); err != nil {
+		t.Fatalf("unexpected error loading: %s", err)
+	}
+
+	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+		!reflect.DeepEqual(groups, []string{"admins"}) {
+		t.Errorf("expected the published mapping to be served, got %v (found=%t)", groups, ok)
+	}
+
+	loads := store.loads
+
+	for range 5 {
+		if err := reader.reload(); err != nil {
+			t.Fatalf("unexpected error reloading: %s", err)
+		}
+	}
+
+	if store.loads != loads {
+		t.Errorf("expected the mapping not to be fetched again while the store reports the same "+
+			"fingerprint, got %d fetches", store.loads-loads)
+	}
+
+	// The same value is what a watch delivers, so a notification replaying the
+	// mapping already being served has to be recognised as one.
+	if held := reader.held().hash; held != published {
+		t.Errorf("expected the reported fingerprint to have been recorded, got %q", held)
+	}
+}
+
 // A watch notification that arrives while an older load is in flight must
 // queue one more reload. Merely joining the old load would acknowledge the
 // notification while leaving the reader on the mapping captured before it.
