@@ -95,9 +95,9 @@ func (f *fakeAugmenter) Stats() *ldap.Stats {
 	return &ldap.Stats{Users: len(f.mapping)}
 }
 
-// serveWithAD runs a request that authenticates as tokenUser through the full
+// serveWithLDAP runs a request that authenticates as tokenUser through the full
 // handler chain, with the given directory in place.
-func serveWithAD(t *testing.T, p *fakeProxy, req *http.Request, tokenUser user.Info) *http.Response {
+func serveWithLDAP(t *testing.T, p *fakeProxy, req *http.Request, tokenUser user.Info) *http.Response {
 	t.Helper()
 
 	if tokenUser != nil {
@@ -117,7 +117,7 @@ func serveWithAD(t *testing.T, p *fakeProxy, req *http.Request, tokenUser user.I
 	return w.Result()
 }
 
-func newADRequest(path string, method string) *http.Request {
+func newLDAPRequest(path, method string) *http.Request {
 	u := new(url.URL)
 	u.Path = path
 
@@ -170,7 +170,7 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 			p.fakeRT.expUser = test.tokenUser.GetName()
 			p.fakeRT.expGroup = test.expGroup
 
-			resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet), test.tokenUser)
+			resp := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet), test.tokenUser)
 
 			if resp.StatusCode != http.StatusOK {
 				t.Errorf("got unexpected response code, exp=%d got=%d",
@@ -188,7 +188,7 @@ func TestGroupsUnchangedWhenLDAPDisabled(t *testing.T) {
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"from-token", user.AllAuthenticated}
 
-	resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet),
+	resp := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet),
 		&user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}})
 
 	if resp.StatusCode != http.StatusOK {
@@ -204,7 +204,7 @@ func TestLDAPRefreshEndpoint(t *testing.T) {
 	directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 	p.ldapDirectory = directory
 
-	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
+	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
@@ -238,10 +238,10 @@ func TestLDAPRefreshEndpointRefreshesOneUser(t *testing.T) {
 	}
 	p.ldapDirectory = directory
 
-	req := newADRequest(LDAPRefreshPath, http.MethodPost)
+	req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
 	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
 
-	resp := serveWithAD(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
+	resp := serveWithLDAP(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
@@ -284,10 +284,10 @@ func TestLDAPRefreshEndpointReportsAFailedUserRefresh(t *testing.T) {
 	}
 	p.ldapDirectory = directory
 
-	req := newADRequest(LDAPRefreshPath, http.MethodPost)
+	req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
 	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
 
-	resp := serveWithAD(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
+	resp := serveWithLDAP(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("got unexpected response code, exp=%d got=%d",
@@ -310,7 +310,7 @@ func TestLDAPReaderDoesNotServeRefreshEndpoint(t *testing.T) {
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
 
-	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
+	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
@@ -363,7 +363,7 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 			directory := &fakeAugmenter{refreshUsers: test.refreshUsers}
 			p.ldapDirectory = directory
 
-			resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
+			resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
 				&user.DefaultInfo{Name: test.requester})
 
 			if resp.StatusCode != test.expCode {
@@ -388,10 +388,10 @@ func TestLDAPRefreshEndpointRequiresAuthentication(t *testing.T) {
 	directory := &fakeAugmenter{}
 	p.ldapDirectory = directory
 
-	req := newADRequest(LDAPRefreshPath, http.MethodPost)
+	req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
 	req.Header = http.Header{}
 
-	resp := serveWithAD(t, p, req, nil)
+	resp := serveWithLDAP(t, p, req, nil)
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("got unexpected response code, exp=%d got=%d",
@@ -410,7 +410,7 @@ func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 	directory := &fakeAugmenter{}
 	p.ldapDirectory = directory
 
-	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodGet),
+	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodGet),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -429,7 +429,7 @@ func TestLDAPRefreshEndpointReportsFailure(t *testing.T) {
 
 	p.ldapDirectory = &fakeAugmenter{refreshErr: errors.New("directory is down")}
 
-	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath, http.MethodPost),
+	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusInternalServerError {
@@ -449,7 +449,7 @@ func TestLDAPRefreshPathIsNotProxied(t *testing.T) {
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
 
-	resp := serveWithAD(t, p, newADRequest(LDAPRefreshPath+"/subpath", http.MethodPost),
+	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath+"/subpath", http.MethodPost),
 		&user.DefaultInfo{Name: "alice@example.net"})
 
 	if resp.StatusCode != http.StatusOK {
@@ -540,7 +540,7 @@ func TestImpersonationIsRefusedWhenAugmentationIsEnabled(t *testing.T) {
 				mapping: map[string][]string{"alice@example.net": {"admins"}},
 			}
 
-			req := newADRequest("/api/v1/pods", http.MethodGet)
+			req := newLDAPRequest("/api/v1/pods", http.MethodGet)
 			for k, vs := range headers {
 				req.Header[k] = vs
 			}
@@ -592,7 +592,7 @@ func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
 
-	resp := serveWithAD(t, p, newADRequest("/api/v1/pods", http.MethodGet),
+	resp := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet),
 		&user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}})
 
 	if resp.StatusCode != http.StatusOK {

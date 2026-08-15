@@ -5,10 +5,10 @@ import (
 	ctx "context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"time"
 
 	"k8s.io/apiserver/pkg/apis/apiserver"
@@ -24,7 +24,6 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
@@ -32,29 +31,12 @@ import (
 
 const (
 	UserHeaderClientIPKey = "Remote-Client-IP"
-	timestampLayout       = "2006-01-02T15:04:05-0700"
-
-	// LDAPRefreshPath is the path an authenticated user can POST to in order to
-	// trigger a rebuild of the LDAP user to group mapping.
-	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
-
-	// LDAPRefreshUserParam names the one user to refresh, for a caller who
-	// knows what changed in the directory and does not need every other user
-	// searched for again to pick it up.
-	LDAPRefreshUserParam = "user"
 )
 
 var (
 	errUnauthorized          = errors.New("Unauthorized")
 	errNoName                = errors.New("No name in OIDC info")
 	errNoImpersonationConfig = errors.New("No impersonation configuration in context")
-
-	// errImpersonationNotAccepted is returned for a request that carries
-	// Impersonate- headers while the groups of a request are being taken from
-	// the directory. See withImpersonateRequest for why the two cannot both be
-	// honoured.
-	errImpersonationNotAccepted = errors.New(
-		"impersonation headers are not accepted while group augmentation is enabled")
 )
 
 type Config struct {
@@ -69,35 +51,6 @@ type Config struct {
 }
 
 type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
-
-// GroupAugmenter is the source of the groups a request is impersonated with
-// when the groups of the token are not to be trusted.
-type GroupAugmenter interface {
-	// Groups returns the groups held by the given user, and whether the user
-	// is known to the backend at all.
-	Groups(username string) ([]string, bool)
-
-	// Run builds the initial mapping and keeps it refreshed until stopCh is
-	// closed.
-	Run(stopCh <-chan struct{}) error
-
-	// CanRefresh reports whether the given user may trigger a refresh.
-	CanRefresh(username string) bool
-
-	// RefreshEndpointEnabled reports whether this augmenter can rebuild the
-	// mapping requested by the refresh endpoint. Readers update from their
-	// store internally, but do not expose that endpoint to clients.
-	RefreshEndpointEnabled() bool
-
-	// Refresh rebuilds the mapping on demand.
-	Refresh() error
-
-	// RefreshUser re-searches the directories for one user and persists the
-	// mapping if what it found differs from what is being served.
-	RefreshUser(context ctx.Context, username string) (*ldap.UserStats, error)
-
-	Stats() *ldap.Stats
-}
 
 type Proxy struct {
 	oidcRequestAuther     *bearertoken.Authenticator
@@ -127,7 +80,7 @@ type CAFromFile struct {
 }
 
 func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
-	res, _ := ioutil.ReadFile(caFromFile.CAFile)
+	res, _ := os.ReadFile(caFromFile.CAFile)
 	return res
 }
 

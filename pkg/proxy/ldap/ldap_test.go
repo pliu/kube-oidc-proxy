@@ -1233,17 +1233,63 @@ func TestRefreshDoesNotConflateEscapedCommasInDNs(t *testing.T) {
 }
 
 func TestRefreshRejectsMalformedDNs(t *testing.T) {
-	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
-	c.entries["OU=Groups,DC=example,DC=net"][0].DN = `CN=broken\`
-
-	d := newTestDirectory(t, testConfig(), c)
-
-	err := d.Refresh()
-	if err == nil {
-		t.Fatal("expected an error refreshing a malformed group DN")
+	// A reserved system: name is skipped after the DN is parsed. The parse
+	// still has to fail the rebuild: an unparseable DN is a directory problem,
+	// not a name we chose not to emit.
+	tests := map[string]string{
+		"an ordinary group name":        "admins",
+		"a reserved system: group name": "system:masters",
 	}
-	if !strings.Contains(err.Error(), "invalid DN") {
-		t.Errorf("expected the error to identify the invalid DN, got %q", err)
+
+	for name, cn := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := connWithUsers([]string{cn}, map[string][]string{"alice@example.net": {cn}})
+			c.entries["OU=Groups,DC=example,DC=net"][0].DN = `CN=broken\`
+
+			d := newTestDirectory(t, testConfig(), c)
+
+			err := d.Refresh()
+			if err == nil {
+				t.Fatal("expected an error refreshing a malformed group DN")
+			}
+			if !strings.Contains(err.Error(), "invalid DN") {
+				t.Errorf("expected the error to identify the invalid DN, got %q", err)
+			}
+		})
+	}
+}
+
+func TestEachBackendReturnsFirstErrorInConfigOrder(t *testing.T) {
+	backends := []*backend{
+		{config: &BackendConfig{Name: "a"}},
+		{config: &BackendConfig{Name: "b"}},
+		{config: &BackendConfig{Name: "c"}},
+	}
+
+	results, err := eachBackend(backends, func(b *backend) (string, error) {
+		if b.config.Name != "a" {
+			return "", errors.New("failed")
+		}
+		return b.config.Name, nil
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), `backend "b"`) {
+		t.Errorf("expected the first error in configuration order, got %q", err)
+	}
+	if results != nil {
+		t.Errorf("expected no results when a backend failed, got %v", results)
+	}
+
+	names, err := eachBackend(backends, func(b *backend) (string, error) {
+		return b.config.Name, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if exp := []string{"a", "b", "c"}; !reflect.DeepEqual(names, exp) {
+		t.Errorf("expected results in configuration order, exp=%v got=%v", exp, names)
 	}
 }
 

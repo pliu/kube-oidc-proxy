@@ -17,9 +17,16 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
-// snapshotVersion is bumped whenever a persisted mapping stops being readable
-// by the code that reads it back. A snapshot of another version is discarded.
-const snapshotVersion = 1
+const (
+	// snapshotVersion is bumped whenever a persisted mapping stops being
+	// readable by the code that reads it back. A snapshot of another version
+	// is discarded.
+	snapshotVersion = 1
+
+	// cacheTimeout bounds a read or write of the persisted mapping, so that an
+	// unresponsive store cannot hold up a refresh indefinitely.
+	cacheTimeout = time.Second * 30
+)
 
 // Snapshot is a built mapping as it is persisted.
 type Snapshot struct {
