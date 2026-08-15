@@ -171,17 +171,25 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
-			// Start readiness probe
-			if err := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
-				fakeJWT, p.OIDCTokenAuthenticator(), ldapReadiness...); err != nil {
-				return err
-			}
+			// Start readiness probe. It stays unready until the secure
+			// listener is accepting, so a restored LDAP mapping cannot put
+			// the pod in its Service while the first directory sweep is
+			// still blocking Run.
+			ready := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
+				fakeJWT, p.OIDCTokenAuthenticator(), ldapReadiness...)
 
 			// Run proxy
 			waitCh, listenerStoppedCh, err := p.Run(stopCh)
 			if err != nil {
 				return err
 			}
+
+			// The port is bound before any of this, so an early request
+			// would be taken and then left hanging rather than refused.
+			// Serve returns once the listener is accepting: mark only then,
+			// so the Service cannot route requests that would wait out the
+			// first directory sweep.
+			ready.MarkServing()
 
 			<-waitCh
 			<-listenerStoppedCh

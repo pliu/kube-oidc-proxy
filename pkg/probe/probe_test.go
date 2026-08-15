@@ -44,10 +44,7 @@ func TestRun(t *testing.T) {
 		t.FailNow()
 	}
 
-	if err := Run(port, fakeJWT, f); err != nil {
-		t.Error(err.Error())
-		t.FailNow()
-	}
+	ready := Run(port, fakeJWT, f)
 
 	url := fmt.Sprintf("http://0.0.0.0:%s", port)
 
@@ -79,13 +76,26 @@ func TestRun(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
+	// OIDC is initialised, but the secure listener is not accepting yet.
+	if resp.StatusCode != 503 {
+		t.Errorf("expected ready probe to stay unready until serving, exp=%d got=%d",
+			503, resp.StatusCode)
+	}
+
+	ready.MarkServing()
+
+	resp, err = http.Get(url + "/ready")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
 	if resp.StatusCode != 200 {
 		t.Errorf("expected ready probe to be responding and ready, exp=%d got=%d",
 			200, resp.StatusCode)
 	}
 
-	// Once the authenticator has returned with an non-initialised error, then
-	// should always return ready
+	// Once the authenticator has returned with a non-initialised error, then
+	// should always return ready.
 
 	f.returnErr = true
 
@@ -97,5 +107,22 @@ func TestRun(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("expected ready probe to be responding and ready, exp=%d got=%d",
 			200, resp.StatusCode)
+	}
+}
+
+func TestCheckStaysUnreadyUntilServing(t *testing.T) {
+	h := &HealthCheck{
+		oidcAuther: &fakeTokenAuthenticator{},
+		fakeJWT:    "unused",
+	}
+
+	if err := h.Check(); err == nil || err.Error() != "secure listener is not serving yet" {
+		t.Fatalf("expected not serving yet, got %v", err)
+	}
+
+	h.MarkServing()
+
+	if err := h.Check(); err != nil {
+		t.Fatalf("expected ready once serving, got %v", err)
 	}
 }

@@ -3,10 +3,12 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/heptiolabs/healthcheck"
@@ -25,7 +27,19 @@ type HealthCheck struct {
 	oidcAuther authenticator.Token
 	fakeJWT    string
 
-	ready bool
+	// oidcReady is sticky once the OIDC authenticator has finished
+	// initialising. The provider being reachable later is not required for
+	// serving, and probing it again would flap readiness when the issuer
+	// blips.
+	oidcReady atomic.Bool
+
+	// serving is set once the secure listener is accepting connections.
+	// Without this, a restored LDAP mapping (or an initialised OIDC
+	// authenticator) would report the pod Ready while Run is still blocked
+	// on the first directory sweep and nothing is accepting on the bound
+	// port. The port is bound long before then, so a connection would be
+	// taken and the request left hanging rather than refused.
+	serving atomic.Bool
 }
 
 // NamedCheck is a readiness check beyond the ones the proxy always makes. It
@@ -36,7 +50,7 @@ type NamedCheck struct {
 	Check func() error
 }
 
-func Run(port, fakeJWT string, oidcAuther authenticator.Token, checks ...NamedCheck) error {
+func Run(port, fakeJWT string, oidcAuther authenticator.Token, checks ...NamedCheck) *HealthCheck {
 	h := &HealthCheck{
 		handler:    healthcheck.NewHandler(),
 		oidcAuther: oidcAuther,
@@ -68,27 +82,37 @@ func Run(port, fakeJWT string, oidcAuther authenticator.Token, checks ...NamedCh
 		}
 	}()
 
-	return nil
+	return h
+}
+
+// MarkServing records that the secure listener is accepting connections.
+// Until this is called the pod stays unready, even if every other check has
+// already passed.
+func (h *HealthCheck) MarkServing() {
+	h.serving.Store(true)
+	klog.V(4).Info("secure listener is serving")
 }
 
 func (h *HealthCheck) Check() error {
-	if h.ready {
-		return nil
+	if !h.oidcReady.Load() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		_, _, err := h.oidcAuther.AuthenticateToken(ctx, h.fakeJWT)
+		if err != nil && strings.HasSuffix(err.Error(), "authenticator not initialized") {
+			err = fmt.Errorf("OIDC provider not yet initialized: %s", err)
+			klog.V(4).Infof("%v", err.Error())
+			return err
+		}
+
+		h.oidcReady.Store(true)
+
+		klog.V(4).Info("OIDC provider initialized.")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	_, _, err := h.oidcAuther.AuthenticateToken(ctx, h.fakeJWT)
-	if err != nil && strings.HasSuffix(err.Error(), "authenticator not initialized") {
-		err = fmt.Errorf("OIDC provider not yet initialized: %s", err)
-		klog.V(4).Infof("%v", err.Error())
-		return err
+	if !h.serving.Load() {
+		return errors.New("secure listener is not serving yet")
 	}
-
-	h.ready = true
-
-	klog.V(4).Info("OIDC provider initialized.")
 
 	return nil
 }

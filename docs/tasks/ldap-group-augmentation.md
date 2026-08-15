@@ -548,10 +548,18 @@ a store reload. Route the exact path to the builder as shown above.
 
 ### Readiness
 
+The proxy reports itself unready until the secure port is accepting
+connections. Restoring a persisted mapping, or finishing the first directory
+sweep, is not enough on its own: both happen before the proxy starts serving.
+The port is bound from the moment the process starts, so a request arriving in
+that window is taken and then left waiting rather than refused, which is
+exactly what the Service must not route to. The pod stays out of it for that
+whole window.
+
 A reader with no mapping would answer every request by stripping the user of
-every group they hold, so it reports itself unready until it has one and stays
-out of its Service. On a fresh install that is the gap between the readers
-starting and the builder finishing its first sweep of the directories.
+every group they hold, so it also reports itself unready until it has one. On
+a fresh install that is the gap between the readers starting and the builder
+finishing its first sweep of the directories.
 
 It waits rather than exiting, since what it is waiting for is on its way. A
 store it cannot read *at all* is a different thing - the wrong name, or no
@@ -668,8 +676,7 @@ $ curl -XPOST -H "Authorization: Bearer ${TOKEN}" \
 ```
 
 `source` is where the mapping being served came from: `directory`, or `cache` if
-it was loaded from the store - after a failed startup refresh, or on every
-mapping if this proxy is a [reader](#splitting-the-builder-from-the-proxies).
+it was loaded from the store after a failed startup refresh.
 
 `groups` is how many groups were found under the group search bases, summed
 over the backends. It is not the number of distinct group names anyone holds:
@@ -679,8 +686,9 @@ having returned something, which is the check described in
 [How it works](#how-it-works). `users` is the size of the mapping itself.
 
 With the builder split from the proxies, this endpoint has to reach the builder
-to rebuild anything, which is a matter of [routing](#refreshing). On a reader it
-looks for a newer mapping rather than rebuilding one.
+to rebuild anything, which is a matter of [routing](#refreshing). Readers do
+not serve the endpoint: a request that lands on a reader is passed to the API
+server like any other path.
 
 The endpoint sits behind the same OIDC authentication as every other request, so
 an unauthenticated caller cannot trigger a rebuild. A caller arriving while a
