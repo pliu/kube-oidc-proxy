@@ -9,6 +9,22 @@ import (
 	goldap "github.com/go-ldap/ldap/v3"
 )
 
+const (
+	// memberOfAttribute holds the DNs of the groups an entry belongs to.
+	memberOfAttribute = "memberOf"
+
+	// rangeOption is the attribute option a directory answers with when it has
+	// returned only part of a multi valued attribute. Active Directory caps
+	// memberOf at MaxValRange, 1500 values by default, and substitutes
+	// "memberOf;range=0-1499" for the attribute that was asked for.
+	rangeOption = "range="
+
+	// maxRangeRequests bounds the follow up searches made to collect a
+	// truncated attribute, so that a directory which never advances the window
+	// cannot hold a refresh here indefinitely.
+	maxRangeRequests = 1000
+)
+
 // attributeValues returns the values of the named attribute of an entry, along
 // with any options the directory attached to it.
 //

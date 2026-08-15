@@ -35,12 +35,12 @@ func normaliseDN(dn string) (string, error) {
 func sameDN(a, b string) (bool, error) {
 	aKey, err := normaliseDN(a)
 	if err != nil {
-		return false, fmt.Errorf("user %q has an invalid DN: %s", a, err)
+		return false, fmt.Errorf("%q has an invalid DN: %s", a, err)
 	}
 
 	bKey, err := normaliseDN(b)
 	if err != nil {
-		return false, fmt.Errorf("user %q has an invalid DN: %s", b, err)
+		return false, fmt.Errorf("%q has an invalid DN: %s", b, err)
 	}
 
 	return aKey == bKey, nil

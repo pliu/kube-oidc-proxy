@@ -10,10 +10,51 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// maxGroupDiscoveries bounds the groups one refresh of a user will look up
-// individually, so that a mapping far enough out of date cannot turn refreshing
-// one user into a search per group they hold.
-const maxGroupDiscoveries = 100
+const (
+	// pageSize is the LDAP paging size used for searches. 1000 is the default
+	// MaxPageSize of an Active Directory domain controller.
+	pageSize = 1000
+
+	// maxGroupDiscoveries bounds the groups one refresh of a user will look up
+	// individually, so that a mapping far enough out of date cannot turn
+	// refreshing one user into a search per group they hold.
+	maxGroupDiscoveries = 100
+
+	// kubernetesSystemGroupPrefix is reserved by Kubernetes for built-in
+	// groups such as system:masters. Impersonating a caller as a member of
+	// those groups would grant privileges the directory must not be able to
+	// confer.
+	kubernetesSystemGroupPrefix = "system:"
+)
+
+// duplicateUserError reports two entries of one backend claiming one username.
+// It is a type of its own so that the condition can be reported as a metric,
+// which is what an operator needs to notice a directory that needs cleaning up
+// rather than one that is merely unreachable.
+type duplicateUserError struct {
+	username string
+	first    string
+	second   string
+}
+
+// duplicateGroupError reports two entries of one backend collapsing into the
+// same Kubernetes group name. Once the DN is discarded there is no way for
+// RBAC to tell those directory groups apart.
+type duplicateGroupError struct {
+	name   string
+	first  string
+	second string
+}
+
+func (e *duplicateGroupError) Error() string {
+	return fmt.Sprintf("group name %q is held by both %q and %q, so the authorization identity is ambiguous",
+		e.name, e.first, e.second)
+}
+
+func (e *duplicateUserError) Error() string {
+	return fmt.Sprintf("%q is held by both %q and %q, so the groups to give them are ambiguous",
+		e.username, e.first, e.second)
+}
 
 // searchGroups returns a mapping of normalised group DN -> group name for
 // every group under the configured group search bases.
@@ -35,15 +76,23 @@ func (b *backend) searchGroups(c conn) (map[string]string, error) {
 		}
 
 		for _, entry := range res.Entries {
-			name := emittedGroupName(entry.DN, attributeValue(entry, b.config.GroupNameAttribute),
-				b.config.GroupNameAttribute)
-			if name == "" {
+			name := attributeValue(entry, b.config.GroupNameAttribute)
+			if skipEmptyGroup(entry.DN, name, b.config.GroupNameAttribute) {
 				continue
 			}
 
+			// Parse before the reserved-prefix skip so a group whose DN is
+			// not a DN at all still fails the rebuild, even if its name would
+			// have been dropped. The entry is unusable either way, but an
+			// unparseable DN is a directory problem rather than a name we
+			// chose not to emit.
 			key, err := normaliseDN(entry.DN)
 			if err != nil {
 				return nil, fmt.Errorf("group %q has an invalid DN: %s", entry.DN, err)
+			}
+
+			if skipReservedGroup(entry.DN, name) {
+				continue
 			}
 
 			if claimed, ok := claimedByName[name]; ok && claimed.key != key {
@@ -395,18 +444,30 @@ func (b *backend) underGroupSearchBase(key string) bool {
 // should be left out of the mapping: it has no name attribute, or the name
 // uses the reserved system: prefix.
 func emittedGroupName(dn, name, attr string) string {
-	if name == "" {
-		klog.V(4).Infof("skipping group %q with no %q attribute", dn, attr)
-		return ""
-	}
-
-	if strings.HasPrefix(name, kubernetesSystemGroupPrefix) {
-		klog.Warningf("skipping group %q: name %q uses the reserved %s prefix",
-			dn, name, kubernetesSystemGroupPrefix)
+	if skipEmptyGroup(dn, name, attr) || skipReservedGroup(dn, name) {
 		return ""
 	}
 
 	return name
+}
+
+func skipEmptyGroup(dn, name, attr string) bool {
+	if name != "" {
+		return false
+	}
+
+	klog.V(4).Infof("skipping group %q with no %q attribute", dn, attr)
+	return true
+}
+
+func skipReservedGroup(dn, name string) bool {
+	if !strings.HasPrefix(name, kubernetesSystemGroupPrefix) {
+		return false
+	}
+
+	klog.Warningf("skipping group %q: name %q uses the reserved %s prefix",
+		dn, name, kubernetesSystemGroupPrefix)
+	return true
 }
 
 // rejectDuplicateUser fails when two DNs claim the same username. Overlapping
@@ -414,7 +475,7 @@ func emittedGroupName(dn, name, attr string) string {
 func rejectDuplicateUser(username, first, second string) error {
 	same, err := sameDN(first, second)
 	if err != nil {
-		return err
+		return fmt.Errorf("user %s", err)
 	}
 
 	if !same {

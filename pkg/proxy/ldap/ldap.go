@@ -27,72 +27,15 @@ import (
 )
 
 const (
-	// pageSize is the LDAP paging size used for searches. 1000 is the default
-	// MaxPageSize of an Active Directory domain controller.
-	pageSize = 1000
-
-	// memberOfAttribute holds the DNs of the groups an entry belongs to.
-	memberOfAttribute = "memberOf"
-
-	// rangeOption is the attribute option a directory answers with when it has
-	// returned only part of a multi valued attribute. Active Directory caps
-	// memberOf at MaxValRange, 1500 values by default, and substitutes
-	// "memberOf;range=0-1499" for the attribute that was asked for.
-	rangeOption = "range="
-
-	// maxRangeRequests bounds the follow up searches made to collect a
-	// truncated attribute, so that a directory which never advances the window
-	// cannot hold a refresh here indefinitely.
-	maxRangeRequests = 1000
-
-	// cacheTimeout bounds a read or write of the persisted mapping, so that an
-	// unresponsive store cannot hold up a refresh indefinitely.
-	cacheTimeout = time.Second * 30
-
 	// SourceDirectory and SourceCache describe where the mapping currently
 	// being served came from.
 	SourceDirectory = "directory"
 	SourceCache     = "cache"
-
-	// kubernetesSystemGroupPrefix is reserved by Kubernetes for built-in
-	// groups such as system:masters. Impersonating a caller as a member of
-	// those groups would grant privileges the directory must not be able to
-	// confer.
-	kubernetesSystemGroupPrefix = "system:"
 )
 
 // ErrNoBackends is returned when there is no directory to build a mapping
 // from. Every other configuration problem is reported by Config.Validate.
 var ErrNoBackends = errors.New("no LDAP backends configured")
-
-// duplicateUserError reports two entries of one backend claiming one username.
-// It is a type of its own so that the condition can be reported as a metric,
-// which is what an operator needs to notice a directory that needs cleaning up
-// rather than one that is merely unreachable.
-type duplicateUserError struct {
-	username string
-	first    string
-	second   string
-}
-
-// duplicateGroupError reports two entries of one backend collapsing into the
-// same Kubernetes group name. Once the DN is discarded there is no way for
-// RBAC to tell those directory groups apart.
-type duplicateGroupError struct {
-	name   string
-	first  string
-	second string
-}
-
-func (e *duplicateGroupError) Error() string {
-	return fmt.Sprintf("group name %q is held by both %q and %q, so the authorization identity is ambiguous",
-		e.name, e.first, e.second)
-}
-
-func (e *duplicateUserError) Error() string {
-	return fmt.Sprintf("%q is held by both %q and %q, so the groups to give them are ambiguous",
-		e.username, e.first, e.second)
-}
 
 // Stats describes the state of the currently active mapping.
 type Stats struct {
@@ -141,12 +84,9 @@ type Directory struct {
 	mapping atomic.Pointer[map[string][]string]
 	stats   atomic.Pointer[Stats]
 
-	// updateGate serialises every directory read that can replace some or all of
-	// the mapping. The apply itself is not enough to serialise: a single-user
-	// refresh can finish an older search after a newer full rebuild has landed,
-	// and would otherwise publish its stale result over the rebuild. A channel
-	// rather than a mutex lets a single-user request stop waiting when its
-	// context is cancelled.
+	// updateGate serialises every directory read that can replace some or all
+	// of the mapping. A channel rather than a mutex lets a single-user request
+	// stop waiting when its context is cancelled; see lockUpdate.
 	updateGate chan struct{}
 
 	// refreshMu guards inflight. It is not held across a rebuild.
@@ -355,4 +295,45 @@ func usernameKey(username, prefix string) string {
 
 func (d *Directory) Stats() *Stats {
 	return d.stats.Load()
+}
+
+// eachBackend searches every backend in parallel and returns the results in
+// configuration order. A refresh takes roughly as long as the slowest backend
+// rather than the sum of all of them. The first error in configuration order
+// is returned, so errors, statistics and the persisted snapshot stay
+// deterministic.
+func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T, error) {
+	type result struct {
+		value T
+		err   error
+	}
+
+	results := make([]result, len(backends))
+	var wg sync.WaitGroup
+	for i, b := range backends {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			value, err := fn(b)
+			if err != nil {
+				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
+				return
+			}
+
+			results[i].value = value
+		}()
+	}
+	wg.Wait()
+
+	values := make([]T, 0, len(results))
+	for _, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+
+		values = append(values, result.value)
+	}
+
+	return values, nil
 }

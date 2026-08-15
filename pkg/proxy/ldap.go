@@ -106,13 +106,13 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 
 		var response interface{}
 
-		if user := req.URL.Query().Get(LDAPRefreshUserParam); user != "" {
+		if refreshUser := req.URL.Query().Get(LDAPRefreshUserParam); refreshUser != "" {
 			klog.V(2).Infof("LDAP refresh of user %q requested by %q (%s)",
-				user, requester.GetName(), remoteAddr)
+				refreshUser, requester.GetName(), remoteAddr)
 
-			stats, err := p.ldapDirectory.RefreshUser(req.Context(), user)
+			stats, err := p.ldapDirectory.RefreshUser(req.Context(), refreshUser)
 			if err != nil {
-				klog.Errorf("failed to refresh LDAP user %q (%s): %s", user, remoteAddr, err)
+				klog.Errorf("failed to refresh LDAP user %q (%s): %s", refreshUser, remoteAddr, err)
 				http.Error(rw, "Failed to refresh the LDAP mapping of that user",
 					http.StatusInternalServerError)
 				return

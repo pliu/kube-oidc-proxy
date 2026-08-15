@@ -141,7 +141,10 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			requester = p.augmentGroups(requester, remoteAddr)
 		}
 
-		userForContext := requester
+		// requester stays the inbound identity. effective is who the request
+		// actually runs as: the requester, or the impersonation target if one
+		// was authorised.
+		effective := requester
 
 		if p.hasImpersonation(req.Header) {
 			// if impersonation headers are present, let's check to see
@@ -155,14 +158,14 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 
 			if target != nil {
 				// TODO - store original context for logging
-				requester = target
+				effective = target
 				targetForContext = target
 			}
 		}
 
 		// Ensure group contains allauthenticated builtin
 		allAuthFound := false
-		groups := requester.GetGroups()
+		groups := effective.GetGroups()
 		for _, elem := range groups {
 			if elem == user.AllAuthenticated {
 				allAuthFound = true
@@ -173,7 +176,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			groups = append(groups, user.AllAuthenticated)
 		}
 
-		extra := requester.GetExtra()
+		extra := effective.GetExtra()
 
 		if extra == nil {
 			extra = make(map[string][]string)
@@ -201,24 +204,24 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		if targetForContext != nil {
 			// add the original user's information as extra headers
 			// so they're recorded in the API server's audit log
-			extra["originaluser.jetstack.io-user"] = []string{userForContext.GetName()}
+			extra["originaluser.jetstack.io-user"] = []string{requester.GetName()}
 
-			numGroups := len(userForContext.GetGroups())
+			numGroups := len(requester.GetGroups())
 			if numGroups > 0 {
 				groupNames := make([]string, numGroups)
-				for i, groupName := range userForContext.GetGroups() {
+				for i, groupName := range requester.GetGroups() {
 					groupNames[i] = groupName
 				}
 
 				extra["originaluser.jetstack.io-groups"] = groupNames
 			}
 
-			if userForContext.GetUID() != "" {
-				extra["originaluser.jetstack.io-uid"] = []string{userForContext.GetUID()}
+			if requester.GetUID() != "" {
+				extra["originaluser.jetstack.io-uid"] = []string{requester.GetUID()}
 			}
 
-			if userForContext.GetExtra() != nil && len(userForContext.GetExtra()) > 0 {
-				jsonExtras, errJsonMarshal := json.Marshal(userForContext.GetExtra())
+			if requester.GetExtra() != nil && len(requester.GetExtra()) > 0 {
+				jsonExtras, errJsonMarshal := json.Marshal(requester.GetExtra())
 				if errJsonMarshal != nil {
 					p.handleError(rw, req, errJsonMarshal)
 					return
@@ -229,11 +232,11 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 
 		conf := &context.ImpersonationRequest{
 			ImpersonationConfig: &transport.ImpersonationConfig{
-				UserName: requester.GetName(),
+				UserName: effective.GetName(),
 				Groups:   groups,
 				Extra:    extra,
 			},
-			InboundUser:      &userForContext,
+			InboundUser:      &requester,
 			ImpersonatedUser: &targetForContext,
 		}
 

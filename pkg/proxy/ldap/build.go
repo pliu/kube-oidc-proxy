@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -95,47 +94,6 @@ func (d *Directory) build() (*buildResult, error) {
 	finalise(built.mapping)
 
 	return built, nil
-}
-
-// eachBackend searches every backend in parallel and returns the results in
-// configuration order. A refresh takes roughly as long as the slowest backend
-// rather than the sum of all of them. The first error in configuration order
-// is returned, so errors, statistics and the persisted snapshot stay
-// deterministic.
-func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T, error) {
-	type result struct {
-		value T
-		err   error
-	}
-
-	results := make([]result, len(backends))
-	var wg sync.WaitGroup
-	for i, b := range backends {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			value, err := fn(b)
-			if err != nil {
-				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
-				return
-			}
-
-			results[i].value = value
-		}()
-	}
-	wg.Wait()
-
-	values := make([]T, 0, len(results))
-	for _, result := range results {
-		if result.err != nil {
-			return nil, result.err
-		}
-
-		values = append(values, result.value)
-	}
-
-	return values, nil
 }
 
 // merge folds the mapping of one backend into the combined mapping. A user
