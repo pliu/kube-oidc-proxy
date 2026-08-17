@@ -19,6 +19,7 @@ import (
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/mocks"
@@ -989,5 +990,75 @@ func TestHeadersConfig(t *testing.T) {
 
 			p.ctrl.Finish()
 		})
+	}
+}
+
+// Exec, attach and port forward reach the API server as HTTP/1.1 protocol
+// upgrades, which Go's HTTP/2 transport cannot carry. A transport that has
+// quietly gained HTTP/2 takes those away, and takes them away only in a real
+// cluster, so it is worth holding down here. The rest config with nothing in it
+// is the awkward case: it leaves TLSClientConfig nil, which on its own has Go
+// negotiate h2.
+func TestUpstreamTransportNeverNegotiatesHTTP2(t *testing.T) {
+	for name, config := range map[string]*rest.Config{
+		"no TLS settings at all": {Host: "https://127.0.0.1:6443"},
+		"TLS settings of its own": {
+			Host:            "https://127.0.0.1:6443",
+			TLSClientConfig: rest.TLSClientConfig{Insecure: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			transport, err := transportForRestConfig(config)
+			if err != nil {
+				t.Fatalf("unexpected error building the transport: %s", err)
+			}
+
+			if transport.ForceAttemptHTTP2 {
+				t.Error("expected the transport to not force HTTP/2")
+			}
+
+			// Nil here, rather than empty, is what has Go register its own
+			// HTTP/2 handler the first time the transport is used.
+			if transport.TLSNextProto == nil {
+				t.Error("expected the transport to have HTTP/2 held off with an empty TLSNextProto")
+			}
+
+			if len(transport.TLSNextProto) > 0 {
+				t.Errorf("expected no next protocol handlers, got %d", len(transport.TLSNextProto))
+			}
+
+			if transport.TLSClientConfig != nil {
+				for _, proto := range transport.TLSClientConfig.NextProtos {
+					if proto == "h2" {
+						t.Error("expected the transport to not offer h2 in ALPN")
+					}
+				}
+			}
+		})
+	}
+}
+
+// All proxied traffic goes to the one API server, so the per-host pool is the
+// pool. Go's default of two would have almost every connection closed as soon
+// as it goes idle and dialled again for the next request.
+func TestUpstreamTransportKeepsConnectionsToTheAPIServerWarm(t *testing.T) {
+	transport, err := transportForRestConfig(&rest.Config{Host: "https://127.0.0.1:6443"})
+	if err != nil {
+		t.Fatalf("unexpected error building the transport: %s", err)
+	}
+
+	if transport.MaxIdleConnsPerHost <= http.DefaultMaxIdleConnsPerHost {
+		t.Errorf("expected more than the default of %d idle connections per host, got %d",
+			http.DefaultMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+
+	// Zero is unlimited, so an idle connection the API server has since
+	// forgotten about would be held for the life of the process.
+	if transport.IdleConnTimeout == 0 {
+		t.Error("expected idle connections to be given up eventually")
+	}
+
+	if transport.TLSHandshakeTimeout == 0 {
+		t.Error("expected the TLS handshake to be bounded")
 	}
 }

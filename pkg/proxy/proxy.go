@@ -3,6 +3,7 @@ package proxy
 
 import (
 	ctx "context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -281,7 +282,28 @@ func (p *Proxy) reviewToken(rw http.ResponseWriter, req *http.Request) bool {
 	return true
 }
 
-func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
+// maxIdleConnsPerHost is how many spare connections to the API server are kept
+// warm. Every request this proxy forwards goes to the one host, so the whole
+// process shares a single pool and the per-host limit is the only one that
+// really applies. Go's default of two would mean all but two connections being
+// closed the moment they go idle and dialled again, TLS handshake and all, for
+// the next request that needs one.
+const maxIdleConnsPerHost = 100
+
+// transportForRestConfig builds the transport that carries proxied requests to
+// the API server.
+//
+// HTTP/2 must stay off. Exec, attach and port forward are HTTP/1.1 protocol
+// upgrades, and Go's HTTP/2 transport cannot carry an upgrade, so negotiating
+// h2 with the API server would break them outright. This is said explicitly,
+// with an empty TLSNextProto, rather than left to fall out of the transport
+// having its own TLSClientConfig: rest.TLSConfigFor returns nil for a rest
+// config that asked for no TLS settings at all, and a nil TLSClientConfig is
+// one of the things that has Go turn HTTP/2 on by itself.
+//
+// It is also worth knowing before reaching for utilnet.SetTransportDefaults,
+// which fills in sensible timeouts and then turns HTTP/2 on.
+func transportForRestConfig(config *rest.Config) (*http.Transport, error) {
 	// get golang tls config to the API server
 	tlsConfig, err := rest.TLSConfigFor(config)
 	if err != nil {
@@ -289,9 +311,32 @@ func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTrippe
 	}
 
 	// create tls transport to request
-	tlsTransport := &http.Transport{
+	return &http.Transport{
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: tlsConfig,
+
+		// Empty rather than nil, which is what keeps HTTP/2 off.
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
+
+		MaxIdleConns:        maxIdleConnsPerHost,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+
+		// A pooled connection the API server has since forgotten about is only
+		// discovered by trying to use it, so idle ones are given up rather than
+		// held for the life of the process.
+		IdleConnTimeout: 90 * time.Second,
+
+		// Bounds connecting, not the request that follows it, so a request that
+		// then streams for hours is unaffected.
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}, nil
+}
+
+func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
+	tlsTransport, err := transportForRestConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	// get kube transport config form rest client config
