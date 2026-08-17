@@ -19,6 +19,28 @@ type Audit struct {
 	serverConfig *server.CompletedConfig
 }
 
+// longRunningRequests reports whether a request is one that streams for as long
+// as the caller keeps it open, rather than one that is answered and finished
+// with.
+//
+// This decides when the audit log hears about a request. A request that is not
+// long-running is recorded once, when it completes, which is the right thing
+// for a request that completes promptly. A long-running one is recorded twice:
+// once when the response starts and again when the stream finally ends. Getting
+// this wrong for a stream means an exec session that lasts an hour leaves
+// nothing in the audit log for that hour, and leaves nothing at all if the
+// proxy is killed before the session ends - exactly the requests an audit log
+// is most wanted for.
+//
+// The generic apiserver default treats only watch this way, on the grounds that
+// a generic API server has no inherent long-running subresources. That default
+// is wrong here: everything this proxy forwards goes to a kube-apiserver, so
+// the set that kube-apiserver itself uses is the set that applies.
+var longRunningRequests = genericfilters.BasicLongRunningRequestCheck(
+	sets.NewString("watch", "proxy"),
+	sets.NewString("attach", "exec", "proxy", "log", "portforward"),
+)
+
 // New creates a new Audit struct to handle auditing for proxy requests. This
 // is mostly a wrapper for the apiserver auditing handlers to combine them with
 // the proxy.
@@ -27,11 +49,7 @@ func New(opts *options.AuditOptions, externalAddress string, secureServingInfo *
 		ExternalAddress: externalAddress,
 		SecureServing:   secureServingInfo,
 
-		// Default to treating watch as a long-running operation.
-		// Generic API servers have no inherent long-running subresources.
-		// This is so watch requests are handled correctly in the audit log.
-		LongRunningFunc: genericfilters.BasicLongRunningRequestCheck(
-			sets.NewString("watch"), sets.NewString()),
+		LongRunningFunc: longRunningRequests,
 	}
 
 	// We do not support dynamic auditing, so leave nil
