@@ -139,6 +139,14 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// authorization decision is made against the directory groups too.
 		if p.ldapDirectory != nil {
 			requester = p.augmentGroups(requester, remoteAddr)
+
+			// The audit event is built from the identity the context holds
+			// when the auditor runs, which is inside this handler. Left as the
+			// identity authentication put there, it would record the groups of
+			// the token rather than the groups the request is actually run
+			// with - the audit log of a proxy that exists in order not to
+			// trust the groups of a token would be recording exactly those.
+			req = req.WithContext(genericapirequest.WithUser(req.Context(), requester))
 		}
 
 		// requester stays the inbound identity. effective is who the request
