@@ -59,9 +59,13 @@ spec:
           {{- if .Values.oidc.signingAlgs }}
           - "--oidc-signing-algs=$(OIDC_SIGNING_ALGS)"
           {{ end }}
-          {{- if .Values.oidc.requiredClaims }}
-          - "--oidc-signing-algs=$(OIDC_REQUIRED_CLAIMS)"
-          {{ end }}
+          {{- /* --oidc-required-claim takes one key=value pair and is repeated,
+                 so each claim is its own argument. Passing them as one
+                 comma-joined value would be read as a single claim whose value
+                 holds the rest of them. */}}
+          {{- range $claim, $value := .Values.oidc.requiredClaims }}
+          - "--oidc-required-claim={{ $claim }}={{ $value }}"
+          {{- end }}
           {{- if .Values.tokenPassthrough.enabled }}
           - "--token-passthrough"
           {{- if .Values.tokenPassthrough.audiences }}
@@ -122,13 +126,6 @@ spec:
             secretKeyRef:
               name: {{ include "kube-oidc-proxy.fullname" . }}-config
               key: oidc.signing-algs
-        {{ end }}
-        {{- if .Values.oidc.requiredClaims }}
-        - name: OIDC_REQUIRED_CLAIMS
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "kube-oidc-proxy.fullname" . }}-config
-              key: oidc.required-claims
         {{ end }}
         volumeMounts:
           {{- if .Values.oidc.caPEM }}
