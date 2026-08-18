@@ -148,10 +148,6 @@ type BackendConfig struct {
 type CacheConfig struct {
 	Type CacheType `json:"type"`
 
-	// MaxAge is how old a persisted mapping may be and still be served at
-	// startup. Zero serves a persisted mapping however old it is.
-	MaxAge Duration `json:"maxAge,omitempty"`
-
 	File             *FileCacheConfig   `json:"file,omitempty"`
 	KubernetesSecret *SecretCacheConfig `json:"kubernetesSecret,omitempty"`
 }
@@ -468,10 +464,6 @@ func (c *CacheConfig) validate() []error {
 
 	default:
 		errs = append(errs, fmt.Errorf("cache: unknown type %q, must be one of none, file, kubernetesSecret", c.Type))
-	}
-
-	if c.MaxAge < 0 {
-		errs = append(errs, errors.New("cache: maxAge must not be negative"))
 	}
 
 	return errs

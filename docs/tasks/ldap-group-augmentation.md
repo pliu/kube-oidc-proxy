@@ -163,7 +163,6 @@ And one using every field, two directories and a persisted mapping:
   "refreshUsers": ["alice@example.net", "bob@example.net"],
   "cache": {
     "type": "kubernetesSecret",
-    "maxAge": "24h",
     "kubernetesSecret": {
       "name": "kube-oidc-proxy-ldap-mapping"
     }
@@ -337,9 +336,9 @@ logs the failure, instead of accepting the degraded one and persisting it over
 the good one.
 
 A persisted mapping is discarded, rather than served, if it was built by a proxy
-that writes a different format, if it was built from a different set of search
-bases, filters or prefixes, or if it is older than `maxAge`. Rotating a bind
-password or changing a URL does not discard it.
+that writes a different format, or if it was built from a different set of
+search bases, filters or prefixes. Rotating a bind password or changing a URL
+does not discard it.
 
 A refresh that rebuilds the mapping already in the store does not write it
 again. Most refreshes are that - group memberships change far less often than
@@ -355,18 +354,9 @@ change and nothing is written - even though it moves the group count reported
 below. The other way round, a user gaining or losing a group is always a write,
 since that is the mapping itself.
 
-The one thing that write did on its own was record how recent the mapping was.
-So when `maxAge` is set, an unchanged mapping is rewritten anyway once it is
-halfway to it, rather than being left to age out of a store it is still being
-confirmed against every `refreshInterval`. With `maxAge` unset nothing measures
-its age, and it is left alone indefinitely - the timestamp in the store then
-says when the mapping last *changed*, which is also what the "built N ago" in
-the startup log is reporting.
-
 | Field | Default | Description |
 | ----- | ------- | ----------- |
 | `type` | | **Required.** One of `none`, `file` or `kubernetesSecret`. |
-| `maxAge` | | How old a persisted mapping may be and still be served. If unset, it is served however old it is. Also makes an unchanged mapping be rewritten once it is halfway to this age. |
 | `file.path` | | Where to write the mapping. Required when `type` is `file`. |
 | `kubernetesSecret.name` | | Name of the Secret to write. Required when `type` is `kubernetesSecret`. |
 | `kubernetesSecret.namespace` | The proxy's own namespace | Namespace of that Secret. |

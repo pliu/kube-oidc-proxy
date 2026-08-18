@@ -157,10 +157,6 @@
           "description": "How the mapping is persisted. 'none' disables persistence.",
           "enum": ["none", "file", "kubernetesSecret"]
         },
-        "maxAge": {
-          "description": "How old a persisted mapping may be and still be served at startup. If unset, a persisted mapping is served however old it is. A mapping that is rebuilt unchanged is not normally written again, so setting this also makes it rewritten once it is halfway to this age rather than left to age out of the store.",
-          "$ref": "#/$defs/duration"
-        },
         "file": {
           "description": "Configuration of the 'file' store. Required when type is 'file'.",
           "type": "object",

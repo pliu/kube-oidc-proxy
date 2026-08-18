@@ -123,7 +123,7 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
 	defer cancel()
 
-	if d.storeHolds(ctx, hash) && !d.held().ageing(builtAt, d.maxCacheAge()) {
+	if d.storeHolds(ctx, hash) {
 		klog.V(4).Infof("LDAP mapping of %d users is the one already persisted to %s, leaving it",
 			len(mapping), d.cache)
 
@@ -142,7 +142,7 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 	// Recorded only once the write is through, so that a store which failed is
 	// written to again by the next refresh rather than being taken for holding
 	// a mapping it never received.
-	d.persisted.Store(&persistedSnapshot{hash: hash, builtAt: builtAt})
+	d.persisted.Store(&persistedSnapshot{hash: hash})
 
 	klog.V(4).Infof("persisted LDAP mapping of %d users to %s", len(mapping), d.cache)
 
@@ -180,8 +180,8 @@ func (d *Directory) storeHolds(ctx context.Context, hash string) bool {
 	return held != "" && held == hash
 }
 
-// persistedSnapshot is what the store is taken to hold: the fingerprint of the
-// mapping it holds, and the build time recorded with it.
+// persistedSnapshot is the fingerprint of the mapping the store is taken to
+// hold.
 //
 // The fingerprint is the one this proxy wrote, on a proxy that writes; the one
 // the store reported, on a proxy that took the mapping from a store that can
@@ -192,8 +192,7 @@ func (d *Directory) storeHolds(ctx context.Context, hash string) bool {
 // Written only by the refresh path, which Refresh serialises, and by restore
 // before the first refresh.
 type persistedSnapshot struct {
-	hash    string
-	builtAt time.Time
+	hash string
 }
 
 // held is what the store is taken to be holding, never nil.
@@ -203,23 +202,6 @@ func (d *Directory) held() persistedSnapshot {
 	}
 
 	return persistedSnapshot{}
-}
-
-// ageing reports whether a mapping that has not changed should be written again
-// anyway, to carry the build time recorded with it forwards.
-//
-// Only maxAge makes that time matter, and it is measured by the proxy that
-// reads the snapshot back rather than by this one. A mapping confirmed against
-// the directories every refresh interval for a week is still recorded as a week
-// old if it was never rewritten in that time, and would be thrown away at
-// exactly the restart it exists for. Rewriting it once it is halfway to being
-// rejected keeps it servable without going back to writing on every refresh.
-func (p persistedSnapshot) ageing(now time.Time, maxAge time.Duration) bool {
-	if maxAge <= 0 {
-		return false
-	}
-
-	return now.Sub(p.builtAt) >= maxAge/2
 }
 
 // contentHash fingerprints the mapping a snapshot carries, together with what
@@ -371,7 +353,7 @@ func (d *Directory) loadHolding(fingerprint string) error {
 	// The store is already holding this, so neither a rebuild that produces the
 	// same mapping nor a poll that finds the same fingerprint has any reason to
 	// go back to it.
-	d.persisted.Store(&persistedSnapshot{hash: fingerprint, builtAt: snapshot.BuiltAt})
+	d.persisted.Store(&persistedSnapshot{hash: fingerprint})
 
 	finalise(mapping)
 
@@ -477,15 +459,6 @@ func (d *Directory) decodeSnapshot(data []byte) (*Snapshot, map[string][]string,
 		return nil, nil, errors.New("it holds no users")
 	}
 
-	// A mapping that predates the configured maximum age describes group
-	// memberships too old to be worth impersonating users with.
-	if maxAge := d.maxCacheAge(); maxAge > 0 {
-		if age := time.Since(snapshot.BuiltAt); age > maxAge {
-			return nil, nil, fmt.Errorf("it was built %s ago, over the configured maxAge of %s",
-				age.Truncate(time.Second), maxAge)
-		}
-	}
-
 	mapping, err := snapshot.mapping()
 	if err != nil {
 		return nil, nil, err
@@ -561,12 +534,4 @@ func (s *Snapshot) mapping() (map[string][]string, error) {
 	}
 
 	return mapping, nil
-}
-
-func (d *Directory) maxCacheAge() time.Duration {
-	if d.config.Cache == nil {
-		return 0
-	}
-
-	return d.config.Cache.MaxAge.Duration()
 }

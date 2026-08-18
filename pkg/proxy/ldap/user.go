@@ -141,9 +141,8 @@ func (d *Directory) applyUser(key string, groups []string, found bool) (bool, er
 		delete(next, key)
 	}
 
-	// The mapping is mostly as old as the rebuild that built it, so that is
-	// what it is persisted as. Claiming the age of this one user for all of it
-	// would let a stale mapping pass the maxAge check on a restart.
+	// The mapping is mostly as old as the rebuild that built it, so preserve that
+	// build time rather than claiming the age of this one user for all of it.
 	if err := d.persist(next, stats.Groups, stats.LastRefresh, stats.Backends); err != nil {
 		return false, err
 	}

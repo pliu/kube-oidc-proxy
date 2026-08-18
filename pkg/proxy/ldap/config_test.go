@@ -131,7 +131,6 @@ func TestParseConfigReadsEveryField(t *testing.T) {
   "refreshUsers": ["alice@example.net"],
   "cache": {
     "type": "kubernetesSecret",
-    "maxAge": "24h",
     "kubernetesSecret": {"name": "ldap-mapping", "namespace": "kube-oidc-proxy"}
   }
 }`
@@ -150,9 +149,6 @@ func TestParseConfigReadsEveryField(t *testing.T) {
 	}
 	if got := config.RefreshInterval.Duration(); got != time.Hour+time.Minute*30 {
 		t.Errorf("expected a refresh interval of 1h30m, got %s", got)
-	}
-	if got := config.Cache.MaxAge.Duration(); got != time.Hour*24 {
-		t.Errorf("expected a maxAge of 24h, got %s", got)
 	}
 	if got := config.Cache.KubernetesSecret.Key; got != DefaultSecretKey {
 		t.Errorf("expected a default Secret key of %q, got %q", DefaultSecretKey, got)

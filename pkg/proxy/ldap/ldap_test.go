@@ -2772,54 +2772,6 @@ func TestRestoredMappingIsNotRewrittenWhenUnchanged(t *testing.T) {
 	}
 }
 
-// Nothing but a write moves the build time recorded with a mapping forwards, so
-// a mapping that is never rewritten ages past maxAge and is thrown away at
-// exactly the restart it exists for.
-func TestUnchangedMappingIsRewrittenBeforeItAgesOut(t *testing.T) {
-	c := connWithUsers([]string{"admins"}, map[string][]string{"alice@example.net": {"admins"}})
-
-	store := new(memoryStore)
-
-	config := testConfig()
-	config.Cache = &CacheConfig{
-		Type:   CacheTypeFile,
-		File:   &FileCacheConfig{Path: filepath.Join(t.TempDir(), "mapping.json")},
-		MaxAge: *NewDuration(time.Hour),
-	}
-
-	d, err := New(config, store)
-	if err != nil {
-		t.Fatalf("unexpected error building directory: %s", err)
-	}
-	d.backends[0].dial = func(string) (conn, error) { return c, nil }
-
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-	if store.saves != 1 {
-		t.Fatalf("expected the first mapping to have been persisted, got %d saves", store.saves)
-	}
-
-	// Still inside the half of maxAge that a rewrite is held off for.
-	d.persisted.Store(&persistedSnapshot{hash: d.held().hash, builtAt: time.Now().Add(-time.Minute * 20)})
-
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-	if store.saves != 1 {
-		t.Errorf("expected a mapping well inside maxAge not to be rewritten, got %d saves", store.saves)
-	}
-
-	d.persisted.Store(&persistedSnapshot{hash: d.held().hash, builtAt: time.Now().Add(-time.Minute * 40)})
-
-	if err := d.Refresh(); err != nil {
-		t.Fatalf("unexpected error refreshing: %s", err)
-	}
-	if store.saves != 2 {
-		t.Errorf("expected a mapping halfway to maxAge to be rewritten, got %d saves", store.saves)
-	}
-}
-
 // internedSnapshot is a snapshot of the given mapping as it would be persisted,
 // with everything else about it held constant.
 func internedSnapshot(mapping map[string][]string) *Snapshot {
@@ -3267,7 +3219,6 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 
 	tests := map[string]struct {
 		mutate func(*Snapshot)
-		maxAge time.Duration
 		expErr string
 	}{
 		"a snapshot of another version": {
@@ -3290,11 +3241,6 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 			mutate: func(s *Snapshot) { s.GroupTable = nil },
 			expErr: "outside the table",
 		},
-		"a snapshot older than the configured maximum age": {
-			mutate: func(s *Snapshot) { s.BuiltAt = time.Now().Add(-time.Hour) },
-			maxAge: time.Minute,
-			expErr: "maxAge",
-		},
 	}
 
 	for name, test := range tests {
@@ -3306,8 +3252,6 @@ func TestRestoreRejectsUnusableSnapshots(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error encoding snapshot: %s", err)
 			}
-
-			d.config.Cache = &CacheConfig{Type: CacheTypeNone, MaxAge: Duration(test.maxAge)}
 
 			if _, _, err := d.decodeSnapshot(data); err == nil {
 				t.Errorf("expected an error containing %q, got none", test.expErr)
