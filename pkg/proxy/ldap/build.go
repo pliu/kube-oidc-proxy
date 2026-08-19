@@ -2,7 +2,6 @@
 package ldap
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -152,17 +151,13 @@ func (b *backend) build() (map[string][]string, map[string]string, error) {
 		var err error
 		groupNames, err = b.searchGroups(c)
 		if err != nil {
-			recordDuplicate(b.config.Name, err)
 			return err
 		}
-		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(0)
 
 		mapping, err = b.searchUsers(c, groupNames)
 		if err != nil {
-			recordDuplicate(b.config.Name, err)
 			return err
 		}
-		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(0)
 
 		return nil
 	})
@@ -171,21 +166,6 @@ func (b *backend) build() (map[string][]string, map[string]string, error) {
 	}
 
 	return mapping, groupNames, nil
-}
-
-// recordDuplicate publishes a metric when a search failed because two entries
-// of one backend collapsed into one authorization identity.
-func recordDuplicate(name string, err error) {
-	var duplicateGroup *duplicateGroupError
-	if errors.As(err, &duplicateGroup) {
-		backendDuplicateValues.WithLabelValues(name, duplicateKindGroup).Set(1)
-		return
-	}
-
-	var duplicateUser *duplicateUserError
-	if errors.As(err, &duplicateUser) {
-		backendDuplicateValues.WithLabelValues(name, duplicateKindUser).Set(1)
-	}
 }
 
 // checkCounts rejects a backend that has stopped returning anything at all.

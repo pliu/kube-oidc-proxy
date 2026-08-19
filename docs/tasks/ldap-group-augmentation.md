@@ -593,33 +593,30 @@ worth having.
 
 Both failures above are quiet by design: the previous mapping keeps serving, so
 no request fails and nothing tells you that group changes have stopped being
-picked up. Two gauges are published for alerting on that, in Prometheus format
+picked up. Metrics are published for alerting on that, in Prometheus format
 at `/metrics` on the readiness probe listener - `--readiness-probe-port`, 8080
 by default, beside `/ready` and `/live`. That listener is plain HTTP with no
 authentication, so the metrics are readable by anything that can reach the pod
-on that port. They carry no request or user data; label values identify a
-configured backend and, for duplicate values, whether it was a user or group.
+on that port. They carry no request or user data; LDAP label values identify a
+configured backend.
 
 | Metric | Type | Description |
 | ------ | ---- | ----------- |
 | `kube_oidc_proxy_ldap_last_refresh_success` | gauge | `1` if the mapping being served is the one this proxy last went and got, `0` if that failed. |
-| `kube_oidc_proxy_ldap_backend_duplicate_values{backend,kind}` | gauge | `1` if two entries of this backend claim one authorization value, which fails the rebuild. `kind` is `user` or `group`. |
 | `kube_oidc_proxy_ldap_refresh_duration_seconds` | histogram | How long a complete rebuild took, across every backend. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend}` | histogram | How long searching one backend took, so that one slow directory can be told from a rebuild that is slow all over. |
 
 On a [reader](#splitting-the-builder-from-the-proxies), "went and got" means
 picking up what the builder published rather than rebuilding, so
-`last_refresh_success` still says whether that proxy is keeping up. The other
-three describe rebuilds and are published by builders and standalone proxies
-only - a reader reports no series for them, since it never searches a
-directory.
+`last_refresh_success` still says whether that proxy is keeping up. The
+histograms describe rebuilds and are published by builders and standalone
+proxies only, since a reader never searches a directory.
 
-The proxy also publishes `kube_oidc_proxy_requests_total`, a counter of every
-request it is handed. It is counted before authentication, so requests being
-turned away reads as requests arriving rather than as silence. It is not broken
-down by status code: that would mean putting a wrapper around the
-`ResponseWriter` of every request, including the ones hijacked for `exec` and
-`port-forward`, which is not worth it for a count.
+The proxy also publishes `kube_oidc_proxy_requests_total{code}`, a counter of
+completed requests labeled by the decimal HTTP response code returned to the
+client. The handler that records it is outside authentication, so rejected
+requests are included. Its response wrapper preserves protocol upgrades used
+by `exec`, `attach`, and `port-forward`.
 
 The two histograms record only rebuilds that *succeeded*. How long a failed one
 took is mostly how long it took to give up - a connection timing out, say -
@@ -634,25 +631,18 @@ cannot be written to therefore shows up as a failed refresh, not as a slow one.
 
 None of the `_ldap_` series exist unless `--ldap-config-file` is set, so a proxy
 running without augmentation does not report a permanent zero for a rebuild it
-is never going to do. Both `kind` series of `backend_duplicate_values` are
-published as `0` for every configured backend from startup, so an alert can
-tell "no duplicates" from a backend that has not been searched yet.
-
-An unreachable directory leaves each `backend_duplicate_values` series where it
-was rather than clearing it, since a search that did not run says nothing about
-what the directory holds. Alert on `last_refresh_success` for that instead:
+is never going to do. Alert on `last_refresh_success` when refreshes stop
+succeeding:
 
 ```
 kube_oidc_proxy_ldap_last_refresh_success == 0
-kube_oidc_proxy_ldap_backend_duplicate_values > 0
 histogram_quantile(0.9, rate(kube_oidc_proxy_ldap_backend_refresh_duration_seconds_bucket[1h])) > 60
 ```
 
 The first firing for longer than a couple of `refreshInterval`s means the
-mapping is going stale. The second means a directory needs cleaning up, and will
-keep failing every rebuild until it is. The third is the early warning for the
-first: a backend whose rebuilds are creeping towards its `timeout` will start
-failing them, and the duration is visible well before that happens.
+mapping is going stale. The second is the early warning for the first: a
+backend whose rebuilds are creeping towards its `timeout` will start failing
+them, and the duration is visible well before that happens.
 
 ## Triggering a refresh
 

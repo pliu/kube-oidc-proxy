@@ -191,14 +191,8 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 	d.stats.Store(&Stats{})
 
 	// Published from here rather than at init, so that a proxy running without
-	// augmentation configured reports no series at all. Every backend starts
-	// with a series of its own, so that "no duplicates" is a zero rather than
-	// an absence an alert cannot tell from a backend that never ran.
+	// augmentation configured reports no series at all.
 	registerMetrics()
-	for _, b := range backends {
-		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindUser).Set(0)
-		backendDuplicateValues.WithLabelValues(b.config.Name, duplicateKindGroup).Set(0)
-	}
 
 	return d, nil
 }
