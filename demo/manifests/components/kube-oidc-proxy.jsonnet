@@ -71,14 +71,33 @@ local READINESS_PORT = 8080;
     subjects_+: [$.serviceAccount],
   },
 
+  // The issuers the proxy trusts. Each takes the fields of a jwt entry of
+  // kube-apiserver's --authentication-config.
+  authnConfig:: {
+    issuers: [{
+      issuer: {
+        url: $.config.oidc.issuerURL,
+        audiences: [$.config.oidc.clientID],
+      } + if std.objectHas($.config.oidc, 'ca') then
+        { certificateAuthority: $.config.oidc.ca }
+      else {},
+      claimMappings: {
+        username: {
+          claim: $.config.oidc.usernameClaim,
+          prefix: '',
+        },
+        groups: {
+          claim: $.config.oidc.groupsClaim,
+          prefix: $.config.oidc.groupsPrefix,
+        },
+      },
+    }],
+  },
+
   oidcSecret: kube.Secret($.p + 'kube-oidc-proxy-config') + $.metadata {
     data_+: {
-              'oidc.client-id': $.config.oidc.clientID,
-              'oidc.issuer-url': $.config.oidc.issuerURL,
-            } +
-            if std.objectHas($.config.oidc, 'ca') then
-              { 'oidc.ca-pem': $.config.oidc.ca }
-            else {},
+      'authn.yaml': std.manifestYamlDoc($.authnConfig),
+    },
   },
 
   deployment: kube.Deployment($.name) + $.metadata {
@@ -113,24 +132,9 @@ local READINESS_PORT = 8080;
                 '--secure-port=' + $.config.secureServing.port,
                 '--tls-cert-file=' + $.config.secureServing.tlsCertFile,
                 '--tls-private-key-file=' + $.config.secureServing.tlsKeyFile,
-                '--oidc-groups-prefix=' + $.config.oidc.groupsPrefix,
-                '--oidc-groups-claim=' + $.config.oidc.groupsClaim,
-                '--oidc-client-id=$(OIDC_CLIENT_ID)',
-                '--oidc-issuer-url=$(OIDC_ISSUER_URL)',
+                '--oidc-config-file=' + CONFIG_PATH + '/oidc/authn.yaml',
                 '--token-passthrough',
-              ] + if std.objectHas($.config.oidc, 'caFile') then
-                ['--oidc-ca-file=' + $.config.oidc.caFile]
-              else
-                [] + if std.objectHas($.config.oidc, 'usernameClaim') then
-                  ['--oidc-username-claim=' + $.config.oidc.usernameClaim]
-                else
-                  []
-              ,
-
-              env_+: {
-                OIDC_CLIENT_ID: kube.SecretKeyRef($.oidcSecret, 'oidc.client-id'),
-                OIDC_ISSUER_URL: kube.SecretKeyRef($.oidcSecret, 'oidc.issuer-url'),
-              },
+              ],
 
               volumeMounts_+: {
                 oidc: { mountPath: CONFIG_PATH + '/oidc', readOnly: true },

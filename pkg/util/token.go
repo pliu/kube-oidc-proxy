@@ -4,10 +4,6 @@ package util
 import (
 	"net/http"
 	"strings"
-	"time"
-
-	"github.com/go-jose/go-jose/v4"
-	"github.com/go-jose/go-jose/v4/jwt"
 )
 
 // Return just the token from the header of the request, without 'bearer'.
@@ -34,27 +30,4 @@ func ParseTokenFromRequest(req *http.Request) (string, bool) {
 	}
 
 	return token, true
-}
-
-// fakeJWT generates a valid JWT using the passed input parameters which is
-// signed by a generated key. This is useful for checking the status of a
-// signer.
-func FakeJWT(issuerURL string) (string, error) {
-	key := []byte("this-is-a-32-byte-long-secret-key!!!!")
-
-	sig, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.HS256, Key: key},
-		(&jose.SignerOptions{}).WithType("JWT"))
-	if err != nil {
-		return "", err
-	}
-
-	cl := jwt.Claims{
-		Subject:   "fake",
-		Issuer:    issuerURL,
-		NotBefore: jwt.NewNumericDate(time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)),
-		Audience:  jwt.Audience(nil),
-	}
-
-	return jwt.Signed(sig).Claims(cl).Serialize()
 }

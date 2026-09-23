@@ -235,9 +235,16 @@ it directly and applies its own impersonation rules.
 ### Matching users
 
 The user name of a request is matched against `usernameAttribute` case
-insensitively. If `--oidc-username-prefix` is set, the prefix is stripped from
-the user name before matching, so the directory can be keyed on the bare
-attribute value.
+insensitively. If the issuers in `--oidc-config-file` set a username prefix
+(`claimMappings.username.prefix`), the prefix is stripped from the user name
+before matching, so the directory can be keyed on the bare attribute value.
+
+Every issuer must then use the same username prefix, and the proxy refuses to
+start otherwise. Issuers with prefixes of their own keep their users apart in
+RBAC, and stripping each one's prefix before looking in a shared directory would
+undo that: a user of one issuer would be handed the groups of the directory user
+another issuer's user of the same name maps to. Giving issuers the same prefix
+is the statement that their user names name the same people.
 
 A user that cannot be found in any directory is given no groups, and so will be
 able to do only what `system:authenticated` allows. There is no way to have such
@@ -253,7 +260,8 @@ entry there, or an RBAC binding against their user name rather than a group.
 
 ### Group names
 
-`--oidc-groups-prefix` is *not* applied to groups pulled from a directory, as
+An issuer's groups prefix (`claimMappings.groups.prefix`) is *not* applied to
+groups pulled from a directory, as
 those groups did not come from the OIDC issuer. The configured group name
 attribute is emitted unchanged. If two directories use the same name, it is the
 same Kubernetes RBAC group and a user receives it only once.
@@ -681,8 +689,8 @@ request destined for Kubernetes.
 
 By default any authenticated user may trigger a refresh. To restrict this to a
 set of users, set `refreshUsers`. Names are matched case insensitively, and may
-be given either as they appear in the JWT or without the
-`--oidc-username-prefix`. A user who is not in the list receives a `403`.
+be given either as they appear in the JWT or without the issuers' username
+prefix. A user who is not in the list receives a `403`.
 
 ### Refreshing one user
 

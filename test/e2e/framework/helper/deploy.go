@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -31,12 +32,7 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 			"--secure-port=6443",
 			"--tls-cert-file=/tls/cert.pem",
 			"--tls-private-key-file=/tls/key.pem",
-			fmt.Sprintf("--oidc-client-id=%s", clientID),
-			fmt.Sprintf("--oidc-issuer-url=%s", issuerURL),
-			"--oidc-username-claim=email",
-			"--oidc-groups-claim=groups",
-			"--oidc-ca-file=/oidc/ca.pem",
-			"--oidc-ca-file=/oidc/ca.pem",
+			"--oidc-config-file=/oidc/authn.yaml",
 			"--v=10",
 		}, extraArgs...),
 		VolumeMounts: []corev1.VolumeMount{
@@ -83,18 +79,36 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		Name: "oidc",
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
-				SecretName: "oidc-ca",
+				SecretName: "oidc-config",
 			},
 		},
 	})
 
+	// The issuer serves over TLS with its signing key's certificate, so that
+	// is also the CA its connections are verified against.
+	authnConfig := fmt.Sprintf(`issuers:
+- issuer:
+    url: %s
+    audiences: [%s]
+    certificateAuthority: |
+      %s
+  claimMappings:
+    username:
+      claim: email
+      prefix: ""
+    groups:
+      claim: groups
+      prefix: ""
+`, issuerURL, clientID,
+		strings.ReplaceAll(strings.TrimSpace(string(oidcKeyBundle.CertBytes)), "\n", "\n      "))
+
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "oidc-ca",
+			Name:      "oidc-config",
 			Namespace: ns.Name,
 		},
 		Data: map[string][]byte{
-			"ca.pem": oidcKeyBundle.CertBytes,
+			"authn.yaml": []byte(authnConfig),
 		},
 	}
 

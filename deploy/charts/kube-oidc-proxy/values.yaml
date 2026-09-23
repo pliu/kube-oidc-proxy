@@ -38,23 +38,10 @@ tls:
 # These values needs to be set in overrides in order to get kube-oidc-proxy
 # working.
 oidc:
-  # A minimal configuration requires setting clientId, issuerUrl and usernameClaim
-  # values.
-  clientId: ""
-  issuerUrl: ""
-  usernameClaim: ""
-
-  # PEM encoded value of CA cert that will verify TLS connection to
-  # OIDC issuer URL. If not provided, default hosts root CA's will be used.
-  caPEM:
-
-  usernamePrefix:
-  groupsClaim:
-  groupsPrefix:
-
-  signingAlgs:
-    - RS256
-  requiredClaims: {}
+  # Every issuer to trust. Each takes the fields of a jwt entry of
+  # kube-apiserver's --authentication-config, and signingAlgs (default
+  # [RS256]). See the chart README for an example.
+  issuers: []
 
 # To enable token passthrough feature
 # https://github.com/jetstack/kube-oidc-proxy/blob/master/docs/tasks/token-passthrough.md

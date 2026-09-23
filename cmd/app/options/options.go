@@ -93,6 +93,12 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 		errs = append(errs, err...)
 	}
 
+	if o.LDAP.Enabled() {
+		if _, err := o.OIDCAuthentication.SharedUsernamePrefix(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if o.App.DisableImpersonation && o.LDAP.Enabled() {
 		errs = append(errs, errors.New("cannot augment groups from LDAP when impersonation disabled"))
 	}

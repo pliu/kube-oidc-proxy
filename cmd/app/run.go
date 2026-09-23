@@ -17,7 +17,6 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
-	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
 func NewRunCommand(stopCh <-chan struct{}) *cobra.Command {
@@ -114,7 +113,12 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			var ldapDirectory proxy.GroupAugmenter
 			var ldapReadiness []probe.NamedCheck
 			if opts.LDAP.Enabled() {
-				ldapConfig, err := opts.LDAP.Config(opts.OIDCAuthentication.UsernamePrefix)
+				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
+				if err != nil {
+					return err
+				}
+
+				ldapConfig, err := opts.LDAP.Config(usernamePrefix)
 				if err != nil {
 					return err
 				}
@@ -165,18 +169,12 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
-			// Create a fake JWT to set up readiness probe
-			fakeJWT, err := util.FakeJWT(opts.OIDCAuthentication.IssuerURL)
-			if err != nil {
-				return err
-			}
-
 			// Start readiness probe. It stays unready until the secure
 			// listener is accepting, so a restored LDAP mapping cannot put
 			// the pod in its Service while the first directory sweep is
 			// still blocking Run.
 			ready := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
-				fakeJWT, p.OIDCTokenAuthenticator(), ldapReadiness...)
+				p.OIDCHealthCheck, ldapReadiness...)
 
 			// Run proxy
 			waitCh, listenerStoppedCh, err := p.Run(stopCh)

@@ -2,23 +2,47 @@
 package options
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/pflag"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/apis/apiserver"
+	"k8s.io/apiserver/pkg/apis/apiserver/install"
+	apiserverv1 "k8s.io/apiserver/pkg/apis/apiserver/v1"
+	"k8s.io/apiserver/pkg/apis/apiserver/validation"
+	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
+	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	cliflag "k8s.io/component-base/cli/flag"
+	"sigs.k8s.io/yaml"
 )
 
+var configScheme = runtime.NewScheme()
+
+func init() {
+	install.Install(configScheme)
+}
+
+// defaultSigningAlgs is what an issuer that names none is held to. RS256 is
+// the algorithm every OpenID Connect provider is required to implement.
+var defaultSigningAlgs = []string{"RS256"}
+
+// Issuer is one issuer the proxy trusts.
+type Issuer struct {
+	JWTAuthenticator apiserver.JWTAuthenticator
+
+	// SigningAlgs are the JOSE algorithms its tokens may be signed with.
+	SigningAlgs []string
+}
+
 type OIDCAuthenticationOptions struct {
-	CAFile         string
-	ClientID       string
-	IssuerURL      string
-	UsernameClaim  string
-	UsernamePrefix string
-	GroupsClaim    string
-	GroupsPrefix   string
-	SigningAlgs    []string
-	RequiredClaims map[string]string
+	ConfigFile string
+
+	issuers []Issuer
 }
 
 func NewOIDCAuthenticationOptions(nfs *cliflag.NamedFlagSets) *OIDCAuthenticationOptions {
@@ -26,50 +50,163 @@ func NewOIDCAuthenticationOptions(nfs *cliflag.NamedFlagSets) *OIDCAuthenticatio
 }
 
 func (o *OIDCAuthenticationOptions) Validate() error {
-	if o != nil && (len(o.IssuerURL) > 0) != (len(o.ClientID) > 0) {
-		return fmt.Errorf("oidc-issuer-url and oidc-client-id should be specified together")
+	if o == nil {
+		return nil
 	}
 
-	return nil
+	if len(o.ConfigFile) == 0 {
+		return errors.New("--oidc-config-file is required")
+	}
+
+	_, err := o.Issuers()
+	return err
+}
+
+// Issuers returns the issuers to trust, as listed in the configuration file.
+func (o *OIDCAuthenticationOptions) Issuers() ([]Issuer, error) {
+	if o.issuers != nil {
+		return o.issuers, nil
+	}
+
+	issuers, err := loadIssuers(o.ConfigFile)
+	if err != nil {
+		return nil, err
+	}
+
+	o.issuers = issuers
+
+	return issuers, nil
+}
+
+// SharedUsernamePrefix returns the username prefix every trusted issuer puts
+// on its usernames. LDAP entries are keyed on raw usernames, so the proxy can
+// only look a user up in them when it knows which prefix to take off - with
+// issuers that prefix differently, users of different issuers who share a raw
+// username would be handed each other's directory groups.
+func (o *OIDCAuthenticationOptions) SharedUsernamePrefix() (string, error) {
+	issuers, err := o.Issuers()
+	if err != nil {
+		return "", err
+	}
+
+	var prefix string
+	for i, issuer := range issuers {
+		var p string
+		if issuer.JWTAuthenticator.ClaimMappings.Username.Prefix != nil {
+			p = *issuer.JWTAuthenticator.ClaimMappings.Username.Prefix
+		}
+
+		if i > 0 && p != prefix {
+			return "", fmt.Errorf("LDAP group augmentation requires every issuer to use the same "+
+				"username prefix, got %q and %q", prefix, p)
+		}
+
+		prefix = p
+	}
+
+	return prefix, nil
+}
+
+// configFile is the file --oidc-config-file names.
+type configFile struct {
+	Issuers []configIssuer `json:"issuers"`
+}
+
+// configIssuer is a jwt entry of kube-apiserver's AuthenticationConfiguration
+// with the algorithms its tokens may be signed with, which kube-apiserver
+// takes from a flag instead.
+type configIssuer struct {
+	apiserverv1.JWTAuthenticator `json:",inline"`
+
+	SigningAlgs []string `json:"signingAlgs,omitempty"`
+}
+
+// loadIssuers reads the issuers out of the file --oidc-config-file names.
+func loadIssuers(path string) ([]Issuer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read --oidc-config-file: %w", err)
+	}
+
+	// A kube-apiserver --authentication-config file is the likeliest thing to
+	// be handed here by mistake, and its first unknown field says little.
+	var fields map[string]interface{}
+	if err := yaml.Unmarshal(data, &fields); err == nil {
+		if _, ok := fields["jwt"]; ok {
+			return nil, errors.New("--oidc-config-file: found jwt, the issuers of a kube-apiserver " +
+				"AuthenticationConfiguration; list them under issuers instead, without apiVersion and kind")
+		}
+	}
+
+	var file configFile
+	if err := yaml.UnmarshalStrict(data, &file); err != nil {
+		return nil, fmt.Errorf("failed to decode --oidc-config-file: %w", err)
+	}
+
+	if len(file.Issuers) == 0 {
+		return nil, errors.New("--oidc-config-file: at least one issuer is required")
+	}
+
+	// Validated as kube-apiserver would an AuthenticationConfiguration of the
+	// same issuers, so every rule it holds its issuers to holds here too.
+	external := &apiserverv1.AuthenticationConfiguration{}
+	for _, issuer := range file.Issuers {
+		external.JWT = append(external.JWT, issuer.JWTAuthenticator)
+	}
+
+	configScheme.Default(external)
+
+	config := &apiserver.AuthenticationConfiguration{}
+	if err := configScheme.Convert(external, config, nil); err != nil {
+		return nil, fmt.Errorf("--oidc-config-file: %w", err)
+	}
+
+	errs := validation.ValidateAuthenticationConfiguration(authenticationcel.NewDefaultCompiler(), config, nil)
+	for _, err := range errs {
+		// The issuers are under jwt in an AuthenticationConfiguration, and
+		// under issuers in this file.
+		if strings.HasPrefix(err.Field, "jwt") {
+			err.Field = "issuers" + strings.TrimPrefix(err.Field, "jwt")
+		}
+	}
+	if err := errs.ToAggregate(); err != nil {
+		return nil, fmt.Errorf("--oidc-config-file: %w", err)
+	}
+
+	valid := sets.New(oidc.AllValidSigningAlgorithms()...)
+
+	issuers := make([]Issuer, 0, len(config.JWT))
+	for i, jwtAuthenticator := range config.JWT {
+		algs := file.Issuers[i].SigningAlgs
+		if algs == nil {
+			algs = defaultSigningAlgs
+		}
+
+		if len(algs) == 0 {
+			return nil, fmt.Errorf("--oidc-config-file: issuers[%d].signingAlgs must not be empty", i)
+		}
+
+		for _, alg := range algs {
+			if !valid.Has(alg) {
+				return nil, fmt.Errorf("--oidc-config-file: issuers[%d].signingAlgs: unsupported signing algorithm %q, must be one of %v",
+					i, alg, sets.List(valid))
+			}
+		}
+
+		issuers = append(issuers, Issuer{
+			JWTAuthenticator: jwtAuthenticator,
+			SigningAlgs:      algs,
+		})
+	}
+
+	return issuers, nil
 }
 
 func (o *OIDCAuthenticationOptions) AddFlags(fs *pflag.FlagSet) *OIDCAuthenticationOptions {
-	fs.StringVar(&o.IssuerURL, "oidc-issuer-url", o.IssuerURL, ""+
-		"The URL of the OpenID issuer, only HTTPS scheme will be accepted.")
-
-	fs.StringVar(&o.ClientID, "oidc-client-id", o.ClientID,
-		"The client ID for the OpenID Connect client.")
-
-	fs.StringVar(&o.CAFile, "oidc-ca-file", o.CAFile, ""+
-		"The OpenID server's certificate will be verified by one of the authorities "+
-		"in the oidc-ca-file, otherwise the host's root CA set will be used")
-
-	fs.StringVar(&o.UsernameClaim, "oidc-username-claim", "sub", ""+
-		"The OpenID claim to use as the username. Note that claims other than the default ('sub') "+
-		"is not guaranteed to be unique and immutable")
-
-	fs.StringVar(&o.UsernamePrefix, "oidc-username-prefix", "", ""+
-		"If provided, all usernames will be prefixed with this value. If not provided, "+
-		"username claims other than 'email' are prefixed by the issuer URL to avoid "+
-		"clashes. To skip any prefixing, provide the value '-'.")
-
-	fs.StringVar(&o.GroupsClaim, "oidc-groups-claim", "", ""+
-		"If provided, the name of a custom OpenID Connect claim for specifying user groups. "+
-		"The claim value is expected to be a string or array of strings.")
-
-	fs.StringVar(&o.GroupsPrefix, "oidc-groups-prefix", "", ""+
-		"If provided, all groups will be prefixed with this value to prevent conflicts with "+
-		"other authentication strategies.")
-
-	fs.StringSliceVar(&o.SigningAlgs, "oidc-signing-algs", []string{"RS256"}, ""+
-		"Comma-separated list of allowed JOSE asymmetric signing algorithms. JWTs with a "+
-		"'alg' header value not in this list will be rejected. "+
-		"Values are defined by RFC 7518 https://tools.ietf.org/html/rfc7518#section-3.1.")
-
-	fs.Var(cliflag.NewMapStringStringNoSplit(&o.RequiredClaims), "oidc-required-claim", ""+
-		"A key=value pair that describes a required claim in the ID Token. "+
-		"If set, the claim is verified to be present in the ID Token with a matching value. "+
-		"Repeat this flag to specify multiple claims.")
+	fs.StringVar(&o.ConfigFile, "oidc-config-file", o.ConfigFile, ""+
+		"Path to a YAML file listing every issuer to trust under issuers. Each issuer takes the "+
+		"fields of a jwt entry of kube-apiserver's --authentication-config, and signingAlgs, the "+
+		"JOSE algorithms its tokens may be signed with (default [RS256]).")
 
 	return o
 }

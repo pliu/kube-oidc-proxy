@@ -2,32 +2,26 @@
 package probe
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/heptiolabs/healthcheck"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/klog/v2"
-)
-
-const (
-	timeout = time.Second * 10
 )
 
 type HealthCheck struct {
 	handler healthcheck.Handler
 
-	oidcAuther authenticator.Token
-	fakeJWT    string
+	// oidcHealth returns an error until the OIDC authenticator of every
+	// trusted issuer has finished initialising.
+	oidcHealth func() error
 
-	// oidcReady is sticky once the OIDC authenticator has finished
+	// oidcReady is sticky once the OIDC authenticators have finished
 	// initialising. The provider being reachable later is not required for
 	// serving, and probing it again would flap readiness when the issuer
 	// blips.
@@ -50,11 +44,10 @@ type NamedCheck struct {
 	Check func() error
 }
 
-func Run(port, fakeJWT string, oidcAuther authenticator.Token, checks ...NamedCheck) *HealthCheck {
+func Run(port string, oidcHealth func() error, checks ...NamedCheck) *HealthCheck {
 	h := &HealthCheck{
 		handler:    healthcheck.NewHandler(),
-		oidcAuther: oidcAuther,
-		fakeJWT:    fakeJWT,
+		oidcHealth: oidcHealth,
 	}
 
 	h.handler.AddReadinessCheck("secure serving", h.Check)
@@ -95,11 +88,7 @@ func (h *HealthCheck) MarkServing() {
 
 func (h *HealthCheck) Check() error {
 	if !h.oidcReady.Load() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
-		_, _, err := h.oidcAuther.AuthenticateToken(ctx, h.fakeJWT)
-		if err != nil && strings.HasSuffix(err.Error(), "authenticator not initialized") {
+		if err := h.oidcHealth(); err != nil {
 			err = fmt.Errorf("OIDC provider not yet initialized: %s", err)
 			klog.V(4).Infof("%v", err.Error())
 			return err
