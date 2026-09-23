@@ -39,8 +39,9 @@ tls:
 # working.
 oidc:
   # Every issuer to trust. Each takes the fields of a jwt entry of
-  # kube-apiserver's --authentication-config, and signingAlgs (default
-  # [RS256]). See the chart README for an example.
+  # kube-apiserver's --authentication-config, signingAlgs (default [RS256]),
+  # and optionally publicKeys to verify its tokens with instead of fetching
+  # its keys. See the chart README for examples.
   issuers: []
 
 # To enable token passthrough feature

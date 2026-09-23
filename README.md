@@ -72,7 +72,11 @@ issuer the proxy trusts under `issuers`; add an entry for each further issuer,
 with a username prefix of its own. Each issuer takes the fields of a `jwt` entry
 of kube-apiserver's `--authentication-config`, and may also set `signingAlgs`, the JOSE algorithms its tokens may be signed with (default
 `[RS256]`). The `certificateAuthority` of an issuer is only needed when its
-serving certificate is not trusted by the host's root CAs. The OIDC provider CA
+serving certificate is not trusted by the host's root CAs. To verify an issuer's
+tokens with keys you give rather than ones fetched from it, set its `publicKeys`
+to PEM public keys or certificates; see the
+[helm chart README](./deploy/charts/kube-oidc-proxy/README.md) for what that
+gives up. The OIDC provider CA
 will be different depending on which provider you are using. The easiest way to obtain
 the correct certificate bundle is often by opening the providers URL into a
 browser and fetching them there (typically output by clicking the lock icon on

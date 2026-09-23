@@ -96,6 +96,39 @@ oidc:
         prefix: "example:"
 ```
 
+An issuer's keys are normally fetched from it, through the `jwks_uri` of its
+`/.well-known/openid-configuration`. To verify its tokens with keys you give
+instead, set `publicKeys` to PEM `PUBLIC KEY` blocks, or `CERTIFICATE` blocks
+whose public key is used. The issuer is then never contacted, so it need not be
+reachable from the proxy, and `certificateAuthority` and `discoveryURL` cannot
+be set alongside.
+
+```yaml
+oidc:
+  issuers:
+  - issuer:
+      url: https://login.example.com
+      audiences: [kube-oidc-proxy]
+    publicKeys: |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEt7GkIyDiezbHfa4fDz2eYDJ+Mev6
+      TbkaMBnJPIRdxAP9LQyP3haLMW2V4rHwVOdJVNdqWN6yi172ESl9fySFqg==
+      -----END PUBLIC KEY-----
+    signingAlgs: [ES256]
+    claimMappings:
+      username:
+        claim: sub
+        prefix: "example:"
+```
+
+With keys given, nothing notices the issuer rotating its keys: tokens signed
+with a new key are rejected until it is added here and the pods restart, so list
+the old and new keys together while a rotation is under way. Only the key in a
+certificate is used; its expiry, chain and revocation are not checked, since
+listing it is what trusts it. Distributed group claims, which are resolved by
+contacting the issuer, cannot be resolved, so a token relying on them is
+rejected.
+
 This minimal configuration gives a cluster internal IP address that can be used
 with `kubectl` to authenticate requests to Kubernetes API server.
 

@@ -2,6 +2,11 @@
 package options
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -37,6 +42,10 @@ type Issuer struct {
 
 	// SigningAlgs are the JOSE algorithms its tokens may be signed with.
 	SigningAlgs []string
+
+	// PublicKeys, when set, are the keys its tokens are verified with, in
+	// place of the ones its discovery document points to.
+	PublicKeys []crypto.PublicKey
 }
 
 type OIDCAuthenticationOptions struct {
@@ -114,11 +123,15 @@ type configFile struct {
 
 // configIssuer is a jwt entry of kube-apiserver's AuthenticationConfiguration
 // with the algorithms its tokens may be signed with, which kube-apiserver
-// takes from a flag instead.
+// takes from a flag instead, and optionally the keys to verify them with.
 type configIssuer struct {
 	apiserverv1.JWTAuthenticator `json:",inline"`
 
 	SigningAlgs []string `json:"signingAlgs,omitempty"`
+
+	// PublicKeys is PEM: PUBLIC KEY blocks, or CERTIFICATE blocks whose
+	// public key is used.
+	PublicKeys string `json:"publicKeys,omitempty"`
 }
 
 // loadIssuers reads the issuers out of the file --oidc-config-file names.
@@ -193,20 +206,111 @@ func loadIssuers(path string) ([]Issuer, error) {
 			}
 		}
 
+		var keys []crypto.PublicKey
+		if publicKeys := file.Issuers[i].PublicKeys; len(publicKeys) > 0 {
+			// Nothing is fetched from an issuer whose keys are given, so
+			// settings that only shape that fetch would be quietly ignored.
+			if len(jwtAuthenticator.Issuer.CertificateAuthority) > 0 {
+				return nil, fmt.Errorf("--oidc-config-file: issuers[%d]: issuer.certificateAuthority cannot be used with publicKeys", i)
+			}
+
+			if len(jwtAuthenticator.Issuer.DiscoveryURL) > 0 {
+				return nil, fmt.Errorf("--oidc-config-file: issuers[%d]: issuer.discoveryURL cannot be used with publicKeys", i)
+			}
+
+			keys, err = parsePublicKeys([]byte(publicKeys), algs)
+			if err != nil {
+				return nil, fmt.Errorf("--oidc-config-file: issuers[%d].publicKeys: %w", i, err)
+			}
+		}
+
 		issuers = append(issuers, Issuer{
 			JWTAuthenticator: jwtAuthenticator,
 			SigningAlgs:      algs,
+			PublicKeys:       keys,
 		})
 	}
 
 	return issuers, nil
 }
 
+// parsePublicKeys reads the keys out of PEM PUBLIC KEY and CERTIFICATE blocks.
+// Only a certificate's public key is used: its validity, chain and revocation
+// are not checked, since listing it here is what trusts it.
+func parsePublicKeys(data []byte, signingAlgs []string) ([]crypto.PublicKey, error) {
+	var keys []crypto.PublicKey
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+
+		var (
+			key crypto.PublicKey
+			err error
+		)
+		switch block.Type {
+		case "PUBLIC KEY":
+			key, err = x509.ParsePKIXPublicKey(block.Bytes)
+		case "CERTIFICATE":
+			var cert *x509.Certificate
+			cert, err = x509.ParseCertificate(block.Bytes)
+			if err == nil {
+				key = cert.PublicKey
+			}
+		default:
+			return nil, fmt.Errorf("unsupported PEM block %q, must be PUBLIC KEY or CERTIFICATE", block.Type)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("key %d: %w", len(keys), err)
+		}
+
+		// A key that none of the issuer's algorithms can verify with would
+		// reject every token signed with it, without saying why.
+		if !keyMatchesAlgs(key, signingAlgs) {
+			return nil, fmt.Errorf("key %d: a %T cannot verify any of signingAlgs %v", len(keys), key, signingAlgs)
+		}
+
+		keys = append(keys, key)
+	}
+
+	if len(strings.TrimSpace(string(data))) > 0 {
+		return nil, errors.New("contains data that is not a PEM block")
+	}
+
+	if len(keys) == 0 {
+		return nil, errors.New("contains no PEM blocks")
+	}
+
+	return keys, nil
+}
+
+// keyMatchesAlgs reports whether the key can verify a signature made with any
+// of the algorithms.
+func keyMatchesAlgs(key crypto.PublicKey, signingAlgs []string) bool {
+	for _, alg := range signingAlgs {
+		switch key.(type) {
+		case *rsa.PublicKey:
+			if strings.HasPrefix(alg, "RS") || strings.HasPrefix(alg, "PS") {
+				return true
+			}
+		case *ecdsa.PublicKey:
+			if strings.HasPrefix(alg, "ES") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func (o *OIDCAuthenticationOptions) AddFlags(fs *pflag.FlagSet) *OIDCAuthenticationOptions {
 	fs.StringVar(&o.ConfigFile, "oidc-config-file", o.ConfigFile, ""+
 		"Path to a YAML file listing every issuer to trust under issuers. Each issuer takes the "+
-		"fields of a jwt entry of kube-apiserver's --authentication-config, and signingAlgs, the "+
-		"JOSE algorithms its tokens may be signed with (default [RS256]).")
+		"fields of a jwt entry of kube-apiserver's --authentication-config, signingAlgs, the "+
+		"JOSE algorithms its tokens may be signed with (default [RS256]), and optionally "+
+		"publicKeys, PEM keys or certificates to verify its tokens with instead of fetching its keys.")
 
 	return o
 }

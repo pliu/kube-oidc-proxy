@@ -86,6 +86,14 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 	issuerB := startIssuer(t, testDir, "b", stopComponents)
 	// Only accepts ES256, while every signer here signs RS256.
 	issuerC := startIssuer(t, testDir, "c", stopComponents)
+	// Its keys are in the file, and nothing listens at its URL: a proxy that
+	// tried to fetch them could never become ready.
+	staticURL := "https://127.0.0.1:" + freePort(t)
+	staticSigner, err := testutil.NewTLSSelfSignedCertKey("127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil)
+	if err != nil {
+		t.Fatalf("failed to create signing key for the static issuer: %s", err)
+	}
+
 	// Serves discovery and keys like the others, but is not in the file.
 	untrusted := startIssuer(t, testDir, "untrusted", stopComponents)
 
@@ -123,8 +131,17 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
     username:
       claim: email
       prefix: "c:"
+- issuer:
+    url: %s
+    audiences: [client-static]
+  publicKeys: |
+%s
+  claimMappings:
+    username:
+      claim: email
+      prefix: "static:"
 `, issuerA.url, indent(issuerA.ca, "      "), issuerB.url, indent(issuerB.ca, "      "),
-		issuerC.url, indent(issuerC.ca, "      "))
+		issuerC.url, indent(issuerC.ca, "      "), staticURL, indent(staticSigner.CertBytes, "    "))
 	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
 
 	proxyPort := freePort(t)
@@ -207,6 +224,17 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-b", "tenant": "b"`, issuerB.url),
 			expCode: http.StatusOK,
 			expUser: "b:alice@example.com",
+		},
+		"a token from an issuer with its keys in the file": {
+			signer:  staticSigner,
+			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-static"`, staticURL),
+			expCode: http.StatusOK,
+			expUser: "static:alice@example.com",
+		},
+		"a token naming the issuer with its keys in the file but signed by another's key": {
+			signer:  issuerA.signer,
+			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-static"`, staticURL),
+			expCode: http.StatusUnauthorized,
 		},
 		"a token from an issuer not in the file": {
 			signer:  untrusted.signer,

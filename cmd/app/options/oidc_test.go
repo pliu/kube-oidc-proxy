@@ -2,11 +2,20 @@
 package options
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -220,5 +229,139 @@ func TestSharedUsernamePrefix(t *testing.T) {
 	o = parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", shared))
 	if prefix, err := o.SharedUsernamePrefix(); err != nil || prefix != "a:" {
 		t.Errorf("expected prefix %q, got %q (err=%v)", "a:", prefix, err)
+	}
+}
+
+func pemPublicKey(t *testing.T, key crypto.PublicKey) string {
+	t.Helper()
+
+	der, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		t.Fatalf("unexpected error marshalling public key: %s", err)
+	}
+
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
+
+func pemCertificate(t *testing.T, key *rsa.PrivateKey) string {
+	t.Helper()
+
+	// Long expired: only the key in a certificate is used.
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("unexpected error creating certificate: %s", err)
+	}
+
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// indentBlock indents every line of a PEM bundle to nest in a YAML block
+// scalar.
+func indentBlock(s, prefix string) string {
+	return prefix + strings.ReplaceAll(strings.TrimSpace(s), "\n", "\n"+prefix)
+}
+
+func publicKeysConfig(publicKeys, extra string) string {
+	return "issuers:\n- issuer:\n    url: https://a.example.com\n    audiences: [a]\n" + extra +
+		"  publicKeys: |\n" + indentBlock(publicKeys, "    ") + "\n" +
+		"  claimMappings:\n    username:\n      claim: sub\n      prefix: \"\"\n"
+}
+
+func TestConfigFilePublicKeys(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("unexpected error generating key: %s", err)
+	}
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("unexpected error generating key: %s", err)
+	}
+
+	bundle := pemPublicKey(t, &rsaKey.PublicKey) + pemCertificate(t, rsaKey) + pemPublicKey(t, &ecKey.PublicKey)
+	o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml",
+		publicKeysConfig(bundle, "  signingAlgs: [RS256, ES256]\n")))
+
+	issuers, err := o.Issuers()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	exp := []crypto.PublicKey{&rsaKey.PublicKey, &rsaKey.PublicKey, &ecKey.PublicKey}
+	if got := issuers[0].PublicKeys; !reflect.DeepEqual(got, exp) {
+		t.Errorf("expected the keys of the bundle, got %v", got)
+	}
+
+	// Without publicKeys, keys are fetched from the issuer.
+	o = parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", twoIssuers))
+	issuers, err = o.Issuers()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if issuers[0].PublicKeys != nil {
+		t.Errorf("expected no public keys, got %v", issuers[0].PublicKeys)
+	}
+}
+
+func TestConfigFilePublicKeysInvalid(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("unexpected error generating key: %s", err)
+	}
+	rsaPEM := pemPublicKey(t, &rsaKey.PublicKey)
+
+	privatePEM := string(pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)}))
+
+	tests := map[string]struct {
+		config string
+		expErr string
+	}{
+		"not PEM": {
+			config: publicKeysConfig("not a key", ""),
+			expErr: "not a PEM block",
+		},
+		"trailing data": {
+			config: publicKeysConfig(rsaPEM+"garbage", ""),
+			expErr: "not a PEM block",
+		},
+		"private key": {
+			config: publicKeysConfig(privatePEM, ""),
+			expErr: `unsupported PEM block "RSA PRIVATE KEY"`,
+		},
+		"corrupt key": {
+			config: publicKeysConfig("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n", ""),
+			expErr: "key 0",
+		},
+		// An RSA key cannot verify an ES256 signature, so every token would
+		// be rejected.
+		"key no algorithm can use": {
+			config: publicKeysConfig(rsaPEM, "  signingAlgs: [ES256]\n"),
+			expErr: "cannot verify any of signingAlgs",
+		},
+		"with a CA": {
+			config: strings.Replace(publicKeysConfig(rsaPEM, ""), "    audiences: [a]\n",
+				"    audiences: [a]\n    certificateAuthority: |\n"+indentBlock(pemCertificate(t, rsaKey), "      ")+"\n", 1),
+			expErr: "certificateAuthority cannot be used with publicKeys",
+		},
+		"with a discovery URL": {
+			config: strings.Replace(publicKeysConfig(rsaPEM, ""), "    audiences: [a]\n",
+				"    audiences: [a]\n    discoveryURL: https://discovery.example.com/.well-known/openid-configuration\n", 1),
+			expErr: "discoveryURL cannot be used with publicKeys",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", test.config))
+
+			if err := o.Validate(); err == nil || !strings.Contains(err.Error(), test.expErr) {
+				t.Errorf("expected error containing %q, got %v", test.expErr, err)
+			}
+		})
 	}
 }

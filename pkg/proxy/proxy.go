@@ -113,11 +113,19 @@ func New(restConfig *rest.Config,
 			caProvider = caBundle(jwtAuthenticator.Issuer.CertificateAuthority)
 		}
 
-		tokenAuther, err := oidc.New(ctx.TODO(), oidc.Options{
+		opts := oidc.Options{
 			CAContentProvider:    caProvider,
 			SupportedSigningAlgs: issuer.SigningAlgs,
 			JWTAuthenticator:     jwtAuthenticator,
-		})
+		}
+
+		// An issuer with its keys configured is never asked for them, so it
+		// is ready at once and need not be reachable.
+		if len(issuer.PublicKeys) > 0 {
+			opts.KeySet = newStaticKeySet(issuer.PublicKeys, issuer.SigningAlgs)
+		}
+
+		tokenAuther, err := oidc.New(ctx.TODO(), opts)
 		if err != nil {
 			return nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
 		}
