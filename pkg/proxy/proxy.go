@@ -9,12 +9,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"time"
 
-	"k8s.io/apiserver/pkg/apis/apiserver"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
+	"k8s.io/apiserver/pkg/authentication/token/union"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	"k8s.io/client-go/rest"
@@ -56,6 +56,7 @@ type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
 type Proxy struct {
 	oidcRequestAuther     *bearertoken.Authenticator
 	tokenAuther           authenticator.Token
+	oidcHealthChecks      []func() error
 	tokenReviewer         *tokenreview.TokenReview
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview
 	secureServingInfo     *server.SecureServingInfo
@@ -74,15 +75,12 @@ type Proxy struct {
 	handleError errorHandlerFn
 }
 
-// implement oidc.CAContentProvider to load
-// the ca file from the options
-type CAFromFile struct {
-	CAFile string
-}
+// caBundle implements oidc.CAContentProvider over the CA bundle an issuer is
+// configured with.
+type caBundle []byte
 
-func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
-	res, _ := os.ReadFile(caFromFile.CAFile)
-	return res
+func (c caBundle) CurrentCABundleContent() []byte {
+	return c
 }
 
 func New(restConfig *rest.Config,
@@ -94,41 +92,49 @@ func New(restConfig *rest.Config,
 	ssinfo *server.SecureServingInfo,
 	config *Config) (*Proxy, error) {
 
-	// load the CA from the file listed in the options
-	caFromFile := CAFromFile{
-		CAFile: oidcOptions.CAFile,
-	}
-
-	// setup static JWT Auhenticator
-	jwtConfig := apiserver.JWTAuthenticator{
-		Issuer: apiserver.Issuer{
-			URL:                  oidcOptions.IssuerURL,
-			Audiences:            []string{oidcOptions.ClientID},
-			CertificateAuthority: string(caFromFile.CurrentCABundleContent()),
-		},
-
-		ClaimMappings: apiserver.ClaimMappings{
-			Username: apiserver.PrefixedClaimOrExpression{
-				Claim:  oidcOptions.UsernameClaim,
-				Prefix: &oidcOptions.UsernamePrefix,
-			},
-			Groups: apiserver.PrefixedClaimOrExpression{
-				Claim:  oidcOptions.GroupsClaim,
-				Prefix: &oidcOptions.GroupsPrefix,
-			},
-		},
-	}
-
-	// generate tokenAuther from oidc config
-	tokenAuther, err := oidc.New(ctx.TODO(), oidc.Options{
-		CAContentProvider: caFromFile,
-		//RequiredClaims:       oidcOptions.RequiredClaims,
-		SupportedSigningAlgs: oidcOptions.SigningAlgs,
-		JWTAuthenticator:     jwtConfig,
-	})
+	issuers, err := oidcOptions.Issuers()
 	if err != nil {
 		return nil, err
 	}
+
+	// One authenticator per trusted issuer. Each only answers for tokens whose
+	// iss is its own, so the union accepts a token from any of them.
+	var (
+		tokenAuthers []authenticator.Token
+		healthChecks []func() error
+	)
+	for _, issuer := range issuers {
+		jwtAuthenticator := issuer.JWTAuthenticator
+
+		// Without a CA of its own, the issuer is verified against the host's
+		// root CA set.
+		var caProvider oidc.CAContentProvider
+		if len(jwtAuthenticator.Issuer.CertificateAuthority) > 0 {
+			caProvider = caBundle(jwtAuthenticator.Issuer.CertificateAuthority)
+		}
+
+		opts := oidc.Options{
+			CAContentProvider:    caProvider,
+			SupportedSigningAlgs: issuer.SigningAlgs,
+			JWTAuthenticator:     jwtAuthenticator,
+		}
+
+		// An issuer with its keys configured is never asked for them, so it
+		// is ready at once and need not be reachable.
+		if len(issuer.PublicKeys) > 0 {
+			opts.KeySet = newStaticKeySet(issuer.PublicKeys, issuer.SigningAlgs)
+		}
+
+		tokenAuther, err := oidc.New(ctx.TODO(), opts)
+		if err != nil {
+			return nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
+		}
+
+		tokenAuthers = append(tokenAuthers, tokenAuther)
+		healthChecks = append(healthChecks, tokenAuther.HealthCheck)
+	}
+
+	tokenAuther := union.New(tokenAuthers...)
 
 	auditor, err := audit.New(auditOptions, config.ExternalAddress, ssinfo)
 	if err != nil {
@@ -146,6 +152,7 @@ func New(restConfig *rest.Config,
 		config:                config,
 		oidcRequestAuther:     bearertoken.New(tokenAuther),
 		tokenAuther:           tokenAuther,
+		oidcHealthChecks:      healthChecks,
 		auditor:               auditor,
 		// Nil unless LDAP group augmentation is configured.
 		ldapDirectory: ldapDirectory,
@@ -354,9 +361,17 @@ func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTrippe
 	return clientRT, nil
 }
 
-// Return the proxy OIDC token authenticator
-func (p *Proxy) OIDCTokenAuthenticator() authenticator.Token {
-	return p.tokenAuther
+// OIDCHealthCheck returns an error until the authenticator of every trusted
+// issuer has fetched its keys.
+func (p *Proxy) OIDCHealthCheck() error {
+	var errs []error
+	for _, check := range p.oidcHealthChecks {
+		if err := check(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return utilerrors.NewAggregate(errs)
 }
 
 func (p *Proxy) RunPreShutdownHooks() error {

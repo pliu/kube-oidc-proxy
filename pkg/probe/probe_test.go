@@ -2,33 +2,28 @@
 package probe
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 
-	"k8s.io/apiserver/pkg/authentication/authenticator"
-
 	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
-type fakeTokenAuthenticator struct {
+type fakeOIDCHealth struct {
 	returnErr bool
 }
 
-var _ authenticator.Token = &fakeTokenAuthenticator{}
-
-func (f *fakeTokenAuthenticator) AuthenticateToken(context.Context, string) (*authenticator.Response, bool, error) {
+func (f *fakeOIDCHealth) HealthCheck() error {
 	if f.returnErr {
-		return nil, false, errors.New("foo bar authenticator not initialized")
+		return errors.New("oidc: authenticator for issuer \"issuer\" is not initialized")
 	}
 
-	return nil, false, errors.New("some other error")
+	return nil
 }
 
 func TestRun(t *testing.T) {
-	f := &fakeTokenAuthenticator{
+	f := &fakeOIDCHealth{
 		returnErr: true,
 	}
 
@@ -38,13 +33,7 @@ func TestRun(t *testing.T) {
 		t.FailNow()
 	}
 
-	fakeJWT, err := util.FakeJWT("issuer")
-	if err != nil {
-		t.Error(err.Error())
-		t.FailNow()
-	}
-
-	ready := Run(port, fakeJWT, f)
+	ready := Run(port, f.HealthCheck)
 
 	url := fmt.Sprintf("http://0.0.0.0:%s", port)
 
@@ -94,8 +83,8 @@ func TestRun(t *testing.T) {
 			200, resp.StatusCode)
 	}
 
-	// Once the authenticator has returned with a non-initialised error, then
-	// should always return ready.
+	// Once the authenticators have initialised, the probe should always
+	// return ready, even if one of them later reports unhealthy.
 
 	f.returnErr = true
 
@@ -112,8 +101,7 @@ func TestRun(t *testing.T) {
 
 func TestCheckStaysUnreadyUntilServing(t *testing.T) {
 	h := &HealthCheck{
-		oidcAuther: &fakeTokenAuthenticator{},
-		fakeJWT:    "unused",
+		oidcHealth: (&fakeOIDCHealth{}).HealthCheck,
 	}
 
 	if err := h.Check(); err == nil || err.Error() != "secure listener is not serving yet" {

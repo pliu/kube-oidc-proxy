@@ -56,7 +56,6 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	oidcServer.StartTLS()
 	t.Cleanup(oidcServer.Close)
 	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: oidcServer.Certificate().Raw})
-	issuerCAPath := writeFile(t, testDir, "issuer-ca.crt", issuerCA)
 
 	primaryLDAP := newMockLDAPServer(t, "platform-admins", "all-staff")
 	secondaryLDAP := newMockLDAPServer(t, "engineering", "all-staff")
@@ -94,6 +93,22 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		close(stopComponents)
 	})
 
+	authnConfig := fmt.Sprintf(`issuers:
+- issuer:
+    url: %s
+    audiences: [%s]
+    certificateAuthority: |
+%s
+  claimMappings:
+    username:
+      claim: email
+      prefix: ""
+    groups:
+      claim: groups
+      prefix: ""
+`, oidcServer.URL, clientID, indent(issuerCA, "      "))
+	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
+
 	command := app.NewRunCommand(proxyStop)
 	command.SetArgs([]string{
 		"--server=" + apiServer.URL,
@@ -102,11 +117,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		"--tls-cert-file=" + certPath,
 		"--tls-private-key-file=" + keyPath,
 		"--readiness-probe-port=" + readinessPort,
-		"--oidc-issuer-url=" + oidcServer.URL,
-		"--oidc-client-id=" + clientID,
-		"--oidc-ca-file=" + issuerCAPath,
-		"--oidc-username-claim=email",
-		"--oidc-groups-claim=groups",
+		"--oidc-config-file=" + authnConfigPath,
 		"--ldap-config-file=" + ldapConfigPath,
 	})
 
