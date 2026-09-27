@@ -10,16 +10,12 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
-	"k8s.io/client-go/metadata/metadatainformer"
-	k8scache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
 )
 
@@ -40,16 +36,10 @@ const (
 	managedByValue = "kube-oidc-proxy"
 
 	// fingerprintAnnotation identifies the mapping the Secret holds. It is
-	// read on its own, without the mapping, by every proxy watching for a
-	// newer one, and compared before a write so that a Secret already holding
-	// this mapping is not rewritten by another proxy that also built it.
+	// read on its own, without the mapping, and compared before a write so
+	// that a Secret already holding this mapping is not rewritten by another
+	// proxy that also built it.
 	fingerprintAnnotation = "ldap.kube-oidc-proxy.jetstack.io/mapping-fingerprint"
-
-	// watchResyncPeriod is how often the watch replays what it is holding. A
-	// watch that is working needs none of this - a change arrives as it
-	// happens - so it is only a floor under how long a change could go
-	// unnoticed if one were ever dropped without the connection breaking.
-	watchResyncPeriod = time.Minute * 30
 )
 
 // Secret persists the mapping into the data of a Kubernetes Secret, so that it
@@ -69,9 +59,8 @@ const (
 type Secret struct {
 	client kubernetes.Interface
 
-	// meta reads the object without its data, which is how a proxy serving a
-	// mapping somebody else built checks for a newer one without pulling the
-	// mapping down every time it looks.
+	// meta reads the object without its data, which is how a proxy checks
+	// which mapping the Secret holds without pulling the mapping down.
 	meta metadata.Interface
 
 	namespace string
@@ -82,7 +71,6 @@ type Secret struct {
 var (
 	_ Store         = &Secret{}
 	_ Fingerprinter = &Secret{}
-	_ Watcher       = &Secret{}
 
 	secretResource = corev1.SchemeGroupVersion.WithResource("secrets")
 )
@@ -190,57 +178,6 @@ func (s *Secret) Fingerprint(ctx context.Context) (string, error) {
 	}
 
 	return fingerprint, nil
-}
-
-// Watch reports every change to the Secret until stopCh is closed.
-//
-// Only the metadata of the object is watched, so what arrives on a change is
-// the fingerprint rather than the mapping - the mapping is fetched afterwards,
-// and only when the fingerprint says it is worth fetching. The list and watch
-// are narrowed to this one Secret by a field selector, though note that RBAC
-// cannot be: a role granting watch grants it over every Secret in the
-// namespace, whatever the request then asks for.
-func (s *Secret) Watch(stopCh <-chan struct{}, onChange func(fingerprint string)) error {
-	informer := metadatainformer.NewFilteredMetadataInformer(s.meta, secretResource, s.namespace,
-		watchResyncPeriod, k8scache.Indexers{},
-		func(options *metav1.ListOptions) {
-			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", s.name).String()
-		},
-	).Informer()
-
-	changed := func(object interface{}) {
-		meta, ok := object.(*metav1.PartialObjectMetadata)
-		if !ok || meta.Name != s.name {
-			return
-		}
-
-		fingerprint, ok := meta.Annotations[fingerprintAnnotation]
-		if !ok {
-			// A Secret with no fingerprint on it holds no mapping of ours, and
-			// telling the caller it now holds "" would have it throw away a
-			// good mapping for an empty one.
-			return
-		}
-
-		onChange(fingerprint)
-	}
-
-	if _, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc:    changed,
-		UpdateFunc: func(_, object interface{}) { changed(object) },
-	}); err != nil {
-		return fmt.Errorf("failed to watch Secret %s/%s: %s", s.namespace, s.name, err)
-	}
-
-	go informer.Run(stopCh)
-
-	// Returning before the first list is complete would leave the caller
-	// unable to tell "nothing published yet" from "not looking yet".
-	if !k8scache.WaitForCacheSync(stopCh, informer.HasSynced) {
-		return fmt.Errorf("gave up waiting to watch Secret %s/%s", s.namespace, s.name)
-	}
-
-	return nil
 }
 
 func (s *Secret) Save(ctx context.Context, data []byte, fingerprint string) error {

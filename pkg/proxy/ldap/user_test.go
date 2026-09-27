@@ -41,7 +41,7 @@ func (g *gatedUserSearchConn) Search(req *goldap.SearchRequest) (*goldap.SearchR
 	return result, nil
 }
 
-// persistingConfig is a standalone proxy that writes what it builds, which is
+// persistingConfig is a proxy that writes what it builds, which is
 // what a single user refresh has to update as well as the mapping in memory.
 func persistingConfig(backends ...*BackendConfig) *Config {
 	config := testConfig(backends...)
@@ -463,8 +463,8 @@ func TestRefreshUserPersistsTheChange(t *testing.T) {
 		t.Fatalf("unexpected error refreshing the user: %s", err)
 	}
 
-	// The mapping is written out, so the user survives a restart and reaches
-	// the readers of a builder rather than living in this proxy alone.
+	// The mapping is written out, so the user survives a restart rather than
+	// living in this proxy's memory alone.
 	if store.saves != 2 {
 		t.Errorf("expected the refreshed user to have been persisted, got %d saves", store.saves)
 	}
@@ -599,37 +599,15 @@ func TestRefreshUserNeedsAMapping(t *testing.T) {
 	}
 }
 
-// A reader holds no credentials and no description of the directory layout, so
-// there is nothing for it to search. Its refresh endpoint is not served at all,
-// which makes this a guard rather than a path anybody reaches.
-func TestRefreshUserRefusesAReader(t *testing.T) {
-	store := &memoryStore{}
-
-	reader, err := New(readerConfig(), store)
-	if err != nil {
-		t.Fatalf("unexpected error building reader: %s", err)
-	}
-
-	_, err = reader.RefreshUser(context.Background(), "alice@example.net")
-	if err == nil {
-		t.Fatal("expected a reader to refuse to refresh a user, got no error")
-	}
-
-	if exp := "never reaches a directory"; !strings.Contains(err.Error(), exp) {
-		t.Errorf("expected an error containing %q, got %q", exp, err)
-	}
-}
-
 // A single-user search that read an older directory state must not land after a
-// newer full rebuild and publish the old membership over it. On a builder that
-// stale publication would also be sent to every reader.
+// newer full rebuild and publish the old membership over it.
 func TestRefreshUserAndRebuildDoNotOverwriteEachOther(t *testing.T) {
 	initial := connWithUsers([]string{"admins", "devs"}, map[string][]string{
 		"alice@example.net": {"admins"},
 	})
 	store := &memoryStore{}
 
-	d, err := New(builderConfig(), store)
+	d, err := New(testConfig(), store)
 	if err != nil {
 		t.Fatalf("unexpected error building directory: %s", err)
 	}
@@ -713,16 +691,16 @@ func TestRefreshUserAndRebuildDoNotOverwriteEachOther(t *testing.T) {
 		t.Errorf("expected the newer full rebuild to remain authoritative, got %v (found=%t)", groups, ok)
 	}
 
-	reader, err := New(readerConfig(), store)
+	restarted, err := New(testConfig(), store)
 	if err != nil {
-		t.Fatalf("unexpected error building reader: %s", err)
+		t.Fatalf("unexpected error building directory: %s", err)
 	}
-	if err := reader.load(); err != nil {
-		t.Fatalf("unexpected error loading the published mapping: %s", err)
+	if err := restarted.load(); err != nil {
+		t.Fatalf("unexpected error loading the persisted mapping: %s", err)
 	}
-	if groups, ok := reader.Groups("alice@example.net"); !ok ||
+	if groups, ok := restarted.Groups("alice@example.net"); !ok ||
 		!reflect.DeepEqual(groups, []string{"admins", "devs"}) {
-		t.Errorf("expected the reader to receive the newer full rebuild, got %v (found=%t)", groups, ok)
+		t.Errorf("expected the newer full rebuild to be persisted, got %v (found=%t)", groups, ok)
 	}
 }
 

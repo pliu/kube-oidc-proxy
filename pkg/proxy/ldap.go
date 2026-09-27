@@ -47,11 +47,6 @@ type GroupAugmenter interface {
 	// CanRefresh reports whether the given user may trigger a refresh.
 	CanRefresh(username string) bool
 
-	// RefreshEndpointEnabled reports whether this augmenter can rebuild the
-	// mapping requested by the refresh endpoint. Readers update from their
-	// store internally, but do not expose that endpoint to clients.
-	RefreshEndpointEnabled() bool
-
 	// Refresh rebuilds the mapping on demand.
 	Refresh() error
 
@@ -67,15 +62,13 @@ type GroupAugmenter interface {
 // so only authenticated users can trigger a refresh. The path is not a valid
 // API server path, so it can never shadow a request meant for Kubernetes.
 //
-// A "user" query parameter refreshes that one user rather than everybody, which
-// searches the directories for them alone instead of sweeping the whole of
-// every one. The mapping is persisted either way: what the endpoint is for is
-// making a change to the directory take effect, and a change that is lost at
-// the next restart has not really taken effect.
+// The endpoint is a stub for now: it authenticates and authorises the caller,
+// then acknowledges the request without rebuilding anything. The mapping is
+// still rebuilt on the configured interval. Refresh and RefreshUser are kept
+// on GroupAugmenter for when the endpoint calls them again.
 func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath ||
-			!p.ldapDirectory.RefreshEndpointEnabled() {
+		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath {
 			handler.ServeHTTP(rw, req)
 			return
 		}
@@ -104,36 +97,13 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 			return
 		}
 
-		var response interface{}
+		klog.V(2).Infof("LDAP refresh requested by %q (%s), which is not implemented yet",
+			requester.GetName(), remoteAddr)
 
-		if refreshUser := req.URL.Query().Get(LDAPRefreshUserParam); refreshUser != "" {
-			klog.V(2).Infof("LDAP refresh of user %q requested by %q (%s)",
-				refreshUser, requester.GetName(), remoteAddr)
-
-			stats, err := p.ldapDirectory.RefreshUser(req.Context(), refreshUser)
-			if err != nil {
-				klog.Errorf("failed to refresh LDAP user %q (%s): %s", refreshUser, remoteAddr, err)
-				http.Error(rw, "Failed to refresh the LDAP mapping of that user",
-					http.StatusInternalServerError)
-				return
-			}
-
-			response = stats
-		} else {
-			klog.V(2).Infof("LDAP refresh requested by %q (%s)",
-				requester.GetName(), remoteAddr)
-
-			if err := p.ldapDirectory.Refresh(); err != nil {
-				klog.Errorf("failed to refresh LDAP mapping (%s): %s", remoteAddr, err)
-				http.Error(rw, "Failed to refresh LDAP mapping", http.StatusInternalServerError)
-				return
-			}
-
-			response = p.ldapDirectory.Stats()
-		}
-
+		// TODO: rebuild the mapping, or the one user named by
+		// LDAPRefreshUserParam, through Refresh and RefreshUser.
 		rw.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(rw).Encode(response); err != nil {
+		if err := json.NewEncoder(rw).Encode(struct{}{}); err != nil {
 			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)
 		}
 	})

@@ -39,9 +39,7 @@ given no groups until the next one. Waiting out the interval is not the only
 way to close that gap: [one user can be refreshed](#refreshing-one-user)
 without everybody being searched for again.
 
-By default every replica does all of this for itself. Past one replica you
-probably want [one of them building and the rest
-serving](#splitting-the-builder-from-the-proxies) instead.
+Every replica does all of this for itself.
 
 A backend that cannot be searched fails the whole rebuild. Merging only what the
 reachable backends returned would quietly drop the groups a user holds in the
@@ -174,9 +172,8 @@ And one using every field, two directories and a persisted mapping:
 
 | Field | Default | Description |
 | ----- | ------- | ----------- |
-| `role` | `standalone` | What this proxy does with the mapping. See [Splitting the builder from the proxies](#splitting-the-builder-from-the-proxies). |
-| `backends` | | The directories to build the mapping from. At least one is required, except for a `reader`, which must have none. |
-| `refreshInterval` | `10m` | How often the mapping is rebuilt. A Go duration string. Not used by a `reader`. |
+| `backends` | | The directories to build the mapping from. At least one is required. |
+| `refreshInterval` | `10m` | How often the mapping is rebuilt. A Go duration string. |
 | `refreshUsers` | | Users allowed to trigger a refresh. If unset, any authenticated user may. |
 | `cache` | | **Required.** Where the built mapping is persisted. See [below](#persisting-the-mapping). |
 
@@ -381,13 +378,6 @@ created if needed. The path should be in a volume that outlives the container -
 a path in the container's writable layer is lost on exactly the restart the
 cache exists for.
 
-Only available to a `standalone` proxy. A `builder` and its `reader`s are
-separate deployments sharing one store, and a file is whatever each pod happens
-to have mounted: it might be a shared volume, and it might be a path in each
-pod's own filesystem, in which case the builder would write to a file no reader
-will ever see. Nothing in the configuration can tell those apart, so those roles
-require a `kubernetesSecret`.
-
 ### `kubernetesSecret`
 
 ```json
@@ -435,117 +425,7 @@ rules:
 Note that the mapping names every user of the cluster and the groups they hold.
 Anything that can read the Secret can read that.
 
-## Splitting the builder from the proxies
-
-By default every replica does everything: it searches the directories, builds
-the mapping, writes it to the store and serves it. That is `"role":
-"standalone"`, and for a single replica it is all you need.
-
-It stops being what you want as soon as there is more than one replica. Every
-replica sweeps every directory on its own schedule, so the load on the
-directories multiplies by the replica count. Every replica writes the whole
-mapping to the same store, so they take turns overwriting each other. And
-because each builds its own mapping at its own moment, two replicas can hand the
-same user different groups depending on which pod the Service picked.
-
-The `builder` and `reader` roles split those jobs across two Deployments:
-
-* One **builder**. It searches the directories, writes the mapping to the store
-  and serves requests like any other replica. It is the only writer of the
-  store, and the only place the bind credentials have to exist.
-* Several **readers**. They never open a directory. They watch the store, serve
-  what the builder published, and are configured with no backends at all -
-  which means no bind credentials and no description of your directory layout on
-  the pods taking user traffic.
-
-Both roles require a `kubernetesSecret` cache. They are separate deployments
-sharing one store, and a Secret is the only kind this proxy can be sure they
-both reach; see [`file`](#file) for why a path is not.
-
-The directories are swept once however many proxies you run, there is one writer
-of the store so nothing overwrites anything, and every proxy serves the same
-mapping because there is only one.
-
-### The two configuration files
-
-The builder is an ordinary configuration with a role on it:
-
-```json
-{
-  "role": "builder",
-  "backends": [
-    {
-      "name": "corp",
-      "urls": ["ldaps://ldap.example.net:636"],
-      "bindDN": "CN=svc-kube-oidc-proxy,OU=Service Accounts,DC=example,DC=net",
-      "bindPasswordFile": "/etc/kube-oidc-proxy/ldap-bind-password",
-      "userSearchBases": ["OU=Users,DC=example,DC=net"],
-      "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
-    }
-  ],
-  "refreshInterval": "10m",
-  "cache": {
-    "type": "kubernetesSecret",
-    "kubernetesSecret": {"name": "kube-oidc-proxy-ldap-mapping"}
-  }
-}
-```
-
-A reader's is the whole of what it needs to know:
-
-```json
-{
-  "role": "reader",
-  "cache": {
-    "type": "kubernetesSecret",
-    "kubernetesSecret": {"name": "kube-oidc-proxy-ldap-mapping"}
-  }
-}
-```
-
-Backends are rejected in a reader's file rather than ignored, so the file cannot
-quietly grow credentials that only look like they do nothing.
-
-### Refreshing
-
-`POST` to the [refresh endpoint](#triggering-a-refresh) only rebuilds from the
-directories on the builder - a reader has nothing to rebuild from. Route that
-path to the builder's Service and the rest to the proxies:
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: kube-oidc-proxy
-  namespace: kube-oidc-proxy
-spec:
-  rules:
-  - host: kube-oidc-proxy.example.net
-    http:
-      paths:
-      - path: /kube-oidc-proxy/ldap/refresh
-        pathType: Exact
-        backend:
-          service:
-            name: kube-oidc-proxy-ldap-builder
-            port: {number: 443}
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: kube-oidc-proxy
-            port: {number: 443}
-```
-
-A refresh that reaches the builder rebuilds, publishes, and reaches every reader
-within about as long as the write takes. The response comes back when the
-builder is done, which is a moment before the readers have caught up.
-
-Readers do not serve the refresh endpoint. A request to that path on a reader is
-handled like any other request and passed to the API server rather than causing
-a store reload. Route the exact path to the builder as shown above.
-
-### Readiness
+## Readiness
 
 The proxy reports itself unready until the secure port is accepting
 connections. Restoring a persisted mapping, or finishing the first directory
@@ -555,47 +435,8 @@ that window is taken and then left waiting rather than refused, which is
 exactly what the Service must not route to. The pod stays out of it for that
 whole window.
 
-A reader with no mapping would answer every request by stripping the user of
-every group they hold, so it also reports itself unready until it has one. On
-a fresh install that is the gap between the readers starting and the builder
-finishing its first sweep of the directories.
-
-It waits rather than exiting, since what it is waiting for is on its way. A
-store it cannot read *at all* is a different thing - the wrong name, or no
-permission - and fails the reader at startup, where somebody is watching.
-
-### RBAC
-
-The builder writes, so it keeps the Role from [above](#kubernetessecret). The
-readers only ever read, and get this instead:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: kube-oidc-proxy-ldap-reader
-  namespace: kube-oidc-proxy
-rules:
-- apiGroups: [""]
-  resources: ["secrets"]
-  resourceNames: ["kube-oidc-proxy-ldap-mapping"]
-  verbs: ["get"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["list", "watch"]
-```
-
-**That second rule is wider than it looks, and it is worth being deliberate
-about.** Readers watch the mapping Secret so that a published mapping reaches
-them as it lands rather than at the next poll. RBAC `resourceNames` does not
-apply to `list` and `watch`, so there is no way to grant a watch of one Secret:
-the grant covers every Secret in the namespace, including the one holding the
-builder's bind password. The field selector on the watch narrows what the
-readers ask for, not what they are permitted to ask for.
-
-If that trade is not one you want to make, put the builder and its credentials
-in a namespace of their own, so that the grant the readers hold reaches nothing
-worth having.
+A proxy with no mapping would answer every request by stripping the user of
+every group they hold, so it also reports itself unready until it has one.
 
 ## Metrics
 
@@ -613,12 +454,6 @@ configured backend.
 | `kube_oidc_proxy_ldap_last_refresh_success` | gauge | `1` if the mapping being served is the one this proxy last went and got, `0` if that failed. |
 | `kube_oidc_proxy_ldap_refresh_duration_seconds` | histogram | How long a complete rebuild took, across every backend. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend}` | histogram | How long searching one backend took, so that one slow directory can be told from a rebuild that is slow all over. |
-
-On a [reader](#splitting-the-builder-from-the-proxies), "went and got" means
-picking up what the builder published rather than rebuilding, so
-`last_refresh_success` still says whether that proxy is keeping up. The
-histograms describe rebuilds and are published by builders and standalone
-proxies only, since a reader never searches a directory.
 
 The proxy also publishes `kube_oidc_proxy_requests_total{code}`, a counter of
 completed requests labeled by the decimal HTTP response code returned to the
@@ -654,6 +489,12 @@ them, and the duration is visible well before that happens.
 
 ## Triggering a refresh
 
+> **Note:** the refresh endpoint is currently a stub. Every proxy serves it,
+> and it authenticates the caller and checks `refreshUsers` as described below,
+> but it answers `200` with an empty JSON object without rebuilding anything.
+> The mapping is still rebuilt every `refreshInterval`. What follows describes
+> the behaviour it will have once it is wired back up.
+
 Waiting out `refreshInterval` after a group membership change is often
 undesirable. An authenticated user can trigger an immediate rebuild by POSTing
 to the refresh endpoint on the proxy:
@@ -673,11 +514,6 @@ a group nobody in the user search bases belongs to is counted, and a group two
 backends both return is counted by each. What it measures is the group search
 having returned something, which is the check described in
 [How it works](#how-it-works). `users` is the size of the mapping itself.
-
-With the builder split from the proxies, this endpoint has to reach the builder
-to rebuild anything, which is a matter of [routing](#refreshing). Readers do
-not serve the endpoint: a request that lands on a reader is passed to the API
-server like any other path.
 
 The endpoint sits behind the same OIDC authentication as every other request, so
 an unauthenticated caller cannot trigger a rebuild. A caller arriving while a
@@ -749,10 +585,3 @@ make it a way of reading the group membership of anybody whose username can be
 guessed. `refreshUsers` gates this exactly as it gates a full rebuild, and a
 burst of requests for one user costs one write rather than one each: whichever
 gets there first writes the mapping, and the rest find nothing left to change.
-
-With the builder split from the proxies this needs the same
-[routing](#refreshing) a full rebuild does - the query parameter rides along
-with the path rule shown there. It is also the only way to pick up a new user
-promptly in that topology: a reader holds no credentials and no description of
-the directory layout, so it cannot search for anybody itself, and it picks up
-the refreshed user when the builder publishes the mapping it just wrote.

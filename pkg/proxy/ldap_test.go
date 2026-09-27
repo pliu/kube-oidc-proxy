@@ -3,8 +3,6 @@ package proxy
 
 import (
 	gocontext "context"
-	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -36,8 +34,6 @@ type fakeAugmenter struct {
 	refreshErr   error
 	refreshCount int
 
-	refreshEndpointDisabled bool
-
 	// directory is what a search for one user finds, standing in for the
 	// directories being searched for somebody the mapping does not hold.
 	directory map[string][]string
@@ -45,8 +41,6 @@ type fakeAugmenter struct {
 	directoryErr error
 	userRefresh  []string
 }
-
-func (f *fakeAugmenter) RefreshEndpointEnabled() bool { return !f.refreshEndpointDisabled }
 
 func (f *fakeAugmenter) CanRefresh(username string) bool {
 	if len(f.refreshUsers) == 0 {
@@ -197,127 +191,36 @@ func TestGroupsUnchangedWhenLDAPDisabled(t *testing.T) {
 	}
 }
 
-func TestLDAPRefreshEndpoint(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
-
-	directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
-	p.ldapDirectory = directory
-
-	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
-		&user.DefaultInfo{Name: "alice@example.net"})
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
+// The endpoint is a stub for now: it answers an allowed caller without
+// rebuilding the mapping, whole or for one user.
+func TestLDAPRefreshEndpointIsAStub(t *testing.T) {
+	tests := map[string]url.Values{
+		"the whole mapping": nil,
+		"one user":          {LDAPRefreshUserParam: {"bob@example.net"}},
 	}
 
-	if directory.refreshCount != 1 {
-		t.Errorf("expected exactly one refresh, got %d", directory.refreshCount)
-	}
+	for name, query := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			defer p.ctrl.Finish()
 
-	var stats ldap.Stats
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		t.Fatalf("failed to decode response: %s", err)
-	}
+			directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
+			p.ldapDirectory = directory
 
-	if stats.Users != 1 {
-		t.Errorf("expected stats of 1 user, got %d", stats.Users)
-	}
-}
+			req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
+			req.URL.RawQuery = query.Encode()
 
-// Refreshing one user searches the directories for them alone rather than
-// sweeping the whole of every one, which is what makes a change to a single
-// user cheap enough to ask for as soon as it is made.
-func TestLDAPRefreshEndpointRefreshesOneUser(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
+			resp := serveWithLDAP(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
 
-	directory := &fakeAugmenter{
-		mapping:   map[string][]string{"alice@example.net": {"admins"}},
-		directory: map[string][]string{"bob@example.net": {"devs", "admins"}},
-	}
-	p.ldapDirectory = directory
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
+			}
 
-	req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
-	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
-
-	resp := serveWithLDAP(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
-	}
-
-	if exp := []string{"bob@example.net"}; !reflect.DeepEqual(directory.userRefresh, exp) {
-		t.Errorf("expected the named user to have been refreshed, exp=%v got=%v",
-			exp, directory.userRefresh)
-	}
-
-	// Everybody else is left alone: the whole point is not rebuilding them.
-	if directory.refreshCount != 0 {
-		t.Errorf("expected no rebuild of the whole mapping, got %d", directory.refreshCount)
-	}
-
-	var stats ldap.UserStats
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		t.Fatalf("failed to decode response: %s", err)
-	}
-
-	if !stats.Found || !stats.Changed || stats.Groups != 2 {
-		t.Errorf("unexpected stats: %+v", stats)
-	}
-
-	// How many groups they hold, not which: by default any authenticated user
-	// may call this, and naming them would make it a way of reading the group
-	// membership of anybody whose username can be guessed.
-	if stats.User != "bob@example.net" {
-		t.Errorf("expected the refreshed user to be named, got %q", stats.User)
-	}
-}
-
-func TestLDAPRefreshEndpointReportsAFailedUserRefresh(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
-
-	directory := &fakeAugmenter{
-		mapping:      map[string][]string{"alice@example.net": {"admins"}},
-		directoryErr: errors.New("directory is unreachable"),
-	}
-	p.ldapDirectory = directory
-
-	req := newLDAPRequest(LDAPRefreshPath, http.MethodPost)
-	req.URL.RawQuery = url.Values{LDAPRefreshUserParam: {"bob@example.net"}}.Encode()
-
-	resp := serveWithLDAP(t, p, req, &user.DefaultInfo{Name: "alice@example.net"})
-
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("got unexpected response code, exp=%d got=%d",
-			http.StatusInternalServerError, resp.StatusCode)
-	}
-}
-
-func TestLDAPReaderDoesNotServeRefreshEndpoint(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
-
-	directory := &fakeAugmenter{
-		mapping:                 map[string][]string{"alice@example.net": {"admins"}},
-		refreshEndpointDisabled: true,
-	}
-	p.ldapDirectory = directory
-
-	// A reader treats the path like any other request and sends it to the API
-	// server with the groups from the mapping it serves.
-	p.fakeRT.expUser = "alice@example.net"
-	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
-
-	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
-		&user.DefaultInfo{Name: "alice@example.net"})
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
-	}
-	if directory.refreshCount != 0 {
-		t.Errorf("expected the reader not to refresh, got %d refreshes", directory.refreshCount)
+			if directory.refreshCount != 0 || len(directory.userRefresh) != 0 {
+				t.Errorf("expected no refresh, got %d rebuilds and user refreshes of %v",
+					directory.refreshCount, directory.userRefresh)
+			}
+		})
 	}
 }
 
@@ -326,32 +229,27 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 		refreshUsers []string
 		requester    string
 
-		expCode      int
-		expRefreshes int
+		expCode int
 	}{
 		"any authenticated user may refresh when no users are configured": {
 			refreshUsers: nil,
 			requester:    "alice@example.net",
 			expCode:      http.StatusOK,
-			expRefreshes: 1,
 		},
 		"an allowed user may refresh": {
 			refreshUsers: []string{"alice@example.net", "bob@example.net"},
 			requester:    "bob@example.net",
 			expCode:      http.StatusOK,
-			expRefreshes: 1,
 		},
 		"a user not in the allowed users is forbidden": {
 			refreshUsers: []string{"alice@example.net"},
 			requester:    "eve@example.net",
 			expCode:      http.StatusForbidden,
-			expRefreshes: 0,
 		},
 		"a user not in a single entry allowed list is forbidden": {
 			refreshUsers: []string{"alice@example.net"},
 			requester:    "alice@example.net.evil",
 			expCode:      http.StatusForbidden,
-			expRefreshes: 0,
 		},
 	}
 
@@ -371,9 +269,8 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 					test.expCode, resp.StatusCode)
 			}
 
-			if directory.refreshCount != test.expRefreshes {
-				t.Errorf("expected %d refreshes, got %d",
-					test.expRefreshes, directory.refreshCount)
+			if directory.refreshCount != 0 {
+				t.Errorf("expected no refresh, got %d", directory.refreshCount)
 			}
 		})
 	}
@@ -420,21 +317,6 @@ func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 
 	if directory.refreshCount != 0 {
 		t.Errorf("expected no refresh, got %d", directory.refreshCount)
-	}
-}
-
-func TestLDAPRefreshEndpointReportsFailure(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
-
-	p.ldapDirectory = &fakeAugmenter{refreshErr: errors.New("directory is down")}
-
-	resp := serveWithLDAP(t, p, newLDAPRequest(LDAPRefreshPath, http.MethodPost),
-		&user.DefaultInfo{Name: "alice@example.net"})
-
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("got unexpected response code, exp=%d got=%d",
-			http.StatusInternalServerError, resp.StatusCode)
 	}
 }
 

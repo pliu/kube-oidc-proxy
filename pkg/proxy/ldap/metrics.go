@@ -12,19 +12,16 @@ const metricsNamespace = "kube_oidc_proxy_ldap"
 var (
 	// lastRefreshSuccess is 1 when the mapping being served is the one this
 	// proxy last went and got, and 0 when the attempt failed and the mapping
-	// is therefore older than it should be. Going and getting it means a
-	// rebuild from the directories, or - on a reader, which does not rebuild
-	// anything - picking up what the builder published.
+	// is therefore older than it should be.
 	//
-	// Failing is not itself an outage in either case: the previous mapping
+	// Failing is not itself an outage: the previous mapping
 	// keeps serving, so nothing surfaces it to a request. This is what an
 	// operator alerts on to find out that group changes have stopped being
 	// picked up.
 	lastRefreshSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Name:      "last_refresh_success",
-		Help: "1 if the mapping being served is the one this proxy last went and got - rebuilt, " +
-			"or picked up from the builder - and 0 if that failed.",
+		Help:      "1 if the mapping being served is the one this proxy last rebuilt, and 0 if that failed.",
 	})
 
 	// refreshDuration and backendRefreshDuration record only rebuilds that

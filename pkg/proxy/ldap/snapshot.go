@@ -86,14 +86,6 @@ func (d *Directory) persist(mapping map[string][]string, groups int, builtAt tim
 		return nil
 	}
 
-	// Said here as well as by the role never reaching a rebuild, because "one
-	// writer" is the property the whole split rests on: a reader that wrote
-	// would be overwriting the builder with a mapping it got from the builder,
-	// and nothing downstream would notice.
-	if !d.config.Role.Persists() {
-		return nil
-	}
-
 	persisted := make([]SnapshotBackend, 0, len(backends))
 	for _, b := range backends {
 		persisted = append(persisted, SnapshotBackend{Name: b.Name, Users: b.Users, Groups: b.Groups})
@@ -304,33 +296,9 @@ func (d *Directory) restore() bool {
 	return true
 }
 
-// load installs the mapping the store is holding. It is how a proxy that does
-// not build one gets everything it serves, and how one that does gets what it
-// serves until its first rebuild finishes.
-//
-// The mapping is fingerprinted from the snapshot that was read back, which is
-// the only answer available to a caller holding nothing but the payload, and
-// the right one for a store that keeps no fingerprint of its own.
+// load installs the mapping the store is holding. It is how a proxy gets what
+// it serves until its first rebuild finishes.
 func (d *Directory) load() error {
-	return d.loadHolding("")
-}
-
-// loadHolding installs the mapping the store is holding, recording it under the
-// fingerprint the store reported for it rather than under one computed here.
-//
-// The two are the same string only while every proxy sharing the store computes
-// it the same way, and that is a property of the binary rather than of the
-// mapping: contentHash covers the snapshot format and what can be served, so a
-// change to it - which has happened, without the format itself moving - leaves a
-// reader that recomputed disagreeing with the builder that wrote. Every
-// comparison a reader makes is against what the store reports, both the
-// fingerprint it is polled for and the one a watch delivers, so recording
-// anything else has it fetch and reinstall the whole mapping on every
-// notification and every resync until the builder next writes.
-//
-// An empty fingerprint means the caller has none to offer, and the snapshot is
-// fingerprinted here instead.
-func (d *Directory) loadHolding(fingerprint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
 	defer cancel()
 
@@ -346,14 +314,9 @@ func (d *Directory) loadHolding(fingerprint string) error {
 
 	d.seedCounts(snapshot.Backends)
 
-	if fingerprint == "" {
-		fingerprint = snapshot.contentHash()
-	}
-
-	// The store is already holding this, so neither a rebuild that produces the
-	// same mapping nor a poll that finds the same fingerprint has any reason to
-	// go back to it.
-	d.persisted.Store(&persistedSnapshot{hash: fingerprint})
+	// The store is already holding this, so a rebuild that produces the same
+	// mapping has no reason to go back to it.
+	d.persisted.Store(&persistedSnapshot{hash: snapshot.contentHash()})
 
 	finalise(mapping)
 
@@ -369,43 +332,6 @@ func (d *Directory) loadHolding(fingerprint string) error {
 		len(mapping), time.Since(snapshot.BuiltAt).Truncate(time.Second), d.cache)
 
 	return nil
-}
-
-// reload installs the mapping the store is holding, if it is not already the
-// one being served. It is what a reader does in place of a rebuild.
-//
-// The check is made against the fingerprint the store reports, which for a
-// Secret is read without the mapping attached, so the ordinary case - a poll
-// that finds nothing new - costs one request for the metadata of one object
-// rather than a copy of the whole mapping. That fingerprint is what the mapping
-// is then recorded under, so that the next poll compares like with like.
-//
-// It is read before the mapping rather than after, so a publication landing
-// between the two is recorded under the fingerprint of the one before it: the
-// next poll finds a mismatch and fetches a mapping it already has, which costs a
-// request. The other order loses the publication instead - the reader would
-// record a fingerprint newer than the payload it read back, and go on serving
-// the older mapping until something else changed.
-func (d *Directory) reload() error {
-	fingerprinter, ok := d.cache.(cache.Fingerprinter)
-	if !ok {
-		return d.load()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cacheTimeout)
-	defer cancel()
-
-	held, err := fingerprinter.Fingerprint(ctx)
-	if err != nil {
-		return err
-	}
-
-	if held != "" && held == d.held().hash && d.HasMapping() {
-		klog.V(4).Infof("LDAP mapping in %s is the one being served", d.cache)
-		return nil
-	}
-
-	return d.loadHolding(held)
 }
 
 // seedCounts primes the per backend counts from a restored snapshot, so that a
@@ -447,11 +373,7 @@ func (d *Directory) decodeSnapshot(data []byte) (*Snapshot, map[string][]string,
 			snapshot.Version, snapshotVersion)
 	}
 
-	// A reader holds no backends, so it has no configuration of its own to
-	// compare this against. The builder that wrote the snapshot is the
-	// authority on whether it describes the directories it was built from -
-	// it is the only thing that ever reached them.
-	if d.config.Role.Builds() && snapshot.MappingHash != d.mappingHash {
+	if snapshot.MappingHash != d.mappingHash {
 		return nil, nil, errors.New("it was built from a different backend configuration")
 	}
 

@@ -147,9 +147,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 
 				// A proxy that has not got hold of a mapping yet would answer
 				// every request by stripping the user of their groups, so it
-				// stays out of its Service until it has one. This is what a
-				// reader waits on while the builder is part way through its
-				// first sweep of the directories.
+				// stays out of its Service until it has one.
 				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
 					Name: "ldap mapping",
 					Check: func() error {

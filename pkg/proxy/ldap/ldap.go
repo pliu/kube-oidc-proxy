@@ -147,18 +147,12 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 	// built in code to the same shape as one read from disk.
 	config.SetDefaults()
 
-	// A reader is meant to have no backends: it serves what a builder
-	// published and never opens a directory itself.
-	if config.Role.Builds() && len(config.Backends) == 0 {
+	if len(config.Backends) == 0 {
 		return nil, ErrNoBackends
 	}
 
 	if err := config.Validate(); err != nil {
 		return nil, err
-	}
-
-	if !config.Role.Builds() && store == nil {
-		return nil, fmt.Errorf("the %q role has no store to read the mapping from", config.Role)
 	}
 
 	backends := make([]*backend, 0, len(config.Backends))
@@ -265,13 +259,6 @@ func (d *Directory) CanRefresh(username string) bool {
 
 	_, ok := d.refreshUsers[usernameKey(username, d.config.UsernamePrefix)]
 	return ok
-}
-
-// RefreshEndpointEnabled reports whether this proxy reaches the directories
-// and can therefore serve the endpoint that asks for a rebuild. Readers learn
-// about published mappings through their store watcher instead.
-func (d *Directory) RefreshEndpointEnabled() bool {
-	return d.config.Role.Builds()
 }
 
 // usernameKey returns the one directory identity represented by a username.

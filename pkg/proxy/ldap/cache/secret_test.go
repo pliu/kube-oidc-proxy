@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -186,72 +185,11 @@ func TestSecretFingerprint(t *testing.T) {
 	}
 
 	// And neither is a Secret that does not exist at all, which is the ordinary
-	// state before the builder has finished its first sweep.
+	// state before the first sweep has finished.
 	missing, _ := testSecretStore(t)
 
 	if _, err := missing.Fingerprint(context.Background()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound for a Secret that does not exist, got %v", err)
-	}
-}
-
-// What a reader is built on: the builder publishes, and the proxies serving
-// the mapping are told, rather than finding out when they next look.
-func TestSecretWatchReportsPublishedMappings(t *testing.T) {
-	held := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "ldap-mapping",
-			Namespace:   "kube-oidc-proxy",
-			Annotations: map[string]string{fingerprintAnnotation: "fingerprint-one"},
-		},
-		Data: map[string][]byte{"mapping.json.gz": []byte("mapping")},
-	}
-
-	meta := testMetadataClient(held)
-
-	store, err := NewSecret(fake.NewSimpleClientset(held), meta,
-		"kube-oidc-proxy", "ldap-mapping", "mapping.json.gz")
-	if err != nil {
-		t.Fatalf("unexpected error building store: %s", err)
-	}
-
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	changes := make(chan string, 8)
-	if err := store.Watch(stopCh, func(fingerprint string) { changes <- fingerprint }); err != nil {
-		t.Fatalf("unexpected error watching: %s", err)
-	}
-
-	// What is already published arrives first, so a reader that starts after
-	// the builder is not left waiting for the next change to happen.
-	select {
-	case got := <-changes:
-		if got != "fingerprint-one" {
-			t.Errorf("expected the published fingerprint, got %q", got)
-		}
-	case <-time.After(time.Second * 10):
-		t.Fatal("expected the mapping already published to be reported")
-	}
-
-	// And then the builder publishes a new one.
-	if err := meta.Tracker().Update(secretResource, &metav1.PartialObjectMetadata{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "ldap-mapping",
-			Namespace:   "kube-oidc-proxy",
-			Annotations: map[string]string{fingerprintAnnotation: "fingerprint-two"},
-		},
-	}, "kube-oidc-proxy"); err != nil {
-		t.Fatalf("unexpected error publishing a new mapping: %s", err)
-	}
-
-	select {
-	case got := <-changes:
-		if got != "fingerprint-two" {
-			t.Errorf("expected the newly published fingerprint, got %q", got)
-		}
-	case <-time.After(time.Second * 10):
-		t.Fatal("expected the newly published mapping to be reported")
 	}
 }
 

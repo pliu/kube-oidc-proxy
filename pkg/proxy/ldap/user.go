@@ -4,7 +4,6 @@ package ldap
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -45,15 +44,10 @@ type UserStats struct {
 // in full; this searches for the one user who changed.
 //
 // It is the whole mapping that gets written out for that one user, since there
-// is no partial write - but that is what makes the change outlive a restart
-// and reach the readers of a builder, which is the only way it reaches the
-// proxies actually taking user traffic. A rebuild of everybody would write
-// exactly the same amount and search the entire directory to get there.
+// is no partial write - but that is what makes the change outlive a restart. A
+// rebuild of everybody would write exactly the same amount and search the
+// entire directory to get there.
 func (d *Directory) RefreshUser(ctx context.Context, username string) (*UserStats, error) {
-	if !d.config.Role.Builds() {
-		return nil, fmt.Errorf("the %q role never reaches a directory, so it cannot refresh a user", d.config.Role)
-	}
-
 	if !d.HasMapping() {
 		return nil, ErrNoMapping
 	}
