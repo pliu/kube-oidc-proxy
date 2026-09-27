@@ -134,6 +134,7 @@ users:
  - [Extra Impersonations Headers](./docs/tasks/extra-impersonation-headers.md)
  - [Auditing](./docs/tasks/auditing.md)
  - [LDAP Group Augmentation](./docs/tasks/ldap-group-augmentation.md)
+ - [Leader Election](./docs/tasks/leader-election.md)
 
 ## Logging
 

@@ -118,6 +118,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		"--tls-private-key-file=" + keyPath,
 		"--readiness-probe-port=" + readinessPort,
 		"--oidc-config-file=" + authnConfigPath,
+		"--leader-elect=false",
 		"--ldap-config-file=" + ldapConfigPath,
 	})
 

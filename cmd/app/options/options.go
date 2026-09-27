@@ -24,6 +24,7 @@ type Options struct {
 	Client             *ClientOptions
 	Misc               *MiscOptions
 	LDAP               *LDAPOptions
+	LeaderElection     *LeaderElectionOptions
 
 	nfs *cliflag.NamedFlagSets
 }
@@ -40,6 +41,7 @@ func New() *Options {
 		Client:             NewClientOptions(nfs),
 		Misc:               NewMiscOptions(nfs),
 		LDAP:               NewLDAPOptions(nfs),
+		LeaderElection:     NewLeaderElectionOptions(nfs),
 
 		nfs: nfs,
 	}
@@ -90,6 +92,10 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 	}
 
 	if err := o.LDAP.Validate(); len(err) > 0 {
+		errs = append(errs, err...)
+	}
+
+	if err := o.LeaderElection.Validate(); len(err) > 0 {
 		errs = append(errs, err...)
 	}
 

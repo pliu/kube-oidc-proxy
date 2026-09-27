@@ -28,7 +28,7 @@ var _ = framework.CasesDescribe("Headers", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Redeploying proxy to send traffic to fake API server")
-		f.DeployProxyWith(extraOIDCVolumes, fmt.Sprintf("--server=%s", fakeAPIServerURL), "--certificate-authority=/fake-apiserver/ca.pem")
+		f.DeployProxyWith(extraOIDCVolumes, fmt.Sprintf("--server=%s", fakeAPIServerURL), "--certificate-authority=/fake-apiserver/ca.pem", "--leader-elect=false")
 
 		resp := sendRequestToProxy(f)
 
@@ -46,7 +46,7 @@ var _ = framework.CasesDescribe("Headers", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Redeploying proxy to send traffic to fake API server with extra headers set")
-		f.DeployProxyWith(extraOIDCVolumes, fmt.Sprintf("--server=%s", fakeAPIServerURL), "--certificate-authority=/fake-apiserver/ca.pem",
+		f.DeployProxyWith(extraOIDCVolumes, fmt.Sprintf("--server=%s", fakeAPIServerURL), "--certificate-authority=/fake-apiserver/ca.pem", "--leader-elect=false",
 			"--extra-user-header-client-ip", "--extra-user-headers=key1=foo,key2=foo,key1=bar")
 
 		resp := sendRequestToProxy(f)

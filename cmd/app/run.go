@@ -3,6 +3,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -12,9 +13,11 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
+	"github.com/jetstack/kube-oidc-proxy/pkg/leader"
 	"github.com/jetstack/kube-oidc-proxy/pkg/probe"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
 )
@@ -160,6 +163,31 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				})
 			}
 
+			// Elect one replica leader. Every replica serves requests
+			// whether or not it leads.
+			var elector *leader.Elector
+			if opts.LeaderElection.LeaderElect {
+				namespace := opts.LeaderElection.ResourceNamespace
+				if namespace == "" {
+					namespace, err = cache.InClusterNamespace()
+					if err != nil {
+						return fmt.Errorf("no --leader-elect-resource-namespace set and %s "+
+							"(set --leader-elect=false when running outside a cluster)", err)
+					}
+				}
+
+				elector, err = leader.New(kubeclient, leader.Config{
+					Namespace:     namespace,
+					Name:          opts.LeaderElection.ResourceName,
+					LeaseDuration: opts.LeaderElection.LeaseDuration.Duration,
+					RenewDeadline: opts.LeaderElection.RenewDeadline.Duration,
+					RetryPeriod:   opts.LeaderElection.RetryPeriod.Duration,
+				})
+				if err != nil {
+					return err
+				}
+			}
+
 			// Initialise proxy with OIDC token authenticator
 			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit, ldapDirectory,
 				tokenReviewer, subectAccessReviewer, secureServingInfo, proxyConfig)
@@ -187,8 +215,21 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			// first directory sweep.
 			ready.MarkServing()
 
+			// Contended for only once serving, so that a replica that fails
+			// to start never holds the Lease.
+			var electionDone <-chan struct{}
+			if elector != nil {
+				electionDone = elector.Run(stopCh)
+			}
+
 			<-waitCh
 			<-listenerStoppedCh
+
+			// Waited on so that the Lease is released before the process
+			// exits, and the next leader can take over at once.
+			if electionDone != nil {
+				<-electionDone
+			}
 
 			if err := p.RunPreShutdownHooks(); err != nil {
 				return err
