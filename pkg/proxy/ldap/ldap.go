@@ -4,14 +4,8 @@
 // they are a member of in one or more LDAP v3 directories - Active Directory,
 // or anything else that exposes a memberOf attribute.
 //
-// The full user -> group mapping is built up front from every configured
-// backend and merged into one, held in memory. It is rebuilt on an interval,
-// or on demand, and swapped in atomically so that in flight requests always
-// read a complete, consistent mapping.
-//
-// The built mapping can also be persisted, so that a proxy restarted while the
-// directories are unreachable serves the last mapping it built rather than
-// stripping every user of their groups.
+// Authenticated users are resolved on demand and persisted per identity.
+// Only cached users are refreshed, and replicas synchronize through ConfigMaps.
 package ldap
 
 import (
@@ -20,84 +14,25 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 )
 
-const (
-	// SourceDirectory and SourceCache describe where the mapping currently
-	// being served came from.
-	SourceDirectory = "directory"
-	SourceCache     = "cache"
-)
+const SourceCache = "cache"
 
-// ErrNoBackends is returned when there is no directory to build a mapping
-// from. Every other configuration problem is reported by Config.Validate.
 var ErrNoBackends = errors.New("no LDAP backends configured")
 
-// Stats describes the state of the currently active mapping.
+// Stats summarizes valid records currently held in memory.
 type Stats struct {
 	Users       int       `json:"users"`
 	Groups      int       `json:"groups"`
 	LastRefresh time.Time `json:"lastRefresh"`
-	Duration    string    `json:"duration"`
-
-	// Source is where the active mapping came from: the directories
-	// themselves, or the persisted cache after a failed startup refresh.
-	Source string `json:"source,omitempty"`
-
-	Backends []BackendStats `json:"backends,omitempty"`
+	Source      string    `json:"source,omitempty"`
 }
 
-// BackendStats describes what one backend contributed to the mapping.
-type BackendStats struct {
-	Name     string `json:"name"`
-	Users    int    `json:"users"`
-	Groups   int    `json:"groups"`
-	Duration string `json:"duration"`
-}
-
+// Directory is the LDAP resolver shared by per-user cache operations.
 type Directory struct {
-	config   *Config
-	backends []*backend
-
-	// cache persists the built mapping. Nil when persistence is disabled.
-	cache cache.Store
-
-	// persisted is what the cache is taken to already hold, so that a refresh
-	// which rebuilds the same mapping does not rewrite it, and a change
-	// reported by the store can be told from the mapping already being served.
-	//
-	// Only the refresh path writes it, and Refresh serialises that. It is a
-	// pointer so that a store watching for changes can read it from a
-	// goroutine of its own.
-	persisted atomic.Pointer[persistedSnapshot]
-
-	// mappingHash identifies the configuration the mapping is built from, so
-	// that a mapping persisted under a different configuration is not served.
-	mappingHash string
-
-	// mapping is the active username -> groups mapping. It is only ever
-	// replaced, never mutated, so readers need no locking.
-	mapping atomic.Pointer[map[string][]string]
-	stats   atomic.Pointer[Stats]
-
-	// updateGate serialises every directory read that can replace some or all
-	// of the mapping. A channel rather than a mutex lets a single-user request
-	// stop waiting when its context is cancelled; see lockUpdate.
-	updateGate chan struct{}
-
-	// refreshMu guards inflight. It is not held across a rebuild.
-	refreshMu sync.Mutex
-
-	// inflight is the rebuild currently running, if one is. A caller arriving
-	// while it runs waits for it rather than starting another.
-	inflight *refreshCall
-
-	// refreshUsers holds the lower cased names of the users allowed to trigger
-	// a refresh. Empty means any authenticated user may.
+	config       *Config
+	backends     []*backend
 	refreshUsers map[string]struct{}
 }
 
@@ -110,23 +45,6 @@ type backend struct {
 	// a file that may have gone away since startup.
 	bindPassword string
 
-	// lastUsers and lastGroups are what this backend returned at the last
-	// refresh that was accepted, so that a backend which still answers but has
-	// stopped returning anything can be told apart from one that was always
-	// empty. Written only by the refresh path, which Refresh serialises, and
-	// by restore before the first refresh.
-	lastUsers  int
-	lastGroups int
-
-	// lastGroupNames is the normalised group DN -> emitted name mapping of the
-	// last accepted refresh. Refreshing one user resolves their memberOf
-	// against it rather than sweeping every group search base again, which is
-	// most of what makes that cheaper than rebuilding everybody.
-	//
-	// Read while a refresh of a single user runs, which is not the goroutine
-	// that wrote it, so it is swapped rather than written into.
-	lastGroupNames atomic.Pointer[map[string]string]
-
 	// groupBaseKeys are the configured group search bases, normalised the same
 	// way a DN read from the directory is. A group a single user refresh has
 	// never heard of is only worth looking at if it lives under one of them,
@@ -136,9 +54,8 @@ type backend struct {
 	dial func(url string) (conn, error)
 }
 
-// New builds a Directory from a validated configuration. The store may be nil,
-// in which case the mapping is not persisted.
-func New(config *Config, store cache.Store) (*Directory, error) {
+// newResolver prepares LDAP backends without contacting the directories.
+func newResolver(config *Config) (*Directory, error) {
 	if config == nil {
 		return nil, ErrNoBackends
 	}
@@ -170,19 +87,7 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 		refreshUsers[usernameKey(username, config.UsernamePrefix)] = struct{}{}
 	}
 
-	d := &Directory{
-		config:       config,
-		backends:     backends,
-		cache:        store,
-		mappingHash:  config.mappingHash(),
-		refreshUsers: refreshUsers,
-		updateGate:   make(chan struct{}, 1),
-	}
-	d.updateGate <- struct{}{}
-
-	empty := make(map[string][]string)
-	d.mapping.Store(&empty)
-	d.stats.Store(&Stats{})
+	d := &Directory{config: config, backends: backends, refreshUsers: refreshUsers}
 
 	// Published from here rather than at init, so that a proxy running without
 	// augmentation configured reports no series at all.
@@ -192,7 +97,7 @@ func New(config *Config, store cache.Store) (*Directory, error) {
 }
 
 // newBackend prepares a backend to be searched. The configuration has already
-// been validated by New, so all that is left is the work that can fail against
+// been validated by newResolver, so all that is left is the work that can fail against
 // the filesystem: the trust bundle and the bind password.
 func newBackend(config *BackendConfig) (*backend, error) {
 	tlsConfig, err := tlsConfigFor(config)
@@ -228,27 +133,6 @@ func newBackend(config *BackendConfig) (*backend, error) {
 	return b, nil
 }
 
-// HasMapping reports whether this proxy has ever got hold of a mapping. Until
-// it has, it would answer every request by stripping the user of their groups,
-// so it must not be sent any.
-//
-// It asks whether a mapping arrived rather than whether it holds any users: a
-// directory that legitimately matches nobody is a mapping like any other, and
-// a proxy serving it is working exactly as it was configured to.
-func (d *Directory) HasMapping() bool {
-	return !d.stats.Load().LastRefresh.IsZero()
-}
-
-// Groups returns the directory groups of the given username. The second return
-// value reports whether the user was found in any backend at all - a user that
-// exists but is in none of the configured groups returns an empty slice and
-// true.
-func (d *Directory) Groups(username string) ([]string, bool) {
-	mapping := *d.mapping.Load()
-	groups, ok := mapping[usernameKey(username, d.config.UsernamePrefix)]
-	return groups, ok
-}
-
 // CanRefresh reports whether the given user is allowed to trigger a refresh.
 // With no allowed users configured, any user may - the endpoint already sits
 // behind authentication.
@@ -274,14 +158,10 @@ func usernameKey(username, prefix string) string {
 	return strings.ToLower(username)
 }
 
-func (d *Directory) Stats() *Stats {
-	return d.stats.Load()
-}
-
 // eachBackend searches every backend in parallel and returns the results in
 // configuration order. A refresh takes roughly as long as the slowest backend
 // rather than the sum of all of them. The first error in configuration order
-// is returned, so errors, statistics and the persisted snapshot stay
+// is returned, so errors and results stay
 // deterministic.
 func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T, error) {
 	type result struct {

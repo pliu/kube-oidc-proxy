@@ -20,7 +20,7 @@ func (c *Config) UserRecordFingerprint() string {
 }
 
 // NewUserRecord applies the same username canonicalization used by LDAP lookups.
-// The readable record format is independent of the legacy directory snapshot.
+// Full group names are preserved in readable YAML.
 func (c *Config) NewUserRecord(username string, found bool, groups []string, checkedAt time.Time) (*cache.UserRecord, error) {
 	return cache.NewUserRecord(usernameKey(username, c.UsernamePrefix), found, groups, c.UserRecordFingerprint(), checkedAt)
 }

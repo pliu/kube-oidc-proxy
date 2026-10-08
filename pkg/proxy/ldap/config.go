@@ -17,6 +17,7 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	k8sErrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Schema is the JSON schema every configuration file is checked against before
@@ -39,24 +40,14 @@ const (
 	DefaultGroupNameAttribute = "cn"
 	DefaultRefreshInterval    = time.Minute * 10
 	DefaultTimeout            = time.Minute * 5
-	DefaultSecretKey          = "mapping.json.gz"
-)
-
-// CacheType selects the store the built mapping is persisted to.
-type CacheType string
-
-const (
-	CacheTypeNone             CacheType = "none"
-	CacheTypeFile             CacheType = "file"
-	CacheTypeKubernetesSecret CacheType = "kubernetesSecret"
 )
 
 // Config is the decoded contents of an LDAP configuration file.
 type Config struct {
 	LookupTimeout     *Duration `json:"lookupTimeout,omitempty"`
 	LookupConcurrency int       `json:"lookupConcurrency,omitempty"`
-	// Backends are the directories the mapping is built from. The mapping of
-	// every backend is merged into one, so a user held in more than one
+	// Backends are queried for each uncached user. Results from
+	// every backend are merged, so a user held in more than one
 	// directory ends up with the union of their groups.
 	Backends []*BackendConfig `json:"backends,omitempty"`
 
@@ -69,8 +60,7 @@ type Config struct {
 	// any authenticated user may trigger one.
 	RefreshUsers []string `json:"refreshUsers,omitempty"`
 
-	// Cache describes where the built mapping is persisted. A nil cache, or one
-	// of type "none", disables persistence.
+	// Cache selects the namespace and scope of required per-user ConfigMaps.
 	Cache *CacheConfig `json:"cache,omitempty"`
 
 	// UsernamePrefix is not part of the configuration file. It is the OIDC
@@ -93,7 +83,7 @@ type BackendConfig struct {
 	InsecureSkipTLSVerify bool   `json:"insecureSkipTLSVerify,omitempty"`
 	StartTLS              bool   `json:"startTLS,omitempty"`
 
-	// Timeout bounds everything this backend does in one rebuild: connecting,
+	// Timeout bounds everything this backend does in one lookup: connecting,
 	// binding and every search. It is a pointer so that a file asking for a
 	// timeout of "0s" is rejected rather than quietly taken to mean no bound
 	// at all, which is the behaviour it reads as asking for.
@@ -108,25 +98,10 @@ type BackendConfig struct {
 	GroupNameAttribute string   `json:"groupNameAttribute,omitempty"`
 }
 
+// CacheConfig scopes per-user ConfigMaps. Namespace defaults to the pod namespace.
 type CacheConfig struct {
-	Namespace string    `json:"namespace,omitempty"`
-	Scope     string    `json:"scope,omitempty"`
-	Type      CacheType `json:"type"`
-
-	File             *FileCacheConfig   `json:"file,omitempty"`
-	KubernetesSecret *SecretCacheConfig `json:"kubernetesSecret,omitempty"`
-}
-
-type FileCacheConfig struct {
-	Path string `json:"path"`
-}
-
-type SecretCacheConfig struct {
-	Name string `json:"name"`
-
-	// Namespace defaults to the namespace the proxy is running in.
 	Namespace string `json:"namespace,omitempty"`
-	Key       string `json:"key,omitempty"`
+	Scope     string `json:"scope"`
 }
 
 // Duration is a time.Duration held in JSON as a string such as "10m", the form
@@ -290,17 +265,6 @@ func (c *Config) SetDefaults() {
 		}
 	}
 
-	if c.Cache == nil {
-		return
-	}
-
-	if c.Cache.Type == "" {
-		c.Cache.Type = CacheTypeNone
-	}
-
-	if c.Cache.KubernetesSecret != nil && c.Cache.KubernetesSecret.Key == "" {
-		c.Cache.KubernetesSecret.Key = DefaultSecretKey
-	}
 }
 
 // Validate checks the rules that the schema cannot express, and re-checks the
@@ -385,34 +349,20 @@ func (b *BackendConfig) validate(id string) []error {
 
 func (c *CacheConfig) validate() []error {
 	if c == nil {
-		return nil
+		return []error{errors.New("cache must be configured")}
 	}
-
 	var errs []error
-
-	switch c.Type {
-	case CacheTypeNone:
-
-	case CacheTypeFile:
-		if c.File == nil || c.File.Path == "" {
-			errs = append(errs, errors.New(`cache: file.path must be set when the cache type is "file"`))
-		}
-
-	case CacheTypeKubernetesSecret:
-		if c.KubernetesSecret == nil || c.KubernetesSecret.Name == "" {
-			errs = append(errs, errors.New(`cache: kubernetesSecret.name must be set when the cache type is "kubernetesSecret"`))
-		}
-
-	default:
-		errs = append(errs, fmt.Errorf("cache: unknown type %q, must be one of none, file, kubernetesSecret", c.Type))
+	if c.Scope == "" {
+		errs = append(errs, errors.New("cache.scope must be set"))
+	} else if problems := validation.IsValidLabelValue(c.Scope); len(problems) != 0 {
+		errs = append(errs, fmt.Errorf("cache.scope: %s", strings.Join(problems, ", ")))
 	}
-
+	if c.Namespace != "" {
+		if problems := validation.IsDNS1123Label(c.Namespace); len(problems) != 0 {
+			errs = append(errs, fmt.Errorf("cache.namespace: %s", strings.Join(problems, ", ")))
+		}
+	}
 	return errs
-}
-
-// Enabled reports whether a mapping should actually be persisted.
-func (c *CacheConfig) Enabled() bool {
-	return c != nil && c.Type != "" && c.Type != CacheTypeNone
 }
 
 // bindPasswordFor resolves the password this backend binds with, reading it

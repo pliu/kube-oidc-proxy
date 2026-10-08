@@ -20,7 +20,7 @@ const minimalConfig = `{
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
   ],
-  "cache": {"type": "none"}
+  "cache": {"scope": "main"}
 }`
 
 func TestParseConfigAppliesDefaults(t *testing.T) {
@@ -54,9 +54,6 @@ func TestParseConfigAppliesDefaults(t *testing.T) {
 		}
 	}
 
-	if config.Cache.Enabled() {
-		t.Error(`expected persistence to be off when the cache type is "none"`)
-	}
 }
 
 func TestParseConfigReadsEveryField(t *testing.T) {
@@ -87,8 +84,7 @@ func TestParseConfigReadsEveryField(t *testing.T) {
   "refreshInterval": "1h30m",
   "refreshUsers": ["alice@example.net"],
   "cache": {
-    "type": "kubernetesSecret",
-    "kubernetesSecret": {"name": "ldap-mapping", "namespace": "kube-oidc-proxy"}
+    "scope": "main", "namespace": "kube-oidc-proxy"
   }
 }`
 
@@ -107,12 +103,10 @@ func TestParseConfigReadsEveryField(t *testing.T) {
 	if got := config.RefreshInterval.Duration(); got != time.Hour+time.Minute*30 {
 		t.Errorf("expected a refresh interval of 1h30m, got %s", got)
 	}
-	if got := config.Cache.KubernetesSecret.Key; got != DefaultSecretKey {
-		t.Errorf("expected a default Secret key of %q, got %q", DefaultSecretKey, got)
+	if config.Cache.Scope != "main" || config.Cache.Namespace != "kube-oidc-proxy" {
+		t.Fatalf("unexpected cache: %+v", config.Cache)
 	}
-	if !config.Cache.Enabled() {
-		t.Error("expected persistence to be on")
-	}
+
 }
 
 // The schema is what stands between a typo in a config file and a proxy that
@@ -146,7 +140,7 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"},
+			  "cache": {"scope": "main"},
 			  "fallbackToTokenGroups": true}`,
 			"fallbackToTokenGroups",
 		},
@@ -191,43 +185,19 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			  "refreshInterval": 600}`,
 			"string",
 		},
-		"an unknown cache type": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "redis"}}`,
-			"must be one of",
-		},
-		"a file cache with no file block": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "file"}}`,
-			"file",
-		},
-		"a Secret cache with no kubernetesSecret block": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "kubernetesSecret"}}`,
-			"kubernetesSecret",
-		},
-		// Roles split building the mapping from serving it, and are gone. A
-		// file still naming one is refused rather than quietly served by a
-		// proxy that now does both.
 		"a role": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}, "role": "standalone"}`,
+			  "cache": {"scope": "main"}, "role": "standalone"}`,
 			"role",
 		},
-		"a Secret name that is not a valid object name": {
+		"legacy Secret cache settings are rejected": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "Not A Name"}}}`,
-			"pattern",
+			"additional properties",
 		},
 	}
 
@@ -260,7 +230,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  {"name": "corp", "urls": ["ldaps://two.example.net:636"],
 			   "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			   "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"duplicate backend name",
 		},
 		"both a bind password and a bind password file": {
@@ -269,7 +239,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "bindPassword": "password", "bindPasswordFile": "/etc/password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"cannot set both bindPassword and bindPasswordFile",
 		},
 		"a bind password with no bind DN": {
@@ -277,7 +247,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "bindPassword": "password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"without a bindDN",
 		},
 		"both a CA file and skipped verification": {
@@ -285,14 +255,14 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "caFile": "/etc/ca.pem", "insecureSkipTLSVerify": true,
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"cannot set both caFile and insecureSkipTLSVerify",
 		},
 		"a refresh interval of zero": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"},
+			  "cache": {"scope": "main"},
 			  "refreshInterval": "0s"}`,
 			"refreshInterval must be a positive duration",
 		},
@@ -301,7 +271,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "timeout": "0s",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"timeout must be a positive duration",
 		},
 		"a removed groupPrefix field": {
@@ -309,7 +279,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"],
 			  "groupPrefix": "ldap:"}],
-			  "cache": {"type": "none"}}`,
+			  "cache": {"scope": "main"}}`,
 			"groupPrefix",
 		},
 	}

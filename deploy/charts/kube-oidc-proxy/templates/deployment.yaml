@@ -46,6 +46,9 @@ spec:
           - "--tls-cert-file=/etc/oidc/tls/crt.pem"
           - "--tls-private-key-file=/etc/oidc/tls/key.pem"
           - "--oidc-config-file=/etc/oidc/authn.yaml"
+          {{- if .Values.ldap.enabled }}
+          - "--ldap-config-file=/etc/oidc/ldap.json"
+          {{- end }}
           {{- if .Values.tokenPassthrough.enabled }}
           - "--token-passthrough"
           {{- if .Values.tokenPassthrough.audiences }}
@@ -84,6 +87,10 @@ spec:
             items:
             - key: authn.yaml
               path: authn.yaml
+            {{- if .Values.ldap.enabled }}
+            - key: ldap.json
+              path: ldap.json
+            {{- end }}
         {{- if .Values.extraVolumes }}{{ toYaml .Values.extraVolumes | trim | nindent 8 }}{{ end }}
         - name: kube-oidc-proxy-tls
           secret:

@@ -16,7 +16,7 @@ import (
 
 const (
 	// LDAPRefreshPath is the path an authenticated user can POST to in order to
-	// trigger a rebuild of the LDAP user to group mapping.
+	// request a refresh (currently a stub).
 	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
 
 	// LDAPRefreshUserParam names the one user to refresh, for a caller who
@@ -47,8 +47,7 @@ type GroupAugmenter interface {
 //
 // The endpoint is a stub for now: it authenticates and authorises the caller,
 // then acknowledges the request without rebuilding anything. The mapping is
-// still rebuilt on the configured interval. Refresh and RefreshUser are kept
-// on GroupAugmenter for when the endpoint calls them again.
+// refreshed by the elected leader on the configured interval.
 func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath {
@@ -83,8 +82,7 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 		klog.V(2).Infof("LDAP refresh requested by %q (%s), which is not implemented yet",
 			requester.GetName(), remoteAddr)
 
-		// TODO: rebuild the mapping, or the one user named by
-		// LDAPRefreshUserParam, through Refresh and RefreshUser.
+		// TODO: refresh cached users through the same per-user machinery.
 		rw.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(rw).Encode(struct{}{}); err != nil {
 			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)
@@ -101,11 +99,6 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // the whole point of augmenting, and a user who is missing because a directory
 // is misconfigured would otherwise quietly regain whatever their identity
 // provider claimed for them.
-//
-// Being held in none of them can also just mean the directory gained them since
-// the last rebuild. Waiting out the interval is not the only way to pick that
-// up: the refresh endpoint takes a single user, so what changed can be
-// refreshed without everybody being searched for again.
 func (p *Proxy) augmentGroups(context ctx.Context, u user.Info, remoteAddr string) (user.Info, error) {
 	groups, ok, err := p.ldapDirectory.Resolve(context, u.GetName())
 	if err != nil {

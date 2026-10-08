@@ -85,7 +85,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
     "groupSearchBases": [%q]
   }],
   "refreshInterval": "1h",
-  "cache": {"type": "none", "namespace": "proxy", "scope": "main"}
+  "cache": {"namespace": "proxy", "scope": "main"}
 }`, primaryLDAP.URL(), bindDN, bindPassword, userBase, groupBase,
 		secondaryLDAP.URL(), bindDN, bindPassword, userBase, groupBase)
 	ldapConfigPath := writeFile(t, testDir, "ldap.json", []byte(ldapConfig))

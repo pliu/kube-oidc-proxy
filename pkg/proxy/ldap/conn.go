@@ -22,7 +22,6 @@ import (
 type conn interface {
 	StartTLS(*tls.Config) error
 	Bind(username, password string) error
-	SearchWithPaging(req *goldap.SearchRequest, pagingSize uint32) (*goldap.SearchResult, error)
 	Search(req *goldap.SearchRequest) (*goldap.SearchResult, error)
 	Close() error
 }
@@ -119,10 +118,6 @@ func (b *backend) timeLimit() int {
 // withConn dials the backend, runs fn against the bound connection, and
 // closes it. A directory that goes quiet is cut off by the watchdog, and the
 // resulting error is reported as the timeout it is.
-func (b *backend) withConn(fn func(conn) error) error {
-	return b.withConnContext(context.Background(), fn)
-}
-
 func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -160,10 +155,6 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 // Each connection is handed to the watchdog as soon as it exists, since a
 // directory that accepts the connection and then never answers the bind hangs
 // just as thoroughly as one that never answers a search.
-func (b *backend) connect(w *watchdog) (conn, error) {
-	return b.connectContext(context.Background(), w)
-}
-
 func (b *backend) connectContext(ctx context.Context, w *watchdog) (conn, error) {
 	var errs []string
 

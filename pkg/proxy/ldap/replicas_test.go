@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -124,7 +125,7 @@ func TestInterruptedWatchRelistsAndRemovesDeletedUser(t *testing.T) {
 	t.Fatal("relist retained deleted record")
 }
 
-func TestLeadershipHandoverCancelsOldLookup(t *testing.T) {
+func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	old, _ := userTestDirectory(t)
 	next, err := NewUserDirectory(old.resolver.config, old.store)
 	if err != nil {
@@ -157,6 +158,19 @@ func TestLeadershipHandoverCancelsOldLookup(t *testing.T) {
 	close(release)
 	if err := <-done; err == nil {
 		t.Fatal("old leadership cycle did not cancel")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		old.callsMu.Lock()
+		pending := len(old.calls)
+		old.callsMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("old lookup did not finish")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	saved, err := old.store.Get(context.Background(), "alice")
 	if err != nil || saved.Record.Groups[0] != "Current" {

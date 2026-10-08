@@ -126,12 +126,6 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 					return err
 				}
 
-				if ldapConfig.Cache == nil {
-					ldapConfig.Cache = &ldap.CacheConfig{}
-				}
-				if ldapConfig.Cache.Scope == "" {
-					ldapConfig.Cache.Scope = "main"
-				}
 				namespace := ldapConfig.Cache.Namespace
 				if namespace == "" {
 					namespace, err = cache.InClusterNamespace()

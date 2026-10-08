@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -98,5 +99,29 @@ func TestResolveIndependentUsersAndBackendFailure(t *testing.T) {
 	}
 	if d.Stats().Users != 0 {
 		t.Fatal("failed lookup was cached")
+	}
+}
+
+func TestCanceledRefreshWaiterDoesNotCancelSharedMiss(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		close(entered)
+		<-release
+		return connWithUsers(nil, map[string][]string{"alice": {}}), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	refresh := make(chan error, 1)
+	go func() { _, err := d.RefreshUser(ctx, "alice"); refresh <- err }()
+	<-entered
+	miss := make(chan error, 1)
+	go func() { _, _, err := d.Resolve(context.Background(), "alice"); miss <- err }()
+	cancel()
+	if err := <-refresh; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-miss; err != nil {
+		t.Fatalf("refresh waiter canceled shared work: %v", err)
 	}
 }

@@ -1,5 +1,19 @@
 # Per-user LDAP group cache refactor plan
 
+## Implementation status
+
+Sections 1–8 are implemented. Each remaining numbered step was committed and
+pushed separately. Verification includes per-user persistence and lifecycle tests,
+race-detector checks, two-replica miss/refresh conflicts with delayed watches,
+watch recovery/deletion, leadership handover, and an HTTP/OIDC/LDAP integration
+test comparing persisted memberships with forwarded and audited identities.
+
+Same-user coalescing and lookup concurrency are local to each replica.
+Cross-replica correctness uses ConfigMap create conflicts and resource-version
+updates; it permits duplicate LDAP queries. Unchanged-record timestamps are
+persisted at most hourly. Legacy snapshots are not imported. See
+[configuration and migration](ldap-group-augmentation.md) for rollout details.
+
 ## Intended behavior
 
 After a request successfully authenticates through OIDC, the proxy looks up the
@@ -25,9 +39,8 @@ records to the LDAP search configuration and username prefix. Unit tests cover
 round trips, empty/absent users, preservation of full group names, invalid
 documents, names, and configuration invalidation.
 
-These types are ready for the later storage and request-path steps. The active
-directory-wide snapshot still uses its legacy representation until those steps
-replace it; the new per-user format uses no compression or interning.
+These types are ready for the later storage and request-path steps. The legacy directory-wide snapshot has now been removed; the per-user
+format uses no compression or interning.
 
 Use one ConfigMap per normalized user identity within a configured cache scope.
 Keep the username, group names, whether LDAP found the user, a configuration

@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -40,7 +41,7 @@ func NewUserDirectory(config *Config, store cache.UserStore) (*UserDirectory, er
 	if store == nil {
 		return nil, fmt.Errorf("per-user LDAP cache requires ConfigMap persistence")
 	}
-	resolver, err := New(config, nil)
+	resolver, err := newResolver(config)
 	if err != nil {
 		return nil, err
 	}
@@ -114,10 +115,12 @@ func (d *UserDirectory) Run(stop <-chan struct{}) error {
 	}()
 	version, err := d.restoreUsers(d.ctx)
 	if err != nil {
+		d.cancel()
 		return err
 	}
 	stream, err := d.store.Watch(d.ctx, version)
 	if err != nil {
+		d.cancel()
 		return err
 	}
 	d.synced.Store(true)

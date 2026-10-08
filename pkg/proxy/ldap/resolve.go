@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -37,10 +38,6 @@ func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string,
 }
 
 func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (cache.UserEntry, bool, error) {
-	return d.resolveWork(ctx, key, refresh, d.ctx)
-}
-
-func (d *UserDirectory) resolveWork(ctx context.Context, key string, refresh bool, parent context.Context) (cache.UserEntry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return cache.UserEntry{}, false, err
 	}
@@ -50,10 +47,8 @@ func (d *UserDirectory) resolveWork(ctx context.Context, key string, refresh boo
 		call = &userCall{done: make(chan struct{})}
 		d.calls[key] = call
 		go func() {
-			work, cancel := context.WithTimeout(parent, d.resolver.config.LookupTimeout.Duration())
+			work, cancel := context.WithTimeout(d.ctx, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
-			stopShutdown := context.AfterFunc(d.ctx, cancel)
-			defer stopShutdown()
 			call.entry, call.changed, call.err = d.lookup(work, key, refresh)
 			d.callsMu.Lock()
 			delete(d.calls, key)

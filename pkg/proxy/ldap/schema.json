@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jetstack/kube-oidc-proxy/schemas/ldap-config.v1.json",
   "title": "kube-oidc-proxy LDAP configuration",
-  "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
+  "description": "LDAP membership lookup and per-user ConfigMap cache configuration.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,7 +11,7 @@
   ],
   "properties": {
     "backends": {
-      "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups.",
+      "description": "Query every backend for each uncached identity and union complete successful results.",
       "type": "array",
       "minItems": 1,
       "items": {
@@ -19,7 +19,7 @@
       }
     },
     "refreshInterval": {
-      "description": "How often the mapping is rebuilt from the directories.",
+      "description": "How often the elected leader refreshes cached users.",
       "$ref": "#/$defs/duration",
       "default": "10m"
     },
@@ -32,8 +32,19 @@
       }
     },
     "cache": {
-      "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup. Required: without a persisted mapping the proxy has nothing to fall back on and refuses to start while a directory is unreachable, so turning persistence off is stated explicitly with a type of 'none' rather than reached by leaving this out.",
+      "description": "Required per-user ConfigMap persistence scope.",
       "$ref": "#/$defs/cache"
+    },
+    "lookupTimeout": {
+      "$ref": "#/$defs/duration",
+      "default": "1m",
+      "description": "Total time for one lookup, including queueing, LDAP and persistence."
+    },
+    "lookupConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 8,
+      "description": "Maximum concurrent user LDAP lookups per replica. Each lookup queries all backends."
     }
   },
   "$defs": {
@@ -100,7 +111,7 @@
           "default": false
         },
         "timeout": {
-          "description": "How long this directory has to connect, bind and be searched before the rebuild is given up on and failed. A Go duration string.",
+          "description": "Bound connecting, binding and searching this backend for one user.",
           "$ref": "#/$defs/duration",
           "default": "5m"
         },
@@ -141,7 +152,7 @@
           "default": "(objectClass=group)"
         },
         "groupNameAttribute": {
-          "description": "Attribute of a group entry to use as the group name. The resulting emitted name must be unique within this backend; distinct LDAP groups with the same name make the rebuild fail rather than collapse into one Kubernetes RBAC identity.",
+          "description": "Full emitted group name attribute; must be unique within the backend.",
           "type": "string",
           "minLength": 1,
           "default": "cn"
@@ -152,106 +163,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type"
+        "scope"
       ],
       "properties": {
-        "type": {
-          "description": "How the mapping is persisted. 'none' disables persistence.",
-          "enum": [
-            "none",
-            "file",
-            "kubernetesSecret"
-          ]
-        },
-        "file": {
-          "description": "Configuration of the 'file' store. Required when type is 'file'.",
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "path"
-          ],
-          "properties": {
-            "path": {
-              "description": "Path the mapping is written to. The parent directory is created if needed, and the file is written atomically.",
-              "type": "string",
-              "minLength": 1
-            }
-          }
-        },
-        "kubernetesSecret": {
-          "description": "Configuration of the 'kubernetesSecret' store. Required when type is 'kubernetesSecret'. Only suits a directory whose mapping fits in the 1MiB the API server allows a Secret; use the 'file' store for anything larger.",
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "name"
-          ],
-          "properties": {
-            "name": {
-              "description": "Name of the Secret the mapping is written to. It is created if it does not exist.",
-              "type": "string",
-              "minLength": 1,
-              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
-            },
-            "namespace": {
-              "description": "Namespace of the Secret. Defaults to the namespace the proxy is running in.",
-              "type": "string",
-              "minLength": 1,
-              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-            },
-            "key": {
-              "description": "Key within the Secret holding the mapping.",
-              "type": "string",
-              "minLength": 1,
-              "pattern": "^[-._a-zA-Z0-9]+$",
-              "default": "mapping.json.gz"
-            }
-          }
-        },
         "namespace": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "description": "Defaults to the pod namespace."
         },
         "scope": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$",
+          "description": "Shared by replicas with identical LDAP and identity settings; separates unrelated caches."
         }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "type": {
-                "const": "file"
-              }
-            },
-            "required": [
-              "type"
-            ]
-          },
-          "then": {
-            "required": [
-              "file"
-            ]
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "type": {
-                "const": "kubernetesSecret"
-              }
-            },
-            "required": [
-              "type"
-            ]
-          },
-          "then": {
-            "required": [
-              "kubernetesSecret"
-            ]
-          }
-        }
-      ]
+      }
     }
   }
 }

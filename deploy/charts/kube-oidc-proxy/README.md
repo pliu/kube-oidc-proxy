@@ -155,3 +155,33 @@ service. The secret must be of `kubernetes.io/tls` type.
 tls:
   secretName: my-tls-secret-with-key-and-cert
 ```
+
+### LDAP per-user cache
+
+Set `ldap.enabled: true`, `ldap.cacheScope: main`, and configure
+`ldap.config.backends`. The chart supplies the ConfigMap namespace (release
+namespace by default) and grants the service account ConfigMap
+`get/list/watch/create/update` in that namespace. Set `ldap.cacheNamespace` to
+an existing dedicated namespace for isolation. Mount password/CA files using
+`extraVolumes` and `extraVolumeMounts`.
+
+```yaml
+ldap:
+  enabled: true
+  cacheScope: main
+  config:
+    lookupConcurrency: 8
+    lookupTimeout: 1m
+    refreshInterval: 10m
+    backends:
+      - name: corp
+        urls: [ldaps://ldap.example.net:636]
+        userSearchBases: ["OU=Users,DC=example,DC=net"]
+        groupSearchBases: ["OU=Groups,DC=example,DC=net"]
+```
+
+Replicas coalesce misses locally and coordinate writes through ConfigMap
+resource versions. Concurrency is per replica; the leader refreshes only cached
+users. ConfigMaps expose readable identities/memberships. Legacy file/Secret
+snapshots are not imported; the first uncached request requires LDAP access.
+See [LDAP configuration and migration](../../../docs/tasks/ldap-group-augmentation.md).

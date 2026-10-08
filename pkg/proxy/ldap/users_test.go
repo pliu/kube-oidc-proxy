@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -19,7 +20,7 @@ import (
 func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 	t.Helper()
 	config := testConfig()
-	config.Cache = &CacheConfig{Type: CacheTypeNone, Namespace: "proxy", Scope: "main"}
+	config.Cache = &CacheConfig{Namespace: "proxy", Scope: "main"}
 	client := fake.NewClientset()
 	var revision atomic.Int64
 	revision.Store(100)

@@ -1,3 +1,4 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
 import (
@@ -75,7 +76,7 @@ func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return
 				}
-				_, _, err := d.resolveWork(ctx, key, true, ctx)
+				_, _, err := d.resolve(ctx, key, true)
 				if err != nil {
 					mu.Lock()
 					failures = append(failures, err)

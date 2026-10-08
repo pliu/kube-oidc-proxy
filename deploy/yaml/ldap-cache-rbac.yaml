@@ -1,0 +1,24 @@
+# Apply when LDAP augmentation is enabled. The LDAP cache namespace must match.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-oidc-proxy-ldap-cache
+  namespace: kube-oidc-proxy
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-oidc-proxy-ldap-cache
+  namespace: kube-oidc-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-oidc-proxy-ldap-cache
+subjects:
+- kind: ServiceAccount
+  name: kube-oidc-proxy
+  namespace: kube-oidc-proxy

@@ -124,3 +124,15 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+# Optional LDAP augmentation with readable per-user ConfigMap persistence.
+ldap:
+  enabled: false
+  cacheScope: main
+  # Defaults to the release namespace. Use a dedicated namespace to isolate RBAC.
+  cacheNamespace: ""
+  # LDAP JSON settings, including backends, refreshInterval, lookupTimeout and
+  # lookupConcurrency. The chart supplies cache.scope and cache.namespace.
+  # Mount bindPasswordFile/caFile with extraVolumes and extraVolumeMounts.
+  config:
+    backends: []
