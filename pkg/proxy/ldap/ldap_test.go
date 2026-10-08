@@ -31,8 +31,7 @@ type fakeConn struct {
 	startTLSErr    error
 	startTLSConfig *tls.Config
 
-	bound  bool
-	closed bool
+	bound bool
 }
 
 func (f *fakeConn) StartTLS(config *tls.Config) error {
@@ -63,7 +62,6 @@ func (f *fakeConn) Search(req *goldap.SearchRequest) (*goldap.SearchResult, erro
 }
 
 func (f *fakeConn) Close() error {
-	f.closed = true
 	return nil
 }
 

@@ -9,11 +9,11 @@ import (
 func TestUserRecordCanonicalIdentity(t *testing.T) {
 	c := testConfig()
 	c.UsernamePrefix = "oidc:"
-	r, err := c.NewUserRecord("oidc:Alice@Example.net", true, []string{"Developers"}, time.Now())
+	r, err := c.NewUserRecord("oidc:alice@example.net", true, []string{"Developers"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Username != "alice@example.net" || r.ConfigurationFingerprint != c.UserRecordFingerprint() {
+	if r.Username != "oidc:alice@example.net" || r.ConfigurationFingerprint != c.UserRecordFingerprint() {
 		t.Fatalf("incorrect identity/configuration: %#v", r)
 	}
 }

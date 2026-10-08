@@ -9,7 +9,73 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
+	"k8s.io/client-go/kubernetes/fake"
 )
+
+func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
+	config := testConfig()
+	config.UsernamePrefix = "oidc:"
+	config.SetDefaults()
+	store, err := cache.NewConfigMaps(fake.NewClientset(), "proxy", "main", config.UserRecordFingerprint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewUserDirectory(config, store, func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.cancel)
+	var calls atomic.Int64
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		calls.Add(1)
+		return connWithUsers([]string{"PrefixedIdentity", "PlainIdentity"}, map[string][]string{
+			"oidc:alice": {"PrefixedIdentity"},
+			"alice":      {"PlainIdentity"},
+		}), nil
+	}
+	identities := []struct{ request, canonical, group string }{
+		{"oidc:oidc:Alice", "oidc:alice", "PrefixedIdentity"},
+		{"oidc:Alice", "alice", "PlainIdentity"},
+	}
+	check := func(directory *UserDirectory) {
+		t.Helper()
+		for _, identity := range identities {
+			groups, found, err := directory.Resolve(context.Background(), identity.request)
+			if err != nil || !found || !reflect.DeepEqual(groups, []string{identity.group}) {
+				t.Fatalf("resolve %q: groups=%v found=%t err=%v", identity.request, groups, found, err)
+			}
+			saved, err := store.Get(context.Background(), identity.canonical)
+			if err != nil || saved.Record == nil || saved.Record.Username != identity.canonical || !reflect.DeepEqual(saved.Record.Groups, groups) {
+				t.Fatalf("persisted %q: entry=%+v err=%v", identity.canonical, saved, err)
+			}
+		}
+	}
+	check(d)
+	check(d)
+	if calls.Load() != 2 {
+		t.Fatalf("cache hits queried LDAP: %d lookups", calls.Load())
+	}
+	if err := d.RefreshCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	check(d)
+	// A fresh replica must restore the same distinct identities without LDAP.
+	restored, err := NewUserDirectory(config, store, func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restored.cancel)
+	restored.resolver.backends[0].dial = func(string) (conn, error) {
+		t.Error("restored record queried LDAP")
+		return nil, errors.New("unexpected LDAP lookup")
+	}
+	if _, err := restored.restoreUsers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	check(restored)
+}
 
 func TestResolvePersistsAndCacheHitDoesNoIO(t *testing.T) {
 	d, client := userTestDirectory(t)

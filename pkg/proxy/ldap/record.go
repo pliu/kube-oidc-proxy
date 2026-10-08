@@ -19,8 +19,9 @@ func (c *Config) UserRecordFingerprint() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// NewUserRecord applies the same username canonicalization used by LDAP lookups.
-// Full group names are preserved in readable YAML.
+// NewUserRecord takes the canonical directory identity produced at the request
+// boundary. A raw LDAP username may itself begin with the OIDC prefix, so that
+// prefix must not be stripped again when creating or refreshing its record.
 func (c *Config) NewUserRecord(username string, found bool, groups []string, checkedAt time.Time) (*cache.UserRecord, error) {
-	return cache.NewUserRecord(usernameKey(username, c.UsernamePrefix), found, groups, c.UserRecordFingerprint(), checkedAt)
+	return cache.NewUserRecord(username, found, groups, c.UserRecordFingerprint(), checkedAt)
 }
