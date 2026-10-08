@@ -3,6 +3,7 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,5 +53,61 @@ func TestConfigMapRecords(t *testing.T) {
 	})
 	if _, err := store.Upsert(ctx, record, "old"); !apierrors.IsConflict(err) || calls != 1 {
 		t.Fatalf("%v calls=%d", err, calls)
+	}
+}
+
+func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
+	store, err := NewConfigMaps(fake.NewClientset(), "proxy", "main", "fingerprint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := NewUserRecord("alice", true, []string{"Developers"}, "fingerprint", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := EncodeUserRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := UserConfigMapName("main", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "42", Labels: map[string]string{ManagedLabel: "kube-oidc-proxy", ScopeLabel: "main"}}, Data: map[string]string{UserRecordKey: string(data)}}
+	if entry := store.Decode(base); entry.Invalid != nil || entry.Record == nil {
+		t.Fatalf("valid record rejected: %+v", entry)
+	}
+	tests := map[string]func(*corev1.ConfigMap){
+		"wrong object name": func(cm *corev1.ConfigMap) { cm.Name = "other" },
+		"wrong document identity": func(cm *corev1.ConfigMap) {
+			cm.Data[UserRecordKey] = strings.Replace(string(data), "username: alice", "username: bob", 1)
+		},
+		"uppercase identity with matching name": func(cm *corev1.ConfigMap) {
+			cm.Name, _ = UserConfigMapName("main", "Alice")
+			cm.Data[UserRecordKey] = strings.Replace(string(data), "username: alice", "username: Alice", 1)
+		},
+		"wrong configuration": func(cm *corev1.ConfigMap) {
+			cm.Data[UserRecordKey] = strings.Replace(string(data), "configurationFingerprint: fingerprint", "configurationFingerprint: other", 1)
+		},
+		"missing found": func(cm *corev1.ConfigMap) {
+			cm.Data[UserRecordKey] = strings.Replace(string(data), "found: true\n", "", 1)
+		},
+		"unknown field":    func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "unknown: true\n" },
+		"duplicate field":  func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "username: bob\n" },
+		"unmanaged object": func(cm *corev1.ConfigMap) { delete(cm.Labels, ManagedLabel) },
+		"different scope":  func(cm *corev1.ConfigMap) { cm.Labels[ScopeLabel] = "other" },
+	}
+	for name, change := range tests {
+		t.Run(name, func(t *testing.T) {
+			cm := base.DeepCopy()
+			change(cm)
+			entry := store.Decode(cm)
+			if entry.Invalid == nil || entry.Record != nil {
+				t.Fatalf("invalid record published: %+v", entry)
+			}
+			if entry.Name != cm.Name || entry.ResourceVersion != cm.ResourceVersion {
+				t.Fatal("invalid record lost its update preconditions")
+			}
+		})
 	}
 }

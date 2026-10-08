@@ -36,14 +36,10 @@ type UserRecord struct {
 func NewUserRecord(username string, found bool, groups []string, fingerprint string, checkedAt time.Time) (*UserRecord, error) {
 	r := &UserRecord{
 		Version: UserRecordVersion, Username: username, Found: found,
-		Groups: append([]string{}, groups...), ConfigurationFingerprint: fingerprint,
-		LastSuccessfulLookup: checkedAt.UTC(),
+		Groups: groups, ConfigurationFingerprint: fingerprint,
+		LastSuccessfulLookup: checkedAt,
 	}
-	if err := r.validate(); err != nil {
-		return nil, err
-	}
-	r.orderGroups()
-	return r, nil
+	return r.normalized()
 }
 
 func (r *UserRecord) validate() error {
@@ -81,13 +77,23 @@ func (r *UserRecord) orderGroups() {
 	r.Groups = unique
 }
 
-// EncodeUserRecord produces plain YAML with an explicit groups list, including
-// groups: [] for an empty result. It does not modify the record.
-func EncodeUserRecord(r *UserRecord) ([]byte, error) {
+// normalized validates once and returns an independent record with canonical
+// group ordering and UTC time. Neither the record nor its input slice changes.
+func (r *UserRecord) normalized() (*UserRecord, error) {
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
-	copy, err := NewUserRecord(r.Username, r.Found, r.Groups, r.ConfigurationFingerprint, r.LastSuccessfulLookup)
+	copy := *r
+	copy.Groups = append([]string{}, r.Groups...)
+	copy.LastSuccessfulLookup = r.LastSuccessfulLookup.UTC()
+	copy.orderGroups()
+	return &copy, nil
+}
+
+// EncodeUserRecord produces plain YAML with an explicit groups list, including
+// groups: [] for an empty result. It does not modify the record.
+func EncodeUserRecord(r *UserRecord) ([]byte, error) {
+	copy, err := r.normalized()
 	if err != nil {
 		return nil, err
 	}
@@ -98,29 +104,41 @@ func EncodeUserRecord(r *UserRecord) ([]byte, error) {
 // configuration. Callers must supply the canonical username, even when loading
 // an object whose name was derived from that username.
 func DecodeUserRecord(data []byte, username, fingerprint string) (*UserRecord, error) {
-	var r UserRecord
-	if err := yaml.UnmarshalStrict(data, &r); err != nil {
-		return nil, fmt.Errorf("decode user record: %w", err)
-	}
-	// Missing found must not silently become false, nor missing/null groups an
-	// empty membership result. Both fields describe a successful LDAP answer.
-	var required struct {
-		Found  *bool     `json:"found"`
-		Groups *[]string `json:"groups"`
-	}
-	if err := yaml.Unmarshal(data, &required); err != nil {
-		return nil, fmt.Errorf("decode user record fields: %w", err)
-	}
-	if required.Found == nil || required.Groups == nil {
-		return nil, fmt.Errorf("user record requires found and groups")
-	}
-	if err := r.validate(); err != nil {
+	r, err := decodeUserRecord(data, fingerprint)
+	if err != nil {
 		return nil, err
 	}
-	if r.Username != username || r.ConfigurationFingerprint != fingerprint {
+	if r.Username != username {
 		return nil, fmt.Errorf("user record identity or configuration does not match")
 	}
-	return NewUserRecord(r.Username, r.Found, r.Groups, r.ConfigurationFingerprint, r.LastSuccessfulLookup)
+	return r, nil
+}
+
+// decodeUserRecord parses the complete document once. Pointers distinguish
+// omitted/null required fields from valid false and empty-list values.
+func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
+	var document struct {
+		Version                  int       `json:"version"`
+		Username                 string    `json:"username"`
+		Found                    *bool     `json:"found"`
+		Groups                   *[]string `json:"groups"`
+		ConfigurationFingerprint string    `json:"configurationFingerprint"`
+		LastSuccessfulLookup     time.Time `json:"lastSuccessfulLookup"`
+	}
+	if err := yaml.UnmarshalStrict(data, &document); err != nil {
+		return nil, fmt.Errorf("decode user record: %w", err)
+	}
+	if document.Found == nil || document.Groups == nil {
+		return nil, fmt.Errorf("user record requires found and groups")
+	}
+	r := &UserRecord{
+		Version: document.Version, Username: document.Username, Found: *document.Found, Groups: *document.Groups,
+		ConfigurationFingerprint: document.ConfigurationFingerprint, LastSuccessfulLookup: document.LastSuccessfulLookup,
+	}
+	if r.ConfigurationFingerprint != fingerprint {
+		return nil, fmt.Errorf("user record identity or configuration does not match")
+	}
+	return r.normalized()
 }
 
 // UserConfigMapName hashes scope and canonical identity separately from LDAP

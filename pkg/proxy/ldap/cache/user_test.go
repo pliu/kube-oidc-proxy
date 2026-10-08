@@ -71,6 +71,8 @@ func TestUserRecordRejectsInvalidDocuments(t *testing.T) {
 		"version":             strings.Replace(valid, "version: 1", "version: 2", 1),
 		"missing version":     strings.Replace(valid, "version: 1\n", "", 1),
 		"missing found":       strings.Replace(valid, "found: true\n", "", 1),
+		"null found":          strings.Replace(valid, "found: true", "found: null", 1),
+		"wrong found type":    strings.Replace(valid, "found: true", "found: [true]", 1),
 		"missing groups":      strings.Replace(valid, "groups: [Developers]\n", "", 1),
 		"null groups":         strings.Replace(valid, "[Developers]", "null", 1),
 		"wrong groups type":   strings.Replace(valid, "[Developers]", "Developers", 1),
@@ -118,5 +120,34 @@ func TestUserConfigMapNames(t *testing.T) {
 	}
 	if _, err := UserConfigMapName("main", ""); err == nil {
 		t.Fatal("accepted empty username")
+	}
+}
+
+func TestEncodeUserRecordNormalizesWithoutMutation(t *testing.T) {
+	r, err := NewUserRecord("alice", true, nil, "fingerprint", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Groups = []string{"Z", "A", "Z"}
+	r.LastSuccessfulLookup = r.LastSuccessfulLookup.In(time.FixedZone("offset", 3600))
+	original := *r
+	original.Groups = append([]string{}, r.Groups...)
+	data, err := EncodeUserRecord(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(*r, original) {
+		t.Fatal("encoding mutated its input")
+	}
+	decoded, err := DecodeUserRecord(data, "alice", "fingerprint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded.Groups, []string{"A", "Z"}) || decoded.LastSuccessfulLookup.Location() != time.UTC {
+		t.Fatalf("encoding did not normalize: %+v", decoded)
+	}
+	r.Version++
+	if _, err := EncodeUserRecord(r); err == nil {
+		t.Fatal("encoding silently replaced an unsupported version")
 	}
 }

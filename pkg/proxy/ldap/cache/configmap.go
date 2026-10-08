@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	typed "k8s.io/client-go/kubernetes/typed/core/v1"
-	"sigs.k8s.io/yaml"
 )
 
 const ScopeLabel = "kube-oidc-proxy.jetstack.io/cache-scope"
@@ -66,20 +65,17 @@ func (s *ConfigMaps) Decode(cm *corev1.ConfigMap) UserEntry {
 		e.Invalid = fmt.Errorf("ConfigMap is outside managed cache scope")
 		return e
 	}
-	var identity struct {
-		Username string `json:"username"`
-	}
-	data := []byte(cm.Data[UserRecordKey])
-	if err := yaml.Unmarshal(data, &identity); err != nil {
+	record, err := decodeUserRecord([]byte(cm.Data[UserRecordKey]), s.fingerprint)
+	if err != nil {
 		e.Invalid = err
 		return e
 	}
-	name, err := UserConfigMapName(s.scope, identity.Username)
-	if err != nil || name != cm.Name || identity.Username != strings.ToLower(identity.Username) {
+	name, err := UserConfigMapName(s.scope, record.Username)
+	if err != nil || name != cm.Name || record.Username != strings.ToLower(record.Username) {
 		e.Invalid = fmt.Errorf("ConfigMap identity does not match its name")
 		return e
 	}
-	e.Record, e.Invalid = DecodeUserRecord(data, identity.Username, s.fingerprint)
+	e.Record = record
 	return e
 }
 
