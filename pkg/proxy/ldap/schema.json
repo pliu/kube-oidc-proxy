@@ -5,13 +5,18 @@
   "description": "Configuration of the LDAP backends that the groups of an authenticated request are augmented from, and of where the built mapping is persisted between restarts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["backends", "cache"],
+  "required": [
+    "backends",
+    "cache"
+  ],
   "properties": {
     "backends": {
       "description": "The directories to build the user to group mapping from. The mappings of every backend are merged, so a user present in more than one directory holds the union of their groups.",
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/backend" }
+      "items": {
+        "$ref": "#/$defs/backend"
+      }
     },
     "refreshInterval": {
       "description": "How often the mapping is rebuilt from the directories.",
@@ -21,7 +26,10 @@
     "refreshUsers": {
       "description": "Users allowed to trigger a refresh of the mapping. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may trigger one.",
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "cache": {
       "description": "Where the built mapping is persisted, so that the last known mapping can be served if the directories are unreachable at startup. Required: without a persisted mapping the proxy has nothing to fall back on and refuses to start while a directory is unreachable, so turning persistence off is stated explicitly with a type of 'none' rather than reached by leaving this out.",
@@ -31,13 +39,22 @@
   "$defs": {
     "duration": {
       "type": "string",
-      "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))*$",
-      "examples": ["30s", "10m", "1h30m"]
+      "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))*$",
+      "examples": [
+        "30s",
+        "10m",
+        "1h30m"
+      ]
     },
     "backend": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "urls", "userSearchBases", "groupSearchBases"],
+      "required": [
+        "name",
+        "urls",
+        "userSearchBases",
+        "groupSearchBases"
+      ],
       "properties": {
         "name": {
           "description": "Name of the backend. Used in logs, statistics and errors, and must be unique.",
@@ -48,7 +65,10 @@
           "description": "URL(s) of this directory. Tried in order until one can be connected to and bound.",
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "pattern": "^ldaps?://" }
+          "items": {
+            "type": "string",
+            "pattern": "^ldaps?://"
+          }
         },
         "bindDN": {
           "description": "DN to bind to the directory as. If unset, an anonymous bind is used.",
@@ -88,7 +108,10 @@
           "description": "Base DN(s) to search for users under.",
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "userFilter": {
           "description": "LDAP filter selecting user entries.",
@@ -106,7 +129,10 @@
           "description": "Base DN(s) to search for groups under. Only groups found under these bases are mapped onto users.",
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "groupFilter": {
           "description": "LDAP filter selecting group entries.",
@@ -125,17 +151,25 @@
     "cache": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "properties": {
         "type": {
           "description": "How the mapping is persisted. 'none' disables persistence.",
-          "enum": ["none", "file", "kubernetesSecret"]
+          "enum": [
+            "none",
+            "file",
+            "kubernetesSecret"
+          ]
         },
         "file": {
           "description": "Configuration of the 'file' store. Required when type is 'file'.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["path"],
+          "required": [
+            "path"
+          ],
           "properties": {
             "path": {
               "description": "Path the mapping is written to. The parent directory is created if needed, and the file is written atomically.",
@@ -148,7 +182,9 @@
           "description": "Configuration of the 'kubernetesSecret' store. Required when type is 'kubernetesSecret'. Only suits a directory whose mapping fits in the 1MiB the API server allows a Secret; use the 'file' store for anything larger.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["name"],
+          "required": [
+            "name"
+          ],
           "properties": {
             "name": {
               "description": "Name of the Secret the mapping is written to. It is created if it does not exist.",
@@ -170,16 +206,50 @@
               "default": "mapping.json.gz"
             }
           }
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "allOf": [
         {
-          "if": { "properties": { "type": { "const": "file" } }, "required": ["type"] },
-          "then": { "required": ["file"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "file"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "kubernetesSecret" } }, "required": ["type"] },
-          "then": { "required": ["kubernetesSecret"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "kubernetesSecret"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "kubernetesSecret"
+            ]
+          }
         }
       ]
     }

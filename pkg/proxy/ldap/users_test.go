@@ -9,6 +9,7 @@ import (
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -27,8 +28,24 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 		return false, nil, nil
 	})
 	client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
-		action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap).ResourceVersion = fmt.Sprint(revision.Add(1))
+		incoming := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+		obj, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), "proxy", incoming.Name)
+		if err != nil {
+			return true, nil, err
+		}
+		if incoming.ResourceVersion != obj.(*corev1.ConfigMap).ResourceVersion {
+			return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), incoming.Name, fmt.Errorf("resource version changed"))
+		}
+		incoming.ResourceVersion = fmt.Sprint(revision.Add(1))
 		return false, nil, nil
+	})
+	client.PrependReactor("list", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		obj, err := client.Tracker().List(corev1.SchemeGroupVersion.WithResource("configmaps"), corev1.SchemeGroupVersion.WithKind("ConfigMap"), "proxy")
+		if err != nil {
+			return true, nil, err
+		}
+		obj.(*corev1.ConfigMapList).ResourceVersion = fmt.Sprint(revision.Load())
+		return true, obj, nil
 	})
 	store, err := cache.NewConfigMaps(client, "proxy", "main", config.UserRecordFingerprint())
 	if err != nil {
@@ -96,7 +113,7 @@ func TestUserStartupAndWatch(t *testing.T) {
 		t.Fatalf("cache present != %v", want)
 	}
 	await(true)
-	cm.ResourceVersion = "11"
+	cm, _ = client.CoreV1().ConfigMaps("proxy").Get(context.Background(), e.Name, metav1.GetOptions{})
 	if _, err := client.CoreV1().ConfigMaps("proxy").Update(context.Background(), cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,4 +122,36 @@ func TestUserStartupAndWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	await(false)
+}
+
+func TestReplicasLearnCommittedMisses(t *testing.T) {
+	first, _ := userTestDirectory(t)
+	second, err := NewUserDirectory(first.resolver.config, first.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.cancel)
+	firstStop, secondStop := make(chan struct{}), make(chan struct{})
+	defer close(firstStop)
+	defer close(secondStop)
+	if err := first.Run(firstStop); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Run(secondStop); err != nil {
+		t.Fatal(err)
+	}
+	first.resolver.backends[0].dial = func(string) (conn, error) {
+		return connWithUsers([]string{"Shared"}, map[string][]string{"alice": {"Shared"}}), nil
+	}
+	if _, _, err := first.Resolve(context.Background(), "alice"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if e, ok := second.cached("alice"); ok && e.Record.Groups[0] == "Shared" {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("replica did not learn persisted miss")
 }

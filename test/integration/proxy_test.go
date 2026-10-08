@@ -2,17 +2,23 @@
 package integration
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"io"
+	corev1 "k8s.io/api/core/v1"
+	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sigs.k8s.io/yaml"
 	"sort"
 	"strings"
 	"sync"
@@ -43,7 +49,8 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create mock API server: %s", err)
 	}
-	apiServer := httptest.NewServer(apiHandler)
+	persistence := &cacheAPI{records: make(map[string]corev1.ConfigMap)}
+	apiServer := httptest.NewServer(persistence.wrap(apiHandler))
 	t.Cleanup(apiServer.Close)
 
 	oidcServer := httptest.NewUnstartedServer(nil)
@@ -78,7 +85,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
     "groupSearchBases": [%q]
   }],
   "refreshInterval": "1h",
-  "cache": {"type": "none"}
+  "cache": {"type": "none", "namespace": "proxy", "scope": "main"}
 }`, primaryLDAP.URL(), bindDN, bindPassword, userBase, groupBase,
 		secondaryLDAP.URL(), bindDN, bindPassword, userBase, groupBase)
 	ldapConfigPath := writeFile(t, testDir, "ldap.json", []byte(ldapConfig))
@@ -109,6 +116,8 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 `, oidcServer.URL, clientID, indent(issuerCA, "      "))
 	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
 
+	auditPath := filepath.Join(testDir, "audit.log")
+	policy := writeFile(t, testDir, "audit-policy.yaml", []byte("apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Metadata\n"))
 	command := app.NewRunCommand(proxyStop)
 	command.SetArgs([]string{
 		"--server=" + apiServer.URL,
@@ -120,14 +129,15 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		"--oidc-config-file=" + authnConfigPath,
 		"--leader-elect=false",
 		"--ldap-config-file=" + ldapConfigPath,
+		"--audit-policy-file=" + policy, "--audit-log-path=" + auditPath, "--audit-log-mode=blocking",
 	})
 
 	commandErr := make(chan error, 1)
 	go func() { commandErr <- command.Execute() }()
 
 	waitForReady(t, "http://127.0.0.1:"+readinessPort+"/ready", commandErr)
-	primaryLDAP.AssertRequests(t, 1, 1, 1)
-	secondaryLDAP.AssertRequests(t, 1, 1, 1)
+	primaryLDAP.AssertRequests(t, 0, 0, 0)
+	secondaryLDAP.AssertRequests(t, 0, 0, 0)
 
 	tokenPayload := []byte(fmt.Sprintf(`{
   "iss": %q,
@@ -179,8 +189,8 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	// built at startup until a refresh replaces it.
 	assertIdentity(t, request(http.MethodGet, apiPath),
 		"all-staff", "engineering", "platform-admins", "system:authenticated")
-	primaryLDAP.AssertRequests(t, 1, 1, 1)
-	secondaryLDAP.AssertRequests(t, 1, 1, 1)
+	primaryLDAP.AssertRequests(t, 1, 2, 1)
+	secondaryLDAP.AssertRequests(t, 1, 2, 1)
 
 	// The refresh endpoint is a stub for now: it answers, but does not search
 	// the directories again, so the mapping is unchanged.
@@ -189,12 +199,68 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		t.Fatalf("LDAP refresh response status = %d, want %d",
 			refreshResponse.StatusCode, http.StatusOK)
 	}
-	primaryLDAP.AssertRequests(t, 1, 1, 1)
-	secondaryLDAP.AssertRequests(t, 1, 1, 1)
+	primaryLDAP.AssertRequests(t, 1, 2, 1)
+	secondaryLDAP.AssertRequests(t, 1, 2, 1)
 
 	assertIdentity(t, request(http.MethodGet, apiPath),
 		"all-staff", "engineering", "platform-admins", "system:authenticated")
 
+	persistence.mu.Lock()
+	var persistedGroups []string
+	for _, cm := range persistence.records {
+		var identity struct {
+			Username                 string `json:"username"`
+			ConfigurationFingerprint string `json:"configurationFingerprint"`
+		}
+		// Decode with the configuration fingerprint carried by this generated record.
+		raw := []byte(cm.Data[cache.UserRecordKey])
+		var record cache.UserRecord
+		if err := yaml.Unmarshal(raw, &record); err != nil {
+			t.Fatal(err)
+		}
+		identity.Username = record.Username
+		identity.ConfigurationFingerprint = record.ConfigurationFingerprint
+		checked, err := cache.DecodeUserRecord(raw, identity.Username, identity.ConfigurationFingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persistedGroups = checked.Groups
+	}
+	persistence.mu.Unlock()
+	wantPersisted := []string{"all-staff", "engineering", "platform-admins"}
+	if !reflect.DeepEqual(persistedGroups, wantPersisted) {
+		t.Fatalf("persisted groups %v", persistedGroups)
+	}
+	file, err := os.Open(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	matched := false
+	for scanner.Scan() {
+		var event auditv1.Event
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.RequestURI != apiPath {
+			continue
+		}
+		groups := append([]string{}, event.User.Groups...)
+		sort.Strings(groups)
+		expected := append([]string{}, persistedGroups...)
+		sort.Strings(expected)
+		if !reflect.DeepEqual(groups, expected) {
+			t.Fatalf("audit groups %v differ from persisted %v", groups, expected)
+		}
+		matched = true
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("no audit event for forwarded request")
+	}
 	stopOnce.Do(func() { close(proxyStop) })
 	select {
 	case err := <-commandErr:

@@ -136,7 +136,9 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 	stop := context.AfterFunc(ctx, w.fire)
 	defer stop()
 
-	c, err := b.connect(w)
+	ctx, cancel := context.WithTimeout(ctx, b.config.Timeout.Duration())
+	defer cancel()
+	c, err := b.connectContext(ctx, w)
 	if err != nil {
 		return w.wrap(err)
 	}
@@ -144,6 +146,9 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 
 	err = w.wrap(fn(c))
 	if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("timed out after %s: %w", b.config.Timeout.Duration(), ctx.Err())
+		}
 		return ctx.Err()
 	}
 	return err
@@ -156,10 +161,14 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 // directory that accepts the connection and then never answers the bind hangs
 // just as thoroughly as one that never answers a search.
 func (b *backend) connect(w *watchdog) (conn, error) {
+	return b.connectContext(context.Background(), w)
+}
+
+func (b *backend) connectContext(ctx context.Context, w *watchdog) (conn, error) {
 	var errs []string
 
 	for _, rawURL := range b.config.URLs {
-		c, err := b.dial(rawURL)
+		c, err := b.dialContext(ctx, rawURL)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", rawURL, err))
 			continue
@@ -254,4 +263,30 @@ func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {
 	tlsConfig.RootCAs = pool
 
 	return tlsConfig, nil
+}
+
+// The dialer itself has a socket timeout. A canceled caller returns promptly;
+// a connection arriving after cancellation is closed rather than leaked.
+func (b *backend) dialContext(ctx context.Context, url string) (conn, error) {
+	type result struct {
+		c   conn
+		err error
+	}
+	ready := make(chan result)
+	go func() {
+		c, err := b.dial(url)
+		select {
+		case ready <- result{c, err}:
+		case <-ctx.Done():
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ready:
+		return r.c, r.err
+	}
 }

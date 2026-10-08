@@ -94,6 +94,9 @@ func (s *ConfigMaps) Get(ctx context.Context, username string) (UserEntry, error
 	if err != nil {
 		return UserEntry{}, err
 	}
+	if cm.Labels[ManagedLabel] != "kube-oidc-proxy" || cm.Labels[ScopeLabel] != s.scope {
+		return UserEntry{}, fmt.Errorf("refusing unmanaged ConfigMap %q", cm.Name)
+	}
 	return s.Decode(cm), nil
 }
 

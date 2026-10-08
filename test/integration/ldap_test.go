@@ -190,7 +190,21 @@ func (s *mockLDAPServer) handleSearch(conn net.Conn, messageID int64, request *b
 		}
 
 	default:
-		return fmt.Errorf("unexpected LDAP search base %q", base)
+		s.mu.Lock()
+		groups := append([]ldapGroup(nil), s.groups...)
+		s.mu.Unlock()
+		found := false
+		for _, group := range groups {
+			if base == group.dn {
+				found = true
+				if err := writeLDAPMessage(conn, messageID, searchEntry(group.dn, map[string][]string{"cn": {group.name}})); err != nil {
+					return err
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf("unexpected LDAP search base %q", base)
+		}
 	}
 
 	return writeLDAPMessage(conn, messageID, ldapResult(goldap.ApplicationSearchResultDone))

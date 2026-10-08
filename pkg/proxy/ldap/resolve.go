@@ -52,6 +52,8 @@ func (d *UserDirectory) resolveWork(ctx context.Context, key string, refresh boo
 		go func() {
 			work, cancel := context.WithTimeout(parent, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
+			stopShutdown := context.AfterFunc(d.ctx, cancel)
+			defer stopShutdown()
 			call.entry, call.changed, call.err = d.lookup(work, key, refresh)
 			d.callsMu.Lock()
 			delete(d.calls, key)
@@ -81,7 +83,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 	}
 	if err == nil && previous.Invalid == nil && !refresh {
 		d.apply(previous, false)
-		return previous, false, nil
+		return d.committed(key, false)
 	}
 	select {
 	case <-ctx.Done():
@@ -102,10 +104,12 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		d.apply(previous, false)
 		d.mu.Lock()
 		cell := d.users[previous.Name]
-		cell.checked = record.LastSuccessfulLookup
+		if cell.entry.ResourceVersion == previous.ResourceVersion {
+			cell.checked = record.LastSuccessfulLookup
+		}
 		d.users[previous.Name] = cell
 		d.mu.Unlock()
-		return previous, false, nil
+		return d.committed(key, false)
 	}
 	committed, err := d.store.Upsert(ctx, record, previous.ResourceVersion)
 	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
@@ -120,10 +124,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 	}
 	d.apply(committed, false)
 	// Watch may already have delivered an even newer record.
-	if current, ok := d.cached(key); ok {
-		committed = current
-	}
-	return committed, changed, nil
+	return d.committed(key, changed)
 }
 
 func (d *UserDirectory) CanRefresh(username string) bool { return d.resolver.CanRefresh(username) }
@@ -155,4 +156,11 @@ func (d *UserDirectory) Stats() *Stats {
 	}
 	result.Groups = len(groups)
 	return result
+}
+
+func (d *UserDirectory) committed(key string, changed bool) (cache.UserEntry, bool, error) {
+	if current, ok := d.cached(key); ok {
+		return current, changed, nil
+	}
+	return cache.UserEntry{}, false, fmt.Errorf("cache record changed or was deleted while resolving %q", key)
 }
