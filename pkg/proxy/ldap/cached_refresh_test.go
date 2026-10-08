@@ -3,6 +3,8 @@ package ldap
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,7 +56,14 @@ func TestPeriodicRefreshRequiresLeadership(t *testing.T) {
 		t.Fatal(err)
 	}
 	var leading atomic.Bool
-	d.isLeader = leading.Load
+	term, cancelTerm := context.WithCancel(context.Background())
+	defer cancelTerm()
+	d.leadership = func() context.Context {
+		if leading.Load() {
+			return term
+		}
+		return nil
+	}
 	go d.runRefresh()
 	time.Sleep(50 * time.Millisecond)
 	if calls.Load() != 1 {
@@ -68,5 +77,86 @@ func TestPeriodicRefreshRequiresLeadership(t *testing.T) {
 	if calls.Load() == 1 {
 		t.Fatal("leader never refreshed")
 	}
-	leading.Store(false)
+	cancelTerm()
+}
+
+func TestLeadershipLossStopsRefreshWithoutCancelingSharedLookup(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	d.resolver.config.LookupConcurrency = 1
+	d.apply(userTestEntry(t, d, "1", "Old"), false)
+	term, cancelTerm := context.WithCancel(context.Background())
+	defer cancelTerm()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		close(entered)
+		<-release
+		return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
+	}
+	cycleDone := make(chan error, 1)
+	go func() { cycleDone <- d.refreshWhileLeader(term) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh never started")
+	}
+	cancelTerm()
+	select {
+	case err := <-cycleDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("leadership loss returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh waited for LDAP after leadership loss")
+	}
+	// Work admitted by the old term must remain alive and finish its commit.
+	d.callsMu.Lock()
+	call := d.calls["alice"]
+	d.callsMu.Unlock()
+	if call == nil {
+		t.Fatal("leadership loss canceled shared work")
+	}
+	unblock()
+	select {
+	case <-call.done:
+		if call.err != nil {
+			t.Fatalf("shared lookup was canceled: %v", call.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shared lookup never completed")
+	}
+
+	groups, found, err := d.Resolve(context.Background(), "alice")
+	if err != nil || !found || len(groups) != 1 || groups[0] != "New" {
+		t.Fatalf("shared result lost: %v %t %v", groups, found, err)
+	}
+}
+
+func TestReplicaShutdownCancelsRefreshWait(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	d.apply(userTestEntry(t, d, "1000", "Old"), false)
+	entered := make(chan struct{})
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		close(entered)
+		<-d.ctx.Done()
+		return nil, d.ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.refreshWhileLeader(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh never started")
+	}
+	d.cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("shutdown returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not stop refresh waiting")
+	}
 }

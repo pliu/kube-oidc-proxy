@@ -127,7 +127,8 @@ user LDAP lookups can run cluster-wide; each queries all configured backends.
 
 The elected leader snapshots only cached users each cycle, refreshing with
 bounded concurrency and committing each independently. Users added during a
-cycle join the next one. Leadership loss stops scheduling and waiting for the cycle. Shared in-flight
+cycle join the next one. The election library cancels a context when leadership
+ends; that event directly stops scheduling and waiting for the cycle. Shared in-flight
 lookups retain their independent timeout so another waiter is not canceled;
 optimistic writes protect overlapping operations during handover.
 

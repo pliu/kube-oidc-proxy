@@ -23,33 +23,33 @@ type userCell struct {
 // UserDirectory serves per-user persisted records. Its map lock protects only
 // memory; LDAP and Kubernetes work happen outside it.
 type UserDirectory struct {
-	isLeader func() bool
-	callsMu  sync.Mutex
-	calls    map[string]*userCall
-	resolver *resolver
-	store    cache.UserStore
-	mu       sync.RWMutex
-	users    map[string]userCell // keyed by deterministic object name, including tombstones
-	synced   atomic.Bool
-	ctx      context.Context
-	cancel   context.CancelFunc
+	leadership func() context.Context
+	callsMu    sync.Mutex
+	calls      map[string]*userCall
+	resolver   *resolver
+	store      cache.UserStore
+	mu         sync.RWMutex
+	users      map[string]userCell // keyed by deterministic object name, including tombstones
+	synced     atomic.Bool
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-// NewUserDirectory refreshes cached users periodically only while isLeader
-// reports that this replica holds the leader election Lease.
-func NewUserDirectory(config *Config, store cache.UserStore, isLeader func() bool) (*UserDirectory, error) {
+// NewUserDirectory refreshes cached users periodically only during the live
+// leadership term returned by leadership; nil denotes a follower.
+func NewUserDirectory(config *Config, store cache.UserStore, leadership func() context.Context) (*UserDirectory, error) {
 	if store == nil {
 		return nil, fmt.Errorf("per-user LDAP cache requires ConfigMap persistence")
 	}
-	if isLeader == nil {
-		return nil, fmt.Errorf("per-user LDAP cache requires a leader election check")
+	if leadership == nil {
+		return nil, fmt.Errorf("per-user LDAP cache requires a leadership context provider")
 	}
 	resolver, err := newResolver(config)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UserDirectory{isLeader: isLeader, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), ctx: ctx, cancel: cancel}, nil
+	return &UserDirectory{leadership: leadership, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), ctx: ctx, cancel: cancel}, nil
 }
 
 // Core Kubernetes ConfigMap resource versions are monotonically increasing

@@ -116,6 +116,10 @@ func TestLeadershipIsHandedOverOnShutdown(t *testing.T) {
 	firstDone := first.Run(firstStop)
 
 	waitFor(t, "the first replica to lead", first.IsLeader)
+	term := first.LeadershipContext()
+	if term == nil {
+		t.Fatal("leader did not expose its term")
+	}
 
 	second := newTestElector(t, client)
 	secondStop := make(chan struct{})
@@ -137,6 +141,33 @@ func TestLeadershipIsHandedOverOnShutdown(t *testing.T) {
 	if first.IsLeader() {
 		t.Error("expected a replica that has shut down not to report itself leader")
 	}
+	select {
+	case <-term.Done():
+	default:
+		t.Error("shutdown did not cancel the leadership term")
+	}
 
 	waitFor(t, "the second replica to take over", second.IsLeader)
+}
+
+func TestCanceledTermCannotReplaceLiveLeadership(t *testing.T) {
+	e := newTestElector(t, fake.NewClientset())
+	stale, cancelStale := context.WithCancel(context.Background())
+	cancelStale()
+	if e.startLeading(stale) || e.IsLeader() {
+		t.Fatal("published an already-ended term")
+	}
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	if !e.startLeading(live) {
+		t.Fatal("rejected live term")
+	}
+	if e.startLeading(stale) || e.LeadershipContext() != live {
+		t.Fatal("late callback replaced live leadership")
+	}
+	cancelLive()
+	if e.LeadershipContext() != nil || e.IsLeader() {
+		t.Fatal("canceled term still reports leadership")
+	}
+	e.stopLeading()
 }

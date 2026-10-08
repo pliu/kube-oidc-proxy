@@ -22,7 +22,7 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := NewUserDirectory(config, store, func() bool { return false })
+	d, err := NewUserDirectory(config, store, func() context.Context { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 	}
 	check(d)
 	// A fresh replica must restore the same distinct identities without LDAP.
-	restored, err := NewUserDirectory(config, store, func() bool { return false })
+	restored, err := NewUserDirectory(config, store, func() context.Context { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

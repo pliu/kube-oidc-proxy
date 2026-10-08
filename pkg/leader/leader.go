@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,9 +47,10 @@ type Config struct {
 // serving requests whether or not it leads: leading is something to ask
 // about, not a precondition for running.
 type Elector struct {
-	elector  *leaderelection.LeaderElector
-	identity string
-	leading  atomic.Bool
+	elector    *leaderelection.LeaderElector
+	identity   string
+	mu         sync.RWMutex
+	leadership context.Context
 }
 
 // New prepares an Elector. Nothing contends for the Lease until Run.
@@ -83,19 +83,20 @@ func New(client kubernetes.Interface, config Config) (*Elector, error) {
 		ReleaseOnCancel: true,
 
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(context.Context) {
+			OnStartedLeading: func(ctx context.Context) {
+				if !e.startLeading(ctx) {
+					return
+				}
 				klog.Infof("became leader, holding Lease %s/%s as %q",
 					config.Namespace, config.Name, identity)
-				e.setLeading(true)
 			},
 			OnStoppedLeading: func() {
 				// Called on every exit from a round, led or not, so only a
 				// replica that was leading has anything to say.
-				if e.leading.Load() {
+				if e.stopLeading() {
 					klog.Infof("stopped leading, no longer holding Lease %s/%s",
 						config.Namespace, config.Name)
 				}
-				e.setLeading(false)
 			},
 			OnNewLeader: func(leader string) {
 				if leader != identity {
@@ -149,7 +150,7 @@ func (e *Elector) Run(stopCh <-chan struct{}) <-chan struct{} {
 
 // IsLeader reports whether this replica currently holds the Lease.
 func (e *Elector) IsLeader() bool {
-	return e.leading.Load()
+	return e.LeadershipContext() != nil
 }
 
 // Identity is what this replica records in the Lease when it holds it.
@@ -157,14 +158,38 @@ func (e *Elector) Identity() string {
 	return e.identity
 }
 
-func (e *Elector) setLeading(leading bool) {
-	e.leading.Store(leading)
-
-	if leading {
-		isLeader.Set(1)
-	} else {
-		isLeader.Set(0)
+// LeadershipContext returns the current leadership term, or nil for a follower.
+// The election library cancels the context as soon as that term ends. Consumers
+// should retain it for the duration of their work rather than poll IsLeader.
+func (e *Elector) LeadershipContext() context.Context {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.leadership == nil || e.leadership.Err() != nil {
+		return nil
 	}
+	return e.leadership
+}
+
+func (e *Elector) startLeading(ctx context.Context) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// OnStartedLeading is asynchronous; an old callback must not publish a
+	// canceled term over a newer one or after shutdown.
+	if ctx.Err() != nil {
+		return false
+	}
+	e.leadership = ctx
+	isLeader.Set(1)
+	return true
+}
+
+func (e *Elector) stopLeading() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	led := e.leadership != nil
+	e.leadership = nil
+	isLeader.Set(0)
+	return led
 }
 
 // newIdentity names this replica in the Lease. The hostname is the pod name,

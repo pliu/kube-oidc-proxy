@@ -18,34 +18,25 @@ func (d *UserDirectory) runRefresh() {
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
-			if !d.isLeader() {
+			term := d.leadership()
+			if term == nil || term.Err() != nil {
 				continue
 			}
-			cycle, cancel := context.WithCancel(d.ctx)
-			monitorDone := make(chan struct{})
-			go func() {
-				defer close(monitorDone)
-				poll := time.NewTicker(100 * time.Millisecond)
-				defer poll.Stop()
-				for {
-					select {
-					case <-cycle.Done():
-						return
-					case <-poll.C:
-						if !d.isLeader() {
-							cancel()
-							return
-						}
-					}
-				}
-			}()
-			if err := d.RefreshCached(cycle); err != nil {
+			if err := d.refreshWhileLeader(term); err != nil && term.Err() == nil && d.ctx.Err() == nil {
 				klog.Errorf("LDAP cached-user refresh: %v", err)
 			}
-			cancel()
-			<-monitorDone
 		}
 	}
+}
+
+// Leadership loss or replica shutdown cancels scheduling and waiting, while
+// shared lookups retain the independent lifetime owned by resolve.
+func (d *UserDirectory) refreshWhileLeader(term context.Context) error {
+	cycle, cancel := context.WithCancel(term)
+	defer cancel()
+	stop := context.AfterFunc(d.ctx, cancel)
+	defer stop()
+	return d.RefreshCached(cycle)
 }
 
 // RefreshCached snapshots only known users. Each record commits independently;

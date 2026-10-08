@@ -159,7 +159,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 					return err
 				}
 				// Only the leader refreshes cached users periodically.
-				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache, elector.IsLeader)
+				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache, elector.LeadershipContext)
 				if err != nil {
 					return err
 				}

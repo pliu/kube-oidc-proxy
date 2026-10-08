@@ -52,7 +52,7 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := NewUserDirectory(config, store, func() bool { return false })
+	d, err := NewUserDirectory(config, store, func() context.Context { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestUserStartupAndWatch(t *testing.T) {
 
 func TestReplicasLearnCommittedMisses(t *testing.T) {
 	first, _ := userTestDirectory(t)
-	second, err := NewUserDirectory(first.resolver.config, first.store, first.isLeader)
+	second, err := NewUserDirectory(first.resolver.config, first.store, first.leadership)
 	if err != nil {
 		t.Fatal(err)
 	}
