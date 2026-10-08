@@ -2,6 +2,7 @@
 package ldap
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -119,12 +120,21 @@ func (b *backend) timeLimit() int {
 // closes it. A directory that goes quiet is cut off by the watchdog, and the
 // resulting error is reported as the timeout it is.
 func (b *backend) withConn(fn func(conn) error) error {
+	return b.withConnContext(context.Background(), fn)
+}
+
+func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// A directory that accepts a connection and then stops answering would
 	// otherwise hold a refresh here for as long as the process runs: go-ldap
 	// waits for a response on a channel with no deadline of its own, so
 	// closing the connection under it is the only way back out.
 	w := newWatchdog(b.config.Timeout.Duration())
 	defer w.stop()
+	stop := context.AfterFunc(ctx, w.fire)
+	defer stop()
 
 	c, err := b.connect(w)
 	if err != nil {
@@ -132,7 +142,11 @@ func (b *backend) withConn(fn func(conn) error) error {
 	}
 	defer c.Close()
 
-	return w.wrap(fn(c))
+	err = w.wrap(fn(c))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // connect dials the configured URLs in order, returning the first connection

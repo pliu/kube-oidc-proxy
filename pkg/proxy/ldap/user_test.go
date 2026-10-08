@@ -395,7 +395,7 @@ func TestRefreshUserRefusesTooManyMissingGroups(t *testing.T) {
 		t.Fatal("expected an error for a mapping this far out of date, got none")
 	}
 
-	if exp := "refresh the whole mapping rather than one user"; !strings.Contains(err.Error(), exp) {
+	if exp := "single-user lookup exceeds the limit"; !strings.Contains(err.Error(), exp) {
 		t.Errorf("expected an error containing %q, got %q", exp, err)
 	}
 }

@@ -2,7 +2,7 @@
 package ldap
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"strings"
 
@@ -18,7 +18,7 @@ const (
 	// maxGroupDiscoveries bounds the groups one refresh of a user will look up
 	// individually, so that a mapping far enough out of date cannot turn
 	// refreshing one user into a search per group they hold.
-	maxGroupDiscoveries = 100
+	maxGroupDiscoveries = 1000
 
 	// kubernetesSystemGroupPrefix is reserved by Kubernetes for built-in
 	// groups such as system:masters. Impersonating a caller as a member of
@@ -235,13 +235,17 @@ func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
 // whatever the other one gives them, which is worse than leaving the mapping
 // as it was.
 func (d *Directory) searchUser(key string) ([]string, bool, error) {
+	return d.searchUserContext(context.Background(), key)
+}
+
+func (d *Directory) searchUserContext(ctx context.Context, key string) ([]string, bool, error) {
 	type foundUser struct {
 		groups []string
 		found  bool
 	}
 
 	results, err := eachBackend(d.backends, func(b *backend) (foundUser, error) {
-		groups, found, err := b.searchUser(key)
+		groups, found, err := b.searchUserContext(ctx, key)
 		return foundUser{groups: groups, found: found}, err
 	})
 	if err != nil {
@@ -272,21 +276,18 @@ func (d *Directory) searchUser(key string) ([]string, bool, error) {
 // hold in it. The second return value reports whether the backend holds them
 // at all.
 //
-// The groups they are a member of are resolved against the group names of the
-// last rebuild rather than by sweeping the group search bases again, which is
-// most of what makes refreshing one user cheaper than rebuilding everybody. A
-// group the last rebuild did not find is looked up on its own - see
-// discoverGroup, and the reason a refresh would be useless without it.
+// Membership DNs are resolved directly; no directory sweep is required.
 func (b *backend) searchUser(username string) ([]string, bool, error) {
-	groupNames := b.lastGroupNames.Load()
-	if groupNames == nil {
-		return nil, false, errors.New("has not been searched yet, so there are no groups to resolve against")
-	}
+	return b.searchUserContext(context.Background(), username)
+}
+
+func (b *backend) searchUserContext(ctx context.Context, username string) ([]string, bool, error) {
+	groupNames := make(map[string]string)
 
 	var groups []string
 	var claimedBy string
 
-	err := b.withConn(func(c conn) error {
+	err := b.withConnContext(ctx, func(c conn) error {
 		// The username is a value from an authenticated request, so it reaches the
 		// filter escaped: a name carrying parentheses or an asterisk must not be
 		// able to widen the search it appears in.
@@ -328,7 +329,7 @@ func (b *backend) searchUser(username string) ([]string, bool, error) {
 				claimedBy = entry.DN
 
 				var err error
-				groups, err = b.groupsOf(c, entry, *groupNames, b.discoverGroup(c, *groupNames))
+				groups, err = b.groupsOf(c, entry, groupNames, b.discoverGroup(c, groupNames))
 				if err != nil {
 					return err
 				}
@@ -348,20 +349,8 @@ func (b *backend) searchUser(username string) ([]string, bool, error) {
 	return groups, true, nil
 }
 
-// discoverGroup answers for a group the last rebuild did not find.
-//
-// Adding a user to a group that was created since then is the change somebody
-// is most likely to be asking to have picked up, so resolving their membership
-// only against what that rebuild found would leave the refresh doing nothing in
-// the case it exists for. The group is looked up on its own instead, which is
-// one search for a DN rather than another sweep of the search bases.
-//
-// It is held to the same rules the sweep holds a group to: it must live under a
-// configured group search base, match the group filter, carry a name, not use
-// the reserved system: prefix, and not collide with the name of a group already
-// in the mapping. A DN that fails any of those is left out, exactly as it would
-// have been by a rebuild - except a collision, which fails the refresh as it
-// fails a rebuild, since there is no answer to give.
+// discoverGroup resolves membership DNs within configured bases and filters.
+// The per-lookup map also detects ambiguous group names.
 func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(string, string) (string, error) {
 	var discovered int
 
@@ -374,13 +363,9 @@ func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(strin
 			return "", nil
 		}
 
-		// A refresh that has to discover this many groups is looking at a
-		// mapping too far out of date for one user to be the right unit of
-		// work, and would be searching the directory once per group to catch
-		// up. Say so rather than quietly returning some of them.
+		// Fail the complete lookup when its work limit is exceeded.
 		if discovered == maxGroupDiscoveries {
-			return "", fmt.Errorf("more than %d groups of %q are missing from the last rebuild, "+
-				"so refresh the whole mapping rather than one user", maxGroupDiscoveries, groupDN)
+			return "", fmt.Errorf("single-user lookup exceeds the limit of %d group resolutions at %q", maxGroupDiscoveries, groupDN)
 		}
 		discovered++
 
@@ -420,8 +405,28 @@ func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(strin
 			}
 		}
 
-		klog.V(2).Infof("group %q of backend %q was created since the last rebuild, mapping it to %q",
-			groupDN, b.config.Name, name)
+		// Check ambiguity by exact emitted name, without enumerating groups.
+		for _, base := range b.config.GroupSearchBases {
+			filter := fmt.Sprintf("(&%s(%s=%s))", b.config.GroupFilter, b.config.GroupNameAttribute, goldap.EscapeFilter(name))
+			matches, err := c.Search(goldap.NewSearchRequest(base, goldap.ScopeWholeSubtree, goldap.NeverDerefAliases,
+				2, b.timeLimit(), false, filter, []string{b.config.GroupNameAttribute}, nil))
+			if err != nil {
+				return "", fmt.Errorf("check group identity %q: %w", name, err)
+			}
+			for _, candidate := range matches.Entries {
+				if attributeValue(candidate, b.config.GroupNameAttribute) != name {
+					continue
+				}
+				candidateKey, err := normaliseDN(candidate.DN)
+				if err != nil {
+					return "", err
+				}
+				if candidateKey != key {
+					return "", &duplicateGroupError{name: name, first: candidate.DN, second: groupDN}
+				}
+			}
+		}
+		groupNames[key] = name
 
 		return name, nil
 	}

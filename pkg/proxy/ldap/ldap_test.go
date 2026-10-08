@@ -145,6 +145,8 @@ func connWithUsers(groups []string, users map[string][]string) *fakeConn {
 	c := &fakeConn{entries: map[string][]*goldap.Entry{}}
 
 	for _, group := range groups {
+		dn := "CN=" + group + ",OU=Groups,DC=example,DC=net"
+		c.entries[dn] = []*goldap.Entry{entry(dn, map[string][]string{"cn": {group}})}
 		c.entries["OU=Groups,DC=example,DC=net"] = append(c.entries["OU=Groups,DC=example,DC=net"],
 			entry("CN="+group+",OU=Groups,DC=example,DC=net", map[string][]string{"cn": {group}}))
 	}
