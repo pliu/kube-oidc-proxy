@@ -22,7 +22,7 @@ func TestConfigMapRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, _ := NewUserRecord("alice", true, []string{"Full Group Name"}, "fingerprint", time.Now())
+	record, _ := NewUserRecord("alice", []string{"Full Group Name"}, "fingerprint", time.Now())
 	if _, err := store.Get(ctx, "alice"); err != ErrNotFound {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := NewUserRecord("alice", true, []string{"Developers"}, "fingerprint", time.Now())
+	record, err := NewUserRecord("alice", []string{"Developers"}, "fingerprint", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +89,8 @@ func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
 		"wrong configuration": func(cm *corev1.ConfigMap) {
 			cm.Data[UserRecordKey] = strings.Replace(string(data), "configurationFingerprint: fingerprint", "configurationFingerprint: other", 1)
 		},
-		"missing found": func(cm *corev1.ConfigMap) {
-			cm.Data[UserRecordKey] = strings.Replace(string(data), "found: true\n", "", 1)
+		"missing groups": func(cm *corev1.ConfigMap) {
+			cm.Data[UserRecordKey] = strings.Replace(string(data), "groups:\n- Developers\n", "", 1)
 		},
 		"unknown field":    func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "unknown: true\n" },
 		"duplicate field":  func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "username: bob\n" },

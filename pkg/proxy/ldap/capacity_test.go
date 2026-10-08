@@ -67,7 +67,7 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 			d.apply(userTestEntry(t, d, "1000", "CachedGroup"), false)
 			results := make(chan error, 2)
 			for _, key := range []string{"bob", "carol"} {
-				go func() { _, _, err := d.Resolve(context.Background(), key); results <- err }()
+				go func() { _, err := d.Resolve(context.Background(), key); results <- err }()
 			}
 			for i := 0; i < 2; i++ {
 				select {
@@ -82,7 +82,7 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_, _, err := d.Resolve(context.Background(), fmt.Sprintf("new-%d", i))
+					_, err := d.Resolve(context.Background(), fmt.Sprintf("new-%d", i))
 					if !errors.Is(err, ErrLookupCapacity) {
 						t.Errorf("overload returned %v", err)
 					}
@@ -92,13 +92,13 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 			if store.gets.Load() != 2 {
 				t.Fatalf("overload caused extra reads: %d", store.gets.Load())
 			}
-			groups, found, err := d.Resolve(context.Background(), "alice")
-			if err != nil || !found || len(groups) != 1 || groups[0] != "CachedGroup" {
-				t.Fatalf("saturation blocked memory hit: %v %t %v", groups, found, err)
+			groups, err := d.Resolve(context.Background(), "alice")
+			if err != nil || len(groups) != 1 || groups[0] != "CachedGroup" {
+				t.Fatalf("saturation blocked memory hit: %v %v", groups, err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
-			if _, _, err := d.Resolve(ctx, "bob"); !errors.Is(err, context.DeadlineExceeded) {
+			if _, err := d.Resolve(ctx, "bob"); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("same-user waiter could not join: %v", err)
 			}
 			unblock()
@@ -112,7 +112,7 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 					t.Fatal("admitted lookup did not complete")
 				}
 			}
-			if _, _, err := d.Resolve(context.Background(), "later"); err != nil {
+			if _, err := d.Resolve(context.Background(), "later"); err != nil {
 				t.Fatalf("capacity was not released: %v", err)
 			}
 		})
@@ -141,9 +141,9 @@ func TestRefreshHasSeparateCapacity(t *testing.T) {
 	}
 
 	results := make(chan error, 2)
-	go func() { _, _, err := d.Resolve(context.Background(), "bob"); results <- err }()
+	go func() { _, err := d.Resolve(context.Background(), "bob"); results <- err }()
 	entered("request lookup")
-	if _, _, err := d.Resolve(context.Background(), "carol"); !errors.Is(err, ErrLookupCapacity) {
+	if _, err := d.Resolve(context.Background(), "carol"); !errors.Is(err, ErrLookupCapacity) {
 		t.Fatalf("request limit not enforced: %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestRefreshHasSeparateCapacity(t *testing.T) {
 			t.Fatal("admitted lookup did not complete")
 		}
 	}
-	if _, _, err := d.Resolve(context.Background(), "later"); err != nil {
+	if _, err := d.Resolve(context.Background(), "later"); err != nil {
 		t.Fatalf("request capacity was not released: %v", err)
 	}
 	if _, err := d.resolve(context.Background(), "later-refresh", true); err != nil {

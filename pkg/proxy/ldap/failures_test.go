@@ -21,7 +21,7 @@ func TestPersistenceFailureDoesNotPublish(t *testing.T) {
 		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}}), nil
 	}
 	client.PrependReactor("create", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) { return true, nil, errors.New("API unavailable") })
-	if _, _, err := d.Resolve(context.Background(), "alice"); err == nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err == nil {
 		t.Fatal("unpersisted result served")
 	}
 	if _, ok := d.cached("alice"); ok {
@@ -40,7 +40,7 @@ func TestConflictDiscardsLookupAndReloadsWinner(t *testing.T) {
 		}
 		return connWithUsers([]string{"Stale"}, map[string][]string{"alice": {"Stale"}}), nil
 	}
-	groups, _, err := d.Resolve(context.Background(), "alice")
+	groups, err := d.Resolve(context.Background(), "alice")
 	if err != nil || len(groups) != 1 || groups[0] != "Winner" {
 		t.Fatalf("stale lookup won: %v %v", groups, err)
 	}
@@ -52,7 +52,7 @@ func TestRefreshFailureKeepsOldAndOtherUsersAdvance(t *testing.T) {
 		return connWithUsers([]string{"Old"}, map[string][]string{"alice": {"Old"}, "bob": {"Old"}}), nil
 	}
 	for _, key := range []string{"alice", "bob"} {
-		if _, _, err := d.Resolve(context.Background(), key); err != nil {
+		if _, err := d.Resolve(context.Background(), key); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -89,9 +89,9 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 				t.Fatal(err)
 			}
 			d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
-			groups, found, err := d.Resolve(context.Background(), "alice")
-			if managed && (err != nil || found || len(groups) != 0) {
-				t.Fatalf("repair failed: %v %v %v", groups, found, err)
+			groups, err := d.Resolve(context.Background(), "alice")
+			if managed && (err != nil || len(groups) != 0) {
+				t.Fatalf("repair failed: %v %v", groups, err)
 			}
 			if !managed && err == nil {
 				t.Fatal("unmanaged ConfigMap overwritten")
@@ -103,7 +103,7 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 func TestUnchangedRefreshAvoidsWrite(t *testing.T) {
 	d, client := userTestDirectory(t)
 	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
-	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	count := len(client.Actions())
@@ -123,7 +123,7 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, _, err := d.resolver.searchUser(ctx, "alice"); err == nil {
+	if _, err := d.resolver.searchUser(ctx, "alice"); err == nil {
 		t.Fatal("canceled lookup succeeded")
 	}
 	if time.Since(start) > time.Second {
@@ -135,7 +135,7 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 func TestUpdateConflictIsNotRetried(t *testing.T) {
 	d, client := userTestDirectory(t)
 	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
-	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	attempts := 0
@@ -147,7 +147,7 @@ func TestUpdateConflictIsNotRetried(t *testing.T) {
 		return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
 	}
 	result, err := d.resolve(context.Background(), "alice", true)
-	if err != nil || attempts != 1 || result.Record.Found {
+	if err != nil || attempts != 1 || len(result.Record.Groups) != 0 {
 		t.Fatalf("%+v %v attempts=%d", result, err, attempts)
 	}
 }

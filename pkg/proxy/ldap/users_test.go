@@ -62,7 +62,7 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 
 func userTestEntry(t *testing.T, d *UserDirectory, version string, groups ...string) cache.UserEntry {
 	t.Helper()
-	record, err := cache.NewUserRecord("alice", true, groups, d.resolver.fingerprint, time.Now())
+	record, err := cache.NewUserRecord("alice", groups, d.resolver.fingerprint, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestReplicasLearnCommittedMisses(t *testing.T) {
 	first.resolver.backends[0].dial = func(string) (conn, error) {
 		return connWithUsers([]string{"Shared"}, map[string][]string{"alice": {"Shared"}}), nil
 	}
-	if _, _, err := first.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := first.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)

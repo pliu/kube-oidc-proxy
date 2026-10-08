@@ -13,7 +13,7 @@ import (
 func TestUserRecordReadableRoundTrip(t *testing.T) {
 	groups := []string{"Platform Administrators", "Developers", "Platform Administrators", "Grüppe: #1", " developers "}
 	original := append([]string{}, groups...)
-	r, err := NewUserRecord("alice@example.net", true, groups, "fingerprint", time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC))
+	r, err := NewUserRecord("alice@example.net", groups, "fingerprint", time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,39 +44,33 @@ func TestUserRecordReadableRoundTrip(t *testing.T) {
 }
 
 func TestUserRecordEmptyResults(t *testing.T) {
-	for _, found := range []bool{true, false} {
-		r, err := NewUserRecord("alice", found, nil, "fingerprint", time.Now())
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := EncodeUserRecord(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(string(data), "groups: []") {
-			t.Fatalf("empty groups must be explicit:\n%s", data)
-		}
-		decoded, err := DecodeUserRecord(data, "alice", "fingerprint")
-		if err != nil || decoded.Found != found || len(decoded.Groups) != 0 {
-			t.Fatalf("empty result did not round trip: %#v, %v", decoded, err)
-		}
+	r, err := NewUserRecord("alice", nil, "fingerprint", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := EncodeUserRecord(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "groups: []") {
+		t.Fatalf("empty groups must be explicit:\n%s", data)
+	}
+	decoded, err := DecodeUserRecord(data, "alice", "fingerprint")
+	if err != nil || len(decoded.Groups) != 0 {
+		t.Fatalf("empty result did not round trip: %#v, %v", decoded, err)
 	}
 }
 
 func TestUserRecordRejectsInvalidDocuments(t *testing.T) {
-	const valid = "version: 1\nusername: alice\nfound: true\ngroups: [Developers]\nconfigurationFingerprint: fingerprint\nlastSuccessfulLookup: '2026-10-08T14:00:00Z'\n"
+	const valid = "version: 1\nusername: alice\ngroups: [Developers]\nconfigurationFingerprint: fingerprint\nlastSuccessfulLookup: '2026-10-08T14:00:00Z'\n"
 	tests := map[string]string{
 		"unknown field":       valid + "unexpected: value\n",
 		"duplicate field":     valid + "username: bob\n",
 		"version":             strings.Replace(valid, "version: 1", "version: 2", 1),
 		"missing version":     strings.Replace(valid, "version: 1\n", "", 1),
-		"missing found":       strings.Replace(valid, "found: true\n", "", 1),
-		"null found":          strings.Replace(valid, "found: true", "found: null", 1),
-		"wrong found type":    strings.Replace(valid, "found: true", "found: [true]", 1),
 		"missing groups":      strings.Replace(valid, "groups: [Developers]\n", "", 1),
 		"null groups":         strings.Replace(valid, "[Developers]", "null", 1),
 		"wrong groups type":   strings.Replace(valid, "[Developers]", "Developers", 1),
-		"absent with groups":  strings.Replace(valid, "found: true", "found: false", 1),
 		"reserved group":      strings.Replace(valid, "Developers", "system:masters", 1),
 		"empty group":         strings.Replace(valid, "[Developers]", "['']", 1),
 		"wrong identity":      strings.Replace(valid, "username: alice", "username: bob", 1),
@@ -143,7 +137,7 @@ func TestUserConfigMapNames(t *testing.T) {
 }
 
 func TestEncodeUserRecordNormalizesWithoutMutation(t *testing.T) {
-	r, err := NewUserRecord("alice", true, nil, "fingerprint", time.Now())
+	r, err := NewUserRecord("alice", nil, "fingerprint", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

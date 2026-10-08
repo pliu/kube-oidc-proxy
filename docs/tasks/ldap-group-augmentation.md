@@ -98,7 +98,6 @@ The `user.yaml` data key contains readable, strictly validated YAML:
 ```yaml
 version: 1
 username: alice@example.net
-found: true
 groups:
   - Developers
   - Platform Administrators
@@ -106,7 +105,7 @@ configurationFingerprint: <configuration hash>
 lastSuccessfulLookup: "2026-10-08T14:00:00Z"
 ```
 
-Empty memberships and absent users (`found: false`, `groups: []`) are valid
+Empty memberships and absent users (`groups: []`) are valid
 records. They remain cached indefinitely and eligible for refresh. Search bases,
 filters, attribute mappings, backend names/order, and OIDC username prefix
 contribute to the configuration fingerprint. Credentials, URLs, TLS settings,
@@ -152,7 +151,7 @@ ends; that event directly stops scheduling and waiting for the cycle. Shared in-
 lookups retain their independent timeout so another waiter is not canceled;
 optimistic writes protect overlapping operations during handover.
 
-Membership and `found` changes are persisted immediately. A check that finds
+Membership changes are persisted immediately. A check that finds
 nothing changed rewrites the record's `lastSuccessfulLookup` at most once per
 hour. Updates propagate independently for each user
 and replica.

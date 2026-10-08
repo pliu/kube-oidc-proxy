@@ -30,7 +30,7 @@ var errImpersonationNotAccepted = errors.New(
 // GroupAugmenter is the source of the groups a request is impersonated with
 // when the groups of the token are not to be trusted.
 type GroupAugmenter interface {
-	Resolve(ctx.Context, string) ([]string, bool, error)
+	Resolve(ctx.Context, string) ([]string, error)
 	Run(<-chan struct{}) error
 	CanRefresh(string) bool
 }
@@ -89,13 +89,9 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // is misconfigured would otherwise quietly regain whatever their identity
 // provider claimed for them.
 func (p *Proxy) augmentGroups(context ctx.Context, u user.Info, remoteAddr string) (user.Info, error) {
-	groups, ok, err := p.ldapDirectory.Resolve(context, u.GetName())
+	groups, err := p.ldapDirectory.Resolve(context, u.GetName())
 	if err != nil {
 		return nil, err
-	}
-	if !ok {
-		klog.V(4).Infof("user %q is held in no directory, dropping the groups of their token (%s)",
-			u.GetName(), remoteAddr)
 	}
 
 	return &user.DefaultInfo{

@@ -17,13 +17,19 @@ func TestRefreshOnlyCachedUsersIncludingAbsent(t *testing.T) {
 		calls.Add(1)
 		return connWithUsers([]string{"Old"}, map[string][]string{"alice": {"Old"}, "uncached": {"Old"}}), nil
 	}
-	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := d.Resolve(context.Background(), "absent"); err != nil || found {
-		t.Fatalf("%t %v", found, err)
+	if groups, err := d.Resolve(context.Background(), "absent"); err != nil || len(groups) != 0 {
+		t.Fatalf("%v %v", groups, err)
 	}
 	before := calls.Load()
+	if groups, err := d.Resolve(context.Background(), "absent"); err != nil || len(groups) != 0 {
+		t.Fatalf("cached absent user: %v %v", groups, err)
+	}
+	if calls.Load() != before {
+		t.Fatal("absent user cache hit queried LDAP")
+	}
 	d.resolver.backends[0].dial = func(string) (conn, error) {
 		calls.Add(1)
 		return connWithUsers([]string{"New"}, map[string][]string{"absent": {"New"}, "uncached": {"New"}}), nil
@@ -35,11 +41,11 @@ func TestRefreshOnlyCachedUsersIncludingAbsent(t *testing.T) {
 		t.Fatal("refresh did not search exactly the two cached users")
 	}
 	alice, ok := d.cached("alice")
-	if !ok || alice.Record.Found || len(alice.Record.Groups) != 0 {
+	if !ok || len(alice.Record.Groups) != 0 {
 		t.Fatal("absent user retained old grants")
 	}
 	absent, ok := d.cached("absent")
-	if !ok || !absent.Record.Found || absent.Record.Groups[0] != "New" {
+	if !ok || len(absent.Record.Groups) != 1 || absent.Record.Groups[0] != "New" {
 		t.Fatal("newly provisioned user was not refreshed")
 	}
 	if _, ok := d.cached("uncached"); ok {
@@ -52,7 +58,7 @@ func TestPeriodicRefreshRequiresLeadership(t *testing.T) {
 	d.resolver.config.RefreshInterval = NewDuration(10 * time.Millisecond)
 	var calls atomic.Int64
 	d.resolver.backends[0].dial = func(string) (conn, error) { calls.Add(1); return connWithUsers(nil, nil), nil }
-	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	var leading atomic.Bool
@@ -128,9 +134,9 @@ func TestLeadershipLossStopsRefreshWithoutCancelingSharedLookup(t *testing.T) {
 		t.Fatal("shared lookup never completed")
 	}
 
-	groups, found, err := d.Resolve(context.Background(), "alice")
-	if err != nil || !found || len(groups) != 1 || groups[0] != "New" {
-		t.Fatalf("shared result lost: %v %t %v", groups, found, err)
+	groups, err := d.Resolve(context.Background(), "alice")
+	if err != nil || len(groups) != 1 || groups[0] != "New" {
+		t.Fatalf("shared result lost: %v %v", groups, err)
 	}
 }
 

@@ -76,7 +76,7 @@ func TestContextClosesBlockedLDAPOperations(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				done := make(chan error, 1)
-				go func() { _, _, err := d.searchUser(ctx, "alice"); done <- err }()
+				go func() { _, err := d.searchUser(ctx, "alice"); done <- err }()
 				select {
 				case <-c.entered:
 				case <-time.After(time.Second):
@@ -112,7 +112,7 @@ func TestLateDialConnectionIsClosedWithoutBinding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, _, err := d.searchUser(ctx, "alice"); done <- err }()
+	go func() { _, err := d.searchUser(ctx, "alice"); done <- err }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):

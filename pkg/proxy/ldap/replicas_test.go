@@ -99,7 +99,7 @@ func (s *interruptedStore) Watch(ctx context.Context, version string) (watch.Int
 func TestInterruptedWatchRelistsAndRemovesDeletedUser(t *testing.T) {
 	d, client := userTestDirectory(t)
 	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
-	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	stream := watch.NewRaceFreeFake()
@@ -136,7 +136,7 @@ func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	old.resolver.backends[0].dial = func(string) (conn, error) {
 		return connWithUsers([]string{"Original"}, map[string][]string{"alice": {"Original"}}), nil
 	}
-	if _, _, err := old.Resolve(context.Background(), "alice"); err != nil {
+	if _, err := old.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	entered, release := make(chan struct{}), make(chan struct{})

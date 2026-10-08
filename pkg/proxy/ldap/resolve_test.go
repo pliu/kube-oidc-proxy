@@ -42,9 +42,9 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 	check := func(directory *UserDirectory) {
 		t.Helper()
 		for _, identity := range identities {
-			groups, found, err := directory.Resolve(context.Background(), identity.request)
-			if err != nil || !found || !reflect.DeepEqual(groups, []string{identity.group}) {
-				t.Fatalf("resolve %q: groups=%v found=%t err=%v", identity.request, groups, found, err)
+			groups, err := directory.Resolve(context.Background(), identity.request)
+			if err != nil || !reflect.DeepEqual(groups, []string{identity.group}) {
+				t.Fatalf("resolve %q: groups=%v err=%v", identity.request, groups, err)
 			}
 			saved, err := store.Get(context.Background(), identity.canonical)
 			if err != nil || saved.Record == nil || saved.Record.Username != identity.canonical || !reflect.DeepEqual(saved.Record.Groups, groups) {
@@ -84,9 +84,9 @@ func TestResolvePersistsAndCacheHitDoesNoIO(t *testing.T) {
 		calls.Add(1)
 		return connWithUsers([]string{"Developers"}, map[string][]string{"alice": {"Developers"}}), nil
 	}
-	groups, found, err := d.Resolve(context.Background(), "ALICE")
-	if err != nil || !found || !reflect.DeepEqual(groups, []string{"Developers"}) {
-		t.Fatalf("%v %v %v", groups, found, err)
+	groups, err := d.Resolve(context.Background(), "ALICE")
+	if err != nil || !reflect.DeepEqual(groups, []string{"Developers"}) {
+		t.Fatalf("%v %v", groups, err)
 	}
 	saved, err := d.store.Get(context.Background(), "alice")
 	if err != nil || !reflect.DeepEqual(saved.Record.Groups, groups) {
@@ -94,7 +94,7 @@ func TestResolvePersistsAndCacheHitDoesNoIO(t *testing.T) {
 	}
 	count := len(client.Actions())
 	groups[0] = "mutated"
-	again, _, err := d.Resolve(context.Background(), "alice")
+	again, err := d.Resolve(context.Background(), "alice")
 	if err != nil || calls.Load() != 1 || len(client.Actions()) != count || again[0] != "Developers" {
 		t.Fatalf("cache hit performed I/O or mutated: %v %v", again, err)
 	}
@@ -113,7 +113,7 @@ func TestResolveCoalescesAndCanceledWaiterDoesNotCancelOthers(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	first := make(chan error, 1)
-	go func() { _, _, err := d.Resolve(ctx, "alice"); first <- err }()
+	go func() { _, err := d.Resolve(ctx, "alice"); first <- err }()
 	<-entered
 	const waiters = 12
 	var wg sync.WaitGroup
@@ -121,7 +121,7 @@ func TestResolveCoalescesAndCanceledWaiterDoesNotCancelOthers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
+			if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -148,7 +148,7 @@ func TestResolveIndependentUsersAndBackendFailure(t *testing.T) {
 	}
 	result := make(chan error, 2)
 	for _, name := range []string{"alice", "bob"} {
-		go func() { _, _, err := d.Resolve(context.Background(), name); result <- err }()
+		go func() { _, err := d.Resolve(context.Background(), name); result <- err }()
 	}
 	for i := 0; i < 2; i++ {
 		select {
@@ -181,7 +181,7 @@ func TestCanceledRefreshWaiterDoesNotCancelSharedMiss(t *testing.T) {
 	go func() { _, err := d.resolve(ctx, "alice", true); refresh <- err }()
 	<-entered
 	miss := make(chan error, 1)
-	go func() { _, _, err := d.Resolve(context.Background(), "alice"); miss <- err }()
+	go func() { _, err := d.Resolve(context.Background(), "alice"); miss <- err }()
 	cancel()
 	if err := <-refresh; !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
@@ -204,9 +204,9 @@ func TestCollidingNamesNeverShareGroups(t *testing.T) {
 	// Alternate so each lookup finds the other user's record under the shared name.
 	for i := 0; i < 3; i++ {
 		for _, username := range []string{"alice@example.net", "alice-example.net"} {
-			groups, found, err := d.Resolve(context.Background(), username)
-			if err != nil || !found || len(groups) != 1 || groups[0] != want[username] {
-				t.Fatalf("%s got %v %t %v, want [%s]", username, groups, found, err, want[username])
+			groups, err := d.Resolve(context.Background(), username)
+			if err != nil || len(groups) != 1 || groups[0] != want[username] {
+				t.Fatalf("%s got %v %v, want [%s]", username, groups, err, want[username])
 			}
 		}
 	}

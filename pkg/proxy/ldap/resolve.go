@@ -28,13 +28,13 @@ type userCall struct {
 
 // Resolve returns cache hits without external I/O. Waiter cancellation does
 // not cancel shared work, which has its own timeout and shutdown context.
-func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string, bool, error) {
+func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string, error) {
 	key := usernameKey(username, d.resolver.config.UsernamePrefix)
 	entry, err := d.resolve(ctx, key, false)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return append([]string{}, entry.Record.Groups...), entry.Record.Found, nil
+	return append([]string{}, entry.Record.Groups...), nil
 }
 
 func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (cache.UserEntry, error) {
@@ -98,16 +98,16 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		d.apply(previous, false)
 		return d.committed(key)
 	}
-	groups, found, err := d.resolver.searchUser(ctx, key)
+	groups, err := d.resolver.searchUser(ctx, key)
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
 	// key is already the canonical identity; it must not be canonicalized again.
-	record, err := cache.NewUserRecord(key, found, groups, d.resolver.fingerprint, time.Now())
+	record, err := cache.NewUserRecord(key, groups, d.resolver.fingerprint, time.Now())
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
-	changed := previous.Record == nil || previous.Record.Found != found || !slices.Equal(previous.Record.Groups, record.Groups)
+	changed := previous.Record == nil || !slices.Equal(previous.Record.Groups, record.Groups)
 	if !changed && record.LastSuccessfulLookup.Sub(previous.Record.LastSuccessfulLookup) < unchangedWriteInterval {
 		d.apply(previous, false)
 		return d.committed(key)

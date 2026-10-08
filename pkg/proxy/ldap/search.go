@@ -92,30 +92,23 @@ func (b *backend) groupsOf(c conn, entry *goldap.Entry) ([]string, error) {
 }
 
 // searchUser queries every backend and unions only complete successful results.
-func (d *resolver) searchUser(ctx context.Context, key string) ([]string, bool, error) {
-	type foundUser struct {
-		groups []string
-		found  bool
-	}
-
-	results, err := eachBackend(d.backends, func(b *backend) (foundUser, error) {
+func (d *resolver) searchUser(ctx context.Context, key string) ([]string, error) {
+	results, err := eachBackend(d.backends, func(b *backend) ([]string, error) {
 		start := time.Now()
-		groups, found, err := b.searchUser(ctx, key)
+		groups, err := b.searchUser(ctx, key)
 		if err == nil {
 			backendRefreshDuration.WithLabelValues(b.config.Name).Observe(time.Since(start).Seconds())
 		}
-		return foundUser{groups: groups, found: found}, err
+		return groups, err
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	groups := make([]string, 0)
 	seen := make(map[string]struct{})
-	found := false
 	for _, result := range results {
-		found = found || result.found
-		for _, group := range result.groups {
+		for _, group := range result {
 			if _, duplicate := seen[group]; duplicate {
 				continue
 			}
@@ -123,19 +116,15 @@ func (d *resolver) searchUser(ctx context.Context, key string) ([]string, bool, 
 			groups = append(groups, group)
 		}
 	}
-	if !found {
-		return nil, false, nil
-	}
 	sort.Strings(groups)
-	return groups, true, nil
+	return groups, nil
 }
 
 // searchUser searches this backend for one user, returning the groups they
-// hold in it. The second return value reports whether the backend holds them
-// at all.
+// hold in it. Missing users return no groups.
 //
 // Membership DNs are resolved directly within configured group search bases.
-func (b *backend) searchUser(ctx context.Context, username string) ([]string, bool, error) {
+func (b *backend) searchUser(ctx context.Context, username string) ([]string, error) {
 	var groups []string
 	var claimedBy string
 
@@ -191,14 +180,10 @@ func (b *backend) searchUser(ctx context.Context, username string) ([]string, bo
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	if claimedBy == "" {
-		return nil, false, nil
-	}
-
-	return groups, true, nil
+	return groups, nil
 }
 
 // discoverGroup resolves membership DNs within configured bases and filters.

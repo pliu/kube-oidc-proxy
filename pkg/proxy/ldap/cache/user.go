@@ -19,12 +19,11 @@ const (
 )
 
 // UserRecord persists one canonical directory identity. Groups are full names,
-// stored directly in readable YAML. Found distinguishes an absent user from a
-// user with no memberships; both are valid cache entries.
+// stored directly in readable YAML. Empty memberships, including absent users,
+// are valid cache entries.
 type UserRecord struct {
 	Version                  int       `json:"version"`
 	Username                 string    `json:"username"`
-	Found                    bool      `json:"found"`
 	Groups                   []string  `json:"groups"`
 	ConfigurationFingerprint string    `json:"configurationFingerprint"`
 	LastSuccessfulLookup     time.Time `json:"lastSuccessfulLookup"`
@@ -32,9 +31,9 @@ type UserRecord struct {
 
 // NewUserRecord takes a canonical username supplied by the identity layer.
 // Sorting and deduplication never alter a group name and never mutate the caller's slice.
-func NewUserRecord(username string, found bool, groups []string, fingerprint string, checkedAt time.Time) (*UserRecord, error) {
+func NewUserRecord(username string, groups []string, fingerprint string, checkedAt time.Time) (*UserRecord, error) {
 	r := &UserRecord{
-		Version: UserRecordVersion, Username: username, Found: found,
+		Version: UserRecordVersion, Username: username,
 		Groups: groups, ConfigurationFingerprint: fingerprint,
 		LastSuccessfulLookup: checkedAt,
 	}
@@ -53,9 +52,6 @@ func (r *UserRecord) validate() error {
 	}
 	if r.LastSuccessfulLookup.IsZero() {
 		return errors.New("user record requires a last successful lookup time")
-	}
-	if !r.Found && len(r.Groups) != 0 {
-		return errors.New("absent user cannot have group memberships")
 	}
 	for _, group := range r.Groups {
 		if strings.TrimSpace(group) == "" || strings.HasPrefix(group, "system:") {
@@ -108,12 +104,11 @@ func DecodeUserRecord(data []byte, username, fingerprint string) (*UserRecord, e
 }
 
 // decodeUserRecord parses the complete document once. Pointers distinguish
-// omitted/null required fields from valid false and empty-list values.
+// omitted/null required fields from valid empty-list values.
 func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
 	var document struct {
 		Version                  int       `json:"version"`
 		Username                 string    `json:"username"`
-		Found                    *bool     `json:"found"`
 		Groups                   *[]string `json:"groups"`
 		ConfigurationFingerprint string    `json:"configurationFingerprint"`
 		LastSuccessfulLookup     time.Time `json:"lastSuccessfulLookup"`
@@ -121,11 +116,11 @@ func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
 	if err := yaml.UnmarshalStrict(data, &document); err != nil {
 		return nil, fmt.Errorf("decode user record: %w", err)
 	}
-	if document.Found == nil || document.Groups == nil {
-		return nil, errors.New("user record requires found and groups")
+	if document.Groups == nil {
+		return nil, errors.New("user record requires groups")
 	}
 	r := &UserRecord{
-		Version: document.Version, Username: document.Username, Found: *document.Found, Groups: *document.Groups,
+		Version: document.Version, Username: document.Username, Groups: *document.Groups,
 		ConfigurationFingerprint: document.ConfigurationFingerprint, LastSuccessfulLookup: document.LastSuccessfulLookup,
 	}
 	if r.ConfigurationFingerprint != fingerprint {

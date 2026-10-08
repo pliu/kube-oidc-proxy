@@ -49,13 +49,12 @@ func (f *fakeAugmenter) CanRefresh(username string) bool {
 	return false
 }
 
-func (f *fakeAugmenter) Resolve(ctx gocontext.Context, username string) ([]string, bool, error) {
+func (f *fakeAugmenter) Resolve(ctx gocontext.Context, username string) ([]string, error) {
 	if f.resolveErr != nil {
-		return nil, false, f.resolveErr
+		return nil, f.resolveErr
 	}
 	f.resolveCount++
-	groups, found := f.mapping[username]
-	return groups, found, nil
+	return f.mapping[username], nil
 }
 
 func (f *fakeAugmenter) Run(stopCh <-chan struct{}) error { return nil }
