@@ -165,7 +165,7 @@ func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T,
 
 			value, err := fn(b)
 			if err != nil {
-				results[i].err = fmt.Errorf("backend %q: %s", b.config.Name, err)
+				results[i].err = fmt.Errorf("backend %q: %w", b.config.Name, err)
 				return
 			}
 

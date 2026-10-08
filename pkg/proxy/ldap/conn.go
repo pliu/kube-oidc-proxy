@@ -26,85 +26,21 @@ type conn interface {
 	Close() error
 }
 
-// watchdog closes a connection that a backend has not finished with in time.
-//
-// go-ldap reads a response off a channel that nothing else ever writes to if
-// the directory goes quiet, and neither Conn.SetTimeout nor the request time
-// limit reaches that: the first bounds the delivery of a response that did
-// arrive, the second is enforced by a server that is still listening. Closing
-// the connection is what unblocks the read, so that is what this does.
-type watchdog struct {
-	timeout time.Duration
-	timer   *time.Timer
-
-	mu sync.Mutex
-	// c is the connection to close, once there is one to close.
-	c conn
-	// fired records that the timeout expired, so that whatever error the
-	// closed connection produces can be reported as the timeout it is.
-	fired bool
-}
-
-func newWatchdog(timeout time.Duration) *watchdog {
-	w := &watchdog{timeout: timeout}
-	w.timer = time.AfterFunc(timeout, w.fire)
-
-	return w
-}
-
-// watch hands the watchdog the connection to close, closing it immediately if
-// the timeout has already expired.
-func (w *watchdog) watch(c conn) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	w.c = c
-
-	if w.fired {
-		c.Close()
+// closeOnCancel keeps connection cleanup active through bind and search. The
+// returned cleanup stops cancellation handling and closes the connection once,
+// even if cancellation and normal completion race.
+func closeOnCancel(ctx context.Context, c conn) func() {
+	closeConn := sync.OnceFunc(func() { _ = c.Close() })
+	stop := context.AfterFunc(ctx, closeConn)
+	return func() {
+		stop()
+		closeConn()
 	}
-}
-
-// forget drops a connection the backend has closed itself, so that a later
-// timeout cannot close a connection this backend no longer owns.
-func (w *watchdog) forget() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	w.c = nil
-}
-
-func (w *watchdog) fire() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	w.fired = true
-
-	if w.c != nil {
-		w.c.Close()
-	}
-}
-
-func (w *watchdog) stop() {
-	w.timer.Stop()
-}
-
-// wrap reports an error as the timeout that caused it, when it was. What
-// go-ldap returns from a connection closed under it says nothing about why.
-func (w *watchdog) wrap(err error) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if err == nil || !w.fired {
-		return err
-	}
-
-	return fmt.Errorf("timed out after %s: %s", w.timeout, err)
 }
 
 // timeLimit is the timeout as the seconds a search request carries, so that a
 // directory which is still listening gives up on its own and answers with a
-// result code, rather than being cut off mid sentence by the watchdog. It is
+// result code before cancellation closes the connection. It is
 // rounded up, since a limit of zero is what the protocol uses for no limit.
 func (b *backend) timeLimit() int {
 	seconds := int((b.config.Timeout.Duration() + time.Second - 1) / time.Second)
@@ -115,35 +51,17 @@ func (b *backend) timeLimit() int {
 	return seconds
 }
 
-// withConn dials the backend, runs fn against the bound connection, and
-// closes it. A directory that goes quiet is cut off by the watchdog, and the
-// resulting error is reported as the timeout it is.
+// withConn applies one deadline to dialing, binding, and searching. Closing the
+// connection on cancellation unblocks LDAP operations that have no context API.
 func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	// A directory that accepts a connection and then stops answering would
-	// otherwise hold a refresh here for as long as the process runs: go-ldap
-	// waits for a response on a channel with no deadline of its own, so
-	// closing the connection under it is the only way back out.
-	w := newWatchdog(b.config.Timeout.Duration())
-	defer w.stop()
-	stop := context.AfterFunc(ctx, w.fire)
-	defer stop()
-
 	ctx, cancel := context.WithTimeout(ctx, b.config.Timeout.Duration())
 	defer cancel()
-	c, err := b.connect(ctx, w)
-	if err != nil {
-		return w.wrap(err)
+	c, cleanup, err := b.connect(ctx)
+	if err == nil {
+		defer cleanup()
+		err = fn(c)
 	}
-	defer c.Close()
-
-	err = w.wrap(fn(c))
 	if ctx.Err() != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("timed out after %s: %w", b.config.Timeout.Duration(), ctx.Err())
-		}
 		return ctx.Err()
 	}
 	return err
@@ -152,31 +70,38 @@ func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
 // connect dials the configured URLs in order, returning the first connection
 // that can be established and bound.
 //
-// Each connection is handed to the watchdog as soon as it exists, since a
+// Each connection is closed on cancellation as soon as it exists, since a
 // directory that accepts the connection and then never answers the bind hangs
 // just as thoroughly as one that never answers a search.
-func (b *backend) connect(ctx context.Context, w *watchdog) (conn, error) {
+func (b *backend) connect(ctx context.Context) (conn, func(), error) {
 	var errs []string
 
 	for _, rawURL := range b.config.URLs {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		c, err := b.dialURL(ctx, rawURL)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", rawURL, err))
 			continue
 		}
 
-		w.watch(c)
+		cleanup := closeOnCancel(ctx, c)
+		if err := ctx.Err(); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
 
 		if b.config.StartTLS {
 			tlsConfig, err := tlsConfigForURL(b.tlsConfig, rawURL)
 			if err != nil {
-				abandon(c, w)
+				cleanup()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS setup failed: %s", rawURL, err))
 				continue
 			}
 
 			if err := c.StartTLS(tlsConfig); err != nil {
-				abandon(c, w)
+				cleanup()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS failed: %s", rawURL, err))
 				continue
 			}
@@ -185,23 +110,18 @@ func (b *backend) connect(ctx context.Context, w *watchdog) (conn, error) {
 		// An empty bind DN leaves the connection anonymous.
 		if b.config.BindDN != "" {
 			if err := c.Bind(b.config.BindDN, b.bindPassword); err != nil {
-				abandon(c, w)
+				cleanup()
 				errs = append(errs, fmt.Sprintf("%s: bind failed: %s", rawURL, err))
 				continue
 			}
 		}
 
-		return c, nil
+		return c, cleanup, nil
 	}
-
-	return nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
-}
-
-// abandon closes a connection this backend is giving up on, so the watchdog
-// cannot close it again after it has been released.
-func abandon(c conn, w *watchdog) {
-	c.Close()
-	w.forget()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return nil, nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
 }
 
 // tlsConfigForURL gives a StartTLS handshake the server name it cannot infer
@@ -225,7 +145,7 @@ func tlsConfigForURL(base *tls.Config, rawURL string) (*tls.Config, error) {
 }
 
 func (b *backend) dialLDAP(rawURL string) (conn, error) {
-	// The watchdog cannot close a connection that does not exist yet, so the
+	// Cancellation cannot close a connection that does not exist yet, so the
 	// dial carries its own bound. go-ldap otherwise applies a package level
 	// default of 60s, which no configuration can move.
 	dialer := &net.Dialer{Timeout: b.config.Timeout.Duration()}
@@ -259,6 +179,9 @@ func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {
 // The dialer itself has a socket timeout. A canceled caller returns promptly;
 // a connection arriving after cancellation is closed rather than leaked.
 func (b *backend) dialURL(ctx context.Context, url string) (conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	type result struct {
 		c   conn
 		err error

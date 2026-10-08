@@ -184,48 +184,6 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 }
 
-func TestWatchdogClosesAConnectionThatOutlastsIt(t *testing.T) {
-	c := newHangingConn()
-
-	w := newWatchdog(time.Millisecond)
-	defer w.stop()
-
-	w.watch(c)
-
-	select {
-	case <-c.closed:
-	case <-time.After(time.Second * 5):
-		t.Fatal("expected the watchdog to close the connection it was given")
-	}
-}
-
-// Dialling races the timeout, so a connection that arrives after it expired
-// must not be left open and searched.
-
-func TestWatchdogClosesAConnectionHandedOverAfterItFired(t *testing.T) {
-	w := newWatchdog(time.Hour)
-	defer w.stop()
-
-	w.fire()
-
-	c := newHangingConn()
-	w.watch(c)
-
-	select {
-	case <-c.closed:
-	default:
-		t.Error("expected a connection handed over after the timeout to be closed straight away")
-	}
-
-	if err := w.wrap(errors.New("response channel closed")); !strings.Contains(err.Error(), "timed out after 1h0m0s") {
-		t.Errorf("expected the error to be reported as the timeout, got %q", err)
-	}
-
-	if err := w.wrap(nil); err != nil {
-		t.Errorf("expected no error to stay no error, got %s", err)
-	}
-}
-
 func TestEachBackendReturnsFirstErrorInConfigOrder(t *testing.T) {
 	backends := []*backend{
 		{config: &BackendConfig{Name: "a"}},
@@ -368,13 +326,11 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 		return c, nil
 	}
 
-	w := newWatchdog(time.Minute)
-	defer w.stop()
-
-	got, err := d.backends[0].connect(context.Background(), w)
+	got, cleanup, err := d.backends[0].connect(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
+	defer cleanup()
 	if got != conn(c) {
 		t.Error("expected the second URL to be used")
 	}
@@ -391,12 +347,11 @@ func TestConnectSetsTheStartTLSServerName(t *testing.T) {
 	c := &fakeConn{}
 	d := newTestResolver(t, config, c)
 
-	w := newWatchdog(time.Minute)
-	defer w.stop()
-
-	if _, err := d.backends[0].connect(context.Background(), w); err != nil {
+	_, cleanup, err := d.backends[0].connect(context.Background())
+	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
+	defer cleanup()
 
 	if c.startTLSConfig == nil {
 		t.Fatal("expected StartTLS to be called")
