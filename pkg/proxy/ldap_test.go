@@ -3,6 +3,7 @@ package proxy
 
 import (
 	gocontext "context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -54,6 +55,14 @@ func (f *fakeAugmenter) CanRefresh(username string) bool {
 	}
 
 	return false
+}
+
+func (f *fakeAugmenter) Resolve(ctx gocontext.Context, username string) ([]string, bool, error) {
+	if f.directoryErr != nil {
+		return nil, false, f.directoryErr
+	}
+	groups, found := f.Groups(username)
+	return groups, found, nil
 }
 
 func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
@@ -354,7 +363,10 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 		Extra:  map[string][]string{"foo": {"bar"}},
 	}
 
-	out := p.augmentGroups(in, "fakeAddr")
+	out, err := p.augmentGroups(gocontext.Background(), in, "fakeAddr")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if out.GetName() != in.GetName() || out.GetUID() != in.GetUID() {
 		t.Errorf("expected name and uid to be preserved, got %q/%q", out.GetName(), out.GetUID())
@@ -480,5 +492,15 @@ func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("got unexpected response code, exp=%d got=%d",
 			http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestLDAPResolutionFailureReturnsServiceUnavailable(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+	p.ldapDirectory = &fakeAugmenter{directoryErr: errors.New("persistence failed")}
+	response := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet), &user.DefaultInfo{Name: "alice", Groups: []string{"from-token"}})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", response.StatusCode)
 	}
 }

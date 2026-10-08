@@ -12,7 +12,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 )
 
 const (
@@ -36,25 +35,9 @@ var errImpersonationNotAccepted = errors.New(
 // GroupAugmenter is the source of the groups a request is impersonated with
 // when the groups of the token are not to be trusted.
 type GroupAugmenter interface {
-	// Groups returns the groups held by the given user, and whether the user
-	// is known to the backend at all.
-	Groups(username string) ([]string, bool)
-
-	// Run builds the initial mapping and keeps it refreshed until stopCh is
-	// closed.
-	Run(stopCh <-chan struct{}) error
-
-	// CanRefresh reports whether the given user may trigger a refresh.
-	CanRefresh(username string) bool
-
-	// Refresh rebuilds the mapping on demand.
-	Refresh() error
-
-	// RefreshUser re-searches the directories for one user and persists the
-	// mapping if what it found differs from what is being served.
-	RefreshUser(context ctx.Context, username string) (*ldap.UserStats, error)
-
-	Stats() *ldap.Stats
+	Resolve(ctx.Context, string) ([]string, bool, error)
+	Run(<-chan struct{}) error
+	CanRefresh(string) bool
 }
 
 // withLDAPRefresh serves the endpoint that triggers a rebuild of the LDAP user
@@ -123,8 +106,11 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // the last rebuild. Waiting out the interval is not the only way to pick that
 // up: the refresh endpoint takes a single user, so what changed can be
 // refreshed without everybody being searched for again.
-func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
-	groups, ok := p.ldapDirectory.Groups(u.GetName())
+func (p *Proxy) augmentGroups(context ctx.Context, u user.Info, remoteAddr string) (user.Info, error) {
+	groups, ok, err := p.ldapDirectory.Resolve(context, u.GetName())
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		klog.V(4).Infof("user %q is held in no directory, dropping the groups of their token (%s)",
 			u.GetName(), remoteAddr)
@@ -135,5 +121,5 @@ func (p *Proxy) augmentGroups(u user.Info, remoteAddr string) user.Info {
 		UID:    u.GetUID(),
 		Groups: groups,
 		Extra:  u.GetExtra(),
-	}
+	}, nil
 }

@@ -53,6 +53,8 @@ const (
 
 // Config is the decoded contents of an LDAP configuration file.
 type Config struct {
+	LookupTimeout     *Duration `json:"lookupTimeout,omitempty"`
+	LookupConcurrency int       `json:"lookupConcurrency,omitempty"`
 	// Backends are the directories the mapping is built from. The mapping of
 	// every backend is merged into one, so a user held in more than one
 	// directory ends up with the union of their groups.
@@ -256,6 +258,12 @@ func ValidateSchema(data []byte) error {
 
 // SetDefaults fills in the fields a configuration file is allowed to leave out.
 func (c *Config) SetDefaults() {
+	if c.LookupTimeout == nil {
+		c.LookupTimeout = NewDuration(time.Minute)
+	}
+	if c.LookupConcurrency == 0 {
+		c.LookupConcurrency = 8
+	}
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)
 	}
@@ -300,6 +308,12 @@ func (c *Config) SetDefaults() {
 // a file is held to the same standard.
 func (c *Config) Validate() error {
 	var errs []error
+	if c.LookupTimeout.Duration() <= 0 {
+		errs = append(errs, errors.New("lookupTimeout must be positive"))
+	}
+	if c.LookupConcurrency < 1 {
+		errs = append(errs, errors.New("lookupConcurrency must be positive"))
+	}
 
 	if len(c.Backends) == 0 {
 		errs = append(errs, errors.New("at least one backend must be configured"))

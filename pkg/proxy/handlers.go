@@ -138,7 +138,13 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// This happens before the impersonation check below so that the
 		// authorization decision is made against the directory groups too.
 		if p.ldapDirectory != nil {
-			requester = p.augmentGroups(requester, remoteAddr)
+			var err error
+			requester, err = p.augmentGroups(req.Context(), requester, remoteAddr)
+			if err != nil {
+				klog.Errorf("LDAP group resolution failed (%s): %v", remoteAddr, err)
+				http.Error(rw, "Group resolution unavailable", http.StatusServiceUnavailable)
+				return
+			}
 
 			// The audit event is built from the identity the context holds
 			// when the auditor runs, which is inside this handler. Left as the

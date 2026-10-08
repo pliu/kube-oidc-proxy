@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
@@ -126,22 +125,24 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 					return err
 				}
 
-				// Reads a Secret without its data, so that a proxy serving a
-				// mapping another one built can check for a newer one without
-				// pulling the whole mapping down every time it looks.
-				metaclient, err := metadata.NewForConfig(restConfig)
+				if ldapConfig.Cache == nil {
+					ldapConfig.Cache = &ldap.CacheConfig{}
+				}
+				if ldapConfig.Cache.Scope == "" {
+					ldapConfig.Cache.Scope = "main"
+				}
+				namespace := ldapConfig.Cache.Namespace
+				if namespace == "" {
+					namespace, err = cache.InClusterNamespace()
+					if err != nil {
+						return err
+					}
+				}
+				ldapCache, err := cache.NewConfigMaps(kubeclient, namespace, ldapConfig.Cache.Scope, ldapConfig.UserRecordFingerprint())
 				if err != nil {
 					return err
 				}
-
-				// The store the built mapping is persisted to. Nil when the
-				// configuration does not ask for it to be persisted.
-				ldapCache, err := ldap.NewCacheStore(ldapConfig.Cache, kubeclient, metaclient)
-				if err != nil {
-					return err
-				}
-
-				directory, err := ldap.New(ldapConfig, ldapCache)
+				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache)
 				if err != nil {
 					return err
 				}
@@ -152,10 +153,10 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				// every request by stripping the user of their groups, so it
 				// stays out of its Service until it has one.
 				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
-					Name: "ldap mapping",
+					Name: "ldap cache synchronization",
 					Check: func() error {
 						if !directory.HasMapping() {
-							return errors.New("no LDAP user to group mapping to serve yet")
+							return errors.New("LDAP cache initial synchronization is incomplete")
 						}
 
 						return nil

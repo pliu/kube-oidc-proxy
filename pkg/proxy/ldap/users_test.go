@@ -2,13 +2,17 @@ package ldap
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
@@ -16,6 +20,16 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 	config := testConfig()
 	config.Cache = &CacheConfig{Type: CacheTypeNone, Namespace: "proxy", Scope: "main"}
 	client := fake.NewClientset()
+	var revision atomic.Int64
+	revision.Store(100)
+	client.PrependReactor("create", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		action.(ktesting.CreateAction).GetObject().(*corev1.ConfigMap).ResourceVersion = fmt.Sprint(revision.Add(1))
+		return false, nil, nil
+	})
+	client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap).ResourceVersion = fmt.Sprint(revision.Add(1))
+		return false, nil, nil
+	})
 	store, err := cache.NewConfigMaps(client, "proxy", "main", config.UserRecordFingerprint())
 	if err != nil {
 		t.Fatal(err)
