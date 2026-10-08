@@ -84,7 +84,7 @@ func TestSubectAccessReview(t *testing.T) {
 
 			expImpersonationHeaders:  true,
 			expAz:                    false,
-			expErr:                   errors.New("mmosley is not allowed to impersonate user 'jjackson-x'"),
+			expErr:                   &ImpersonationDeniedError{Requester: "mmosley", Resource: "users", Name: "jjackson-x"},
 			expErrorRbac:             nil,
 			extraImpersonationHeader: false,
 		},
@@ -110,7 +110,7 @@ func TestSubectAccessReview(t *testing.T) {
 
 			expImpersonationHeaders:  true,
 			expAz:                    false,
-			expErr:                   errors.New("mmosley is not allowed to impersonate group 'group4'"),
+			expErr:                   &ImpersonationDeniedError{Requester: "mmosley", Resource: "groups", Name: "group4"},
 			expErrorRbac:             nil,
 			extraImpersonationHeader: false,
 		},
@@ -136,7 +136,7 @@ func TestSubectAccessReview(t *testing.T) {
 
 			expImpersonationHeaders:  true,
 			expAz:                    false,
-			expErr:                   errors.New("mmosley is not allowed to impersonate extra info 'remoteaddr'='1.2.3.5'"),
+			expErr:                   &ImpersonationDeniedError{Requester: "mmosley", Resource: "userextras/remoteaddr", Name: "1.2.3.5"},
 			expErrorRbac:             nil,
 			extraImpersonationHeader: false,
 		},
@@ -161,7 +161,7 @@ func TestSubectAccessReview(t *testing.T) {
 
 			expImpersonationHeaders:  true,
 			expAz:                    false,
-			expErr:                   errors.New("mmosley is not allowed to impersonate uid '1-2-3-5'"),
+			expErr:                   &ImpersonationDeniedError{Requester: "mmosley", Resource: "uids", Name: "1-2-3-5"},
 			expErrorRbac:             nil,
 			extraImpersonationHeader: false,
 		},

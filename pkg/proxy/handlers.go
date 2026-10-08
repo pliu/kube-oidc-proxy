@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -313,8 +314,9 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 			// Server or unknown error
 		default:
 
-			if strings.Contains(err.Error(), "not allowed to impersonate") {
-				klog.V(2).Infof(err.Error(), r.RemoteAddr)
+			var denied *subjectaccessreview.ImpersonationDeniedError
+			if errors.As(err, &denied) {
+				klog.V(2).Infof("%s (%s)", err, r.RemoteAddr)
 				http.Error(rw, err.Error(), http.StatusForbidden)
 			} else {
 				klog.Errorf("unknown error (%s): %s", r.RemoteAddr, err)
