@@ -97,7 +97,7 @@ func TestResolveIndependentUsersAndBackendFailure(t *testing.T) {
 			t.Fatal("partial result succeeded")
 		}
 	}
-	if d.Stats().Users != 0 {
+	if _, ok := d.cached("alice"); ok {
 		t.Fatal("failed lookup was cached")
 	}
 }
@@ -112,7 +112,7 @@ func TestCanceledRefreshWaiterDoesNotCancelSharedMiss(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	refresh := make(chan error, 1)
-	go func() { _, err := d.RefreshUser(ctx, "alice"); refresh <- err }()
+	go func() { _, err := d.resolve(ctx, "alice", true); refresh <- err }()
 	<-entered
 	miss := make(chan error, 1)
 	go func() { _, _, err := d.Resolve(context.Background(), "alice"); miss <- err }()

@@ -49,7 +49,7 @@ func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 			}
 			results := []chan result{make(chan result, 1), make(chan result, 1)}
 			for i, d := range []*UserDirectory{first, second} {
-				go func() { e, _, err := d.resolve(context.Background(), "alice", refresh); results[i] <- result{e, err} }()
+				go func() { e, err := d.resolve(context.Background(), "alice", refresh); results[i] <- result{e, err} }()
 			}
 			for i := 0; i < 2; i++ {
 				select {
@@ -152,7 +152,7 @@ func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	next.resolver.backends[0].dial = func(string) (conn, error) {
 		return connWithUsers([]string{"Current"}, map[string][]string{"alice": {"Current"}}), nil
 	}
-	if _, err := next.RefreshUser(context.Background(), "alice"); err != nil {
+	if _, err := next.resolve(context.Background(), "alice", true); err != nil {
 		t.Fatal(err)
 	}
 	close(release)

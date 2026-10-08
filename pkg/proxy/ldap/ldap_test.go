@@ -6,13 +6,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	goldap "github.com/go-ldap/ldap/v3"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	goldap "github.com/go-ldap/ldap/v3"
 )
 
 type fakeConn struct {
@@ -46,13 +46,6 @@ func (f *fakeConn) Bind(username, password string) error {
 	}
 	f.bound = true
 	return nil
-}
-
-func (f *fakeConn) SearchWithPaging(req *goldap.SearchRequest, pagingSize uint32) (*goldap.SearchResult, error) {
-	if f.searchErr != nil {
-		return nil, f.searchErr
-	}
-	return &goldap.SearchResult{Entries: f.entries[req.BaseDN]}, nil
 }
 
 func (f *fakeConn) Search(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
@@ -108,10 +101,10 @@ func testConfig(backends ...*BackendConfig) *Config {
 	}
 }
 
-// newTestDirectory returns a Directory whose backends search the given fake
+// newTestResolver returns a resolver whose backends search the given fake
 // connections, in order, rather than a real server.
 
-func newTestDirectory(t *testing.T, config *Config, conns ...conn) *Directory {
+func newTestResolver(t *testing.T, config *Config, conns ...conn) *resolver {
 	t.Helper()
 
 	d, err := newResolver(config)
@@ -235,10 +228,6 @@ func TestWatchdogClosesAConnectionHandedOverAfterItFired(t *testing.T) {
 	}
 }
 
-// A backend whose searches still succeed but find nobody would otherwise merge
-// in as a backend that contributes nothing, silently stripping every user of
-// that directory of their groups.
-
 func TestEachBackendReturnsFirstErrorInConfigOrder(t *testing.T) {
 	backends := []*backend{
 		{config: &BackendConfig{Name: "a"}},
@@ -361,10 +350,6 @@ func TestParseRangeOption(t *testing.T) {
 	}
 }
 
-// Kubernetes treats system: as reserved. A directory group of that name must
-// not become an impersonation group, or creating it in a searched OU would
-// grant cluster privileges.
-
 func TestConnectFailsOverBetweenURLs(t *testing.T) {
 	config := testConfig()
 	config.Backends[0].URLs = []string{"ldaps://down.example.net:636", "ldaps://up.example.net:636"}
@@ -406,7 +391,7 @@ func TestConnectSetsTheStartTLSServerName(t *testing.T) {
 	config.Backends[0].StartTLS = true
 
 	c := &fakeConn{}
-	d := newTestDirectory(t, config, c)
+	d := newTestResolver(t, config, c)
 
 	w := newWatchdog(time.Minute)
 	defer w.stop()
@@ -426,8 +411,6 @@ func TestConnectSetsTheStartTLSServerName(t *testing.T) {
 			d.backends[0].tlsConfig.ServerName)
 	}
 }
-
-// Readers must always see a complete mapping, never a partially built one.
 
 func TestCanRefresh(t *testing.T) {
 	tests := map[string]struct {
@@ -506,45 +489,7 @@ func TestCanRefresh(t *testing.T) {
 	}
 }
 
-func TestMergeDeduplicatesGroups(t *testing.T) {
-	into := map[string][]string{
-		"alice@example.net": {"admins", "shared"},
-	}
-
-	merge(into, map[string][]string{
-		"alice@example.net": {"shared", "contractors"},
-		"bob@example.net":   {"devs"},
-	})
-
-	finalise(into)
-
-	exp := map[string][]string{
-		"alice@example.net": {"admins", "contractors", "shared"},
-		"bob@example.net":   {"devs"},
-	}
-
-	if !reflect.DeepEqual(into, exp) {
-		t.Errorf("expected merged mapping %v, got %v", exp, into)
-	}
-}
-
-func TestFinaliseSortsGroups(t *testing.T) {
-	mapping := map[string][]string{"alice@example.net": {"c", "a", "b"}}
-
-	finalise(mapping)
-
-	if got := mapping["alice@example.net"]; !sort.StringsAreSorted(got) {
-		t.Errorf("expected sorted groups, got %v", got)
-	}
-}
-
-// memoryStore is a cache.Store that keeps the payload in memory. It reports
-// the fingerprint it was last given, as a shared store does, so that what the
-// store holds is what decides whether a mapping is written again.
-// It is guarded, since a store is shared: two proxies writing and reading it
-// are two goroutines, as they would be in two pods.
-
-func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
+func TestSearchFingerprintCoversBackendLayout(t *testing.T) {
 	base := testConfig()
 
 	tests := map[string]struct {
@@ -568,7 +513,7 @@ func TestMappingHashCoversTheLayoutOfTheBackends(t *testing.T) {
 			config := testConfig()
 			test.mutate(config)
 
-			if changed := config.mappingHash() != base.mappingHash(); changed != test.expChange {
+			if changed := config.searchFingerprint() != base.searchFingerprint(); changed != test.expChange {
 				t.Errorf("expected the hash to change=%t, got %t", test.expChange, changed)
 			}
 		})
@@ -587,11 +532,6 @@ func newHangingConn() *hangingConn {
 		fakeConn: &fakeConn{entries: map[string][]*goldap.Entry{}},
 		closed:   make(chan struct{}),
 	}
-}
-
-func (h *hangingConn) SearchWithPaging(*goldap.SearchRequest, uint32) (*goldap.SearchResult, error) {
-	<-h.closed
-	return nil, errors.New("ldap: response channel closed")
 }
 
 func (h *hangingConn) Close() error {

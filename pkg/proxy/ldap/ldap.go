@@ -14,29 +14,18 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 )
-
-const SourceCache = "cache"
 
 var ErrNoBackends = errors.New("no LDAP backends configured")
 
-// Stats summarizes valid records currently held in memory.
-type Stats struct {
-	Users       int       `json:"users"`
-	Groups      int       `json:"groups"`
-	LastRefresh time.Time `json:"lastRefresh"`
-	Source      string    `json:"source,omitempty"`
-}
-
-// Directory is the LDAP resolver shared by per-user cache operations.
-type Directory struct {
+// resolver queries configured LDAP backends for one identity.
+type resolver struct {
 	config       *Config
 	backends     []*backend
 	refreshUsers map[string]struct{}
 }
 
-// backend is one directory the mapping is built from.
+// backend is one configured LDAP directory.
 type backend struct {
 	config    *BackendConfig
 	tlsConfig *tls.Config
@@ -45,17 +34,15 @@ type backend struct {
 	// a file that may have gone away since startup.
 	bindPassword string
 
-	// groupBaseKeys are the configured group search bases, normalised the same
-	// way a DN read from the directory is. A group a single user refresh has
-	// never heard of is only worth looking at if it lives under one of them,
-	// and that is a comparison rather than a search.
+	// groupBaseKeys restrict membership DNs to normalized configured bases
+	// before querying LDAP for their emitted names.
 	groupBaseKeys []string
 
 	dial func(url string) (conn, error)
 }
 
 // newResolver prepares LDAP backends without contacting the directories.
-func newResolver(config *Config) (*Directory, error) {
+func newResolver(config *Config) (*resolver, error) {
 	if config == nil {
 		return nil, ErrNoBackends
 	}
@@ -87,7 +74,7 @@ func newResolver(config *Config) (*Directory, error) {
 		refreshUsers[usernameKey(username, config.UsernamePrefix)] = struct{}{}
 	}
 
-	d := &Directory{config: config, backends: backends, refreshUsers: refreshUsers}
+	d := &resolver{config: config, backends: backends, refreshUsers: refreshUsers}
 
 	// Published from here rather than at init, so that a proxy running without
 	// augmentation configured reports no series at all.
@@ -136,7 +123,7 @@ func newBackend(config *BackendConfig) (*backend, error) {
 // CanRefresh reports whether the given user is allowed to trigger a refresh.
 // With no allowed users configured, any user may - the endpoint already sits
 // behind authentication.
-func (d *Directory) CanRefresh(username string) bool {
+func (d *resolver) CanRefresh(username string) bool {
 	if len(d.refreshUsers) == 0 {
 		return true
 	}

@@ -24,7 +24,7 @@
       "default": "10m"
     },
     "refreshUsers": {
-      "description": "Users allowed to trigger a refresh of the mapping. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may trigger one.",
+      "description": "Users allowed to call the stub refresh endpoint. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may call it.",
       "type": "array",
       "items": {
         "type": "string",
@@ -137,7 +137,7 @@
           "default": "userPrincipalName"
         },
         "groupSearchBases": {
-          "description": "Base DN(s) to search for groups under. Only groups found under these bases are mapped onto users.",
+          "description": "Base DN(s) to search for groups under. Only groups under these bases contribute memberships.",
           "type": "array",
           "minItems": 1,
           "items": {

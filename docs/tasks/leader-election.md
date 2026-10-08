@@ -5,9 +5,10 @@ kube-oidc-proxy elects one of its replicas leader. The replicas contend for a
 `coordination.k8s.io` API group, and whichever holds it leads. A single replica
 simply elects itself.
 
-Every replica serves requests whether or not it leads. Leadership does not yet
-change what any replica does: it is reported, and is there for work that should
-happen on one replica only.
+Every replica serves requests whether or not it leads. When LDAP augmentation
+is enabled, the leader periodically refreshes only cached users. Every replica
+can resolve an authenticated cache miss and watches ConfigMaps for updates.
+Resource-version checks protect overlapping writes during leadership handover.
 
 ## Configuring it
 
@@ -59,7 +60,8 @@ rules:
 
 Bind it to the proxy's service account with a RoleBinding. Without it, the
 proxy still serves requests, but no replica can lead and each logs a failure to
-take the Lease every retry period.
+take the Lease every retry period. Cached memberships remain available and
+misses still resolve, but periodic LDAP refresh requires a leader.
 
 ## Observing it
 

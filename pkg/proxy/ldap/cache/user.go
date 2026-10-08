@@ -20,7 +20,7 @@ const (
 )
 
 // UserRecord persists one canonical directory identity. Groups are full names,
-// never indices or compressed data. Found distinguishes an absent user from a
+// stored directly in readable YAML. Found distinguishes an absent user from a
 // user with no memberships; both are valid cache entries.
 type UserRecord struct {
 	Version                  int       `json:"version"`

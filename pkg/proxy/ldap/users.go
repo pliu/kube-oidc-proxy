@@ -28,7 +28,7 @@ type UserDirectory struct {
 	callsMu  sync.Mutex
 	calls    map[string]*userCall
 	slots    chan struct{}
-	resolver *Directory
+	resolver *resolver
 	store    cache.UserStore
 	mu       sync.RWMutex
 	users    map[string]userCell // keyed by deterministic object name, including tombstones
@@ -176,7 +176,7 @@ func (d *UserDirectory) consume(stream watch.Interface) {
 	}
 }
 
-func (d *UserDirectory) HasMapping() bool { return d.synced.Load() }
+func (d *UserDirectory) HasSynced() bool { return d.synced.Load() }
 func (d *UserDirectory) cached(key string) (cache.UserEntry, bool) {
 	name, _ := cache.UserConfigMapName(d.scope(), key)
 	d.mu.RLock()

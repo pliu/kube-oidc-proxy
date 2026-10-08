@@ -76,7 +76,7 @@ func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return
 				}
-				_, _, err := d.resolve(ctx, key, true)
+				_, err := d.resolve(ctx, key, true)
 				if err != nil {
 					mu.Lock()
 					failures = append(failures, err)

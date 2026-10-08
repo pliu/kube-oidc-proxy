@@ -14,10 +14,9 @@ import (
 const unchangedWriteInterval = time.Hour
 
 type userCall struct {
-	done    chan struct{}
-	entry   cache.UserEntry
-	changed bool
-	err     error
+	done  chan struct{}
+	entry cache.UserEntry
+	err   error
 }
 
 // Resolve returns cache hits without external I/O. Waiter cancellation does
@@ -30,16 +29,16 @@ func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string,
 	if entry, ok := d.cached(key); ok {
 		return append([]string{}, entry.Record.Groups...), entry.Record.Found, nil
 	}
-	entry, _, err := d.resolve(ctx, key, false)
+	entry, err := d.resolve(ctx, key, false)
 	if err != nil {
 		return nil, false, err
 	}
 	return append([]string{}, entry.Record.Groups...), entry.Record.Found, nil
 }
 
-func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (cache.UserEntry, bool, error) {
+func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (cache.UserEntry, error) {
 	if err := ctx.Err(); err != nil {
-		return cache.UserEntry{}, false, err
+		return cache.UserEntry{}, err
 	}
 	d.callsMu.Lock()
 	call := d.calls[key]
@@ -49,7 +48,7 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 		go func() {
 			work, cancel := context.WithTimeout(d.ctx, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
-			call.entry, call.changed, call.err = d.lookup(work, key, refresh)
+			call.entry, call.err = d.lookup(work, key, refresh)
 			d.callsMu.Lock()
 			delete(d.calls, key)
 			close(call.done)
@@ -59,40 +58,40 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 	d.callsMu.Unlock()
 	select {
 	case <-ctx.Done():
-		return cache.UserEntry{}, false, ctx.Err()
+		return cache.UserEntry{}, ctx.Err()
 	case <-call.done:
-		return call.entry, call.changed, call.err
+		return call.entry, call.err
 	}
 }
 
-func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (cache.UserEntry, bool, error) {
+func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (cache.UserEntry, error) {
 	if !refresh {
 		if entry, ok := d.cached(key); ok {
-			return entry, false, nil
+			return entry, nil
 		}
 	}
 	// Capture the committed version BEFORE LDAP, even when watch delivery lags.
 	previous, err := d.store.Get(ctx, key)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
-		return cache.UserEntry{}, false, err
+		return cache.UserEntry{}, err
 	}
 	if err == nil && previous.Invalid == nil && !refresh {
 		d.apply(previous, false)
-		return d.committed(key, false)
+		return d.committed(key)
 	}
 	select {
 	case <-ctx.Done():
-		return cache.UserEntry{}, false, ctx.Err()
+		return cache.UserEntry{}, ctx.Err()
 	case d.slots <- struct{}{}:
 	}
 	groups, found, err := d.resolver.searchUserContext(ctx, key)
 	<-d.slots
 	if err != nil {
-		return cache.UserEntry{}, false, err
+		return cache.UserEntry{}, err
 	}
 	record, err := d.resolver.config.NewUserRecord(key, found, groups, time.Now())
 	if err != nil {
-		return cache.UserEntry{}, false, err
+		return cache.UserEntry{}, err
 	}
 	changed := previous.Record == nil || previous.Record.Found != found || !equalGroups(previous.Record.Groups, record.Groups)
 	if !changed && record.LastSuccessfulLookup.Sub(previous.Record.LastSuccessfulLookup) < unchangedWriteInterval {
@@ -104,7 +103,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		}
 		d.users[previous.Name] = cell
 		d.mu.Unlock()
-		return d.committed(key, false)
+		return d.committed(key)
 	}
 	committed, err := d.store.Upsert(ctx, record, previous.ResourceVersion)
 	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
@@ -112,50 +111,35 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		committed, err = d.store.Get(ctx, key)
 	}
 	if err != nil {
-		return cache.UserEntry{}, false, err
+		return cache.UserEntry{}, err
 	}
 	if committed.Invalid != nil || committed.Record == nil {
-		return cache.UserEntry{}, false, fmt.Errorf("committed cache record is invalid: %v", committed.Invalid)
+		return cache.UserEntry{}, fmt.Errorf("committed cache record is invalid: %v", committed.Invalid)
 	}
 	d.apply(committed, false)
 	// Watch may already have delivered an even newer record.
-	return d.committed(key, changed)
+	return d.committed(key)
 }
 
 func (d *UserDirectory) CanRefresh(username string) bool { return d.resolver.CanRefresh(username) }
-func (d *UserDirectory) RefreshUser(ctx context.Context, username string) (*UserStats, error) {
-	start := time.Now()
-	key := usernameKey(username, d.resolver.config.UsernamePrefix)
-	entry, changed, err := d.resolve(ctx, key, true)
-	if err != nil {
-		return nil, err
+func (d *UserDirectory) committed(key string) (cache.UserEntry, error) {
+	if current, ok := d.cached(key); ok {
+		return current, nil
 	}
-	return &UserStats{User: username, Found: entry.Record.Found, Groups: len(entry.Record.Groups), Changed: changed, Duration: time.Since(start).String()}, nil
-}
-func (d *UserDirectory) Stats() *Stats {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	result := &Stats{Source: SourceCache}
-	groups := make(map[string]bool)
-	for _, cell := range d.users {
-		if cell.deleted || cell.entry.Record == nil || cell.entry.Invalid != nil {
-			continue
-		}
-		result.Users++
-		for _, group := range cell.entry.Record.Groups {
-			groups[group] = true
-		}
-		if cell.checked.After(result.LastRefresh) {
-			result.LastRefresh = cell.checked
-		}
-	}
-	result.Groups = len(groups)
-	return result
+	return cache.UserEntry{}, fmt.Errorf("cache record changed or was deleted while resolving %q", key)
 }
 
-func (d *UserDirectory) committed(key string, changed bool) (cache.UserEntry, bool, error) {
-	if current, ok := d.cached(key); ok {
-		return current, changed, nil
+// equalGroups compares sorted membership lists.
+func equalGroups(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return cache.UserEntry{}, false, fmt.Errorf("cache record changed or was deleted while resolving %q", key)
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
 }

@@ -115,7 +115,7 @@ func (b *backend) timeLimit() int {
 	return seconds
 }
 
-// withConn dials the backend, runs fn against the bound connection, and
+// withConnContext dials the backend, runs fn against the bound connection, and
 // closes it. A directory that goes quiet is cut off by the watchdog, and the
 // resulting error is reported as the timeout it is.
 func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) error {
@@ -149,7 +149,7 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 	return err
 }
 
-// connect dials the configured URLs in order, returning the first connection
+// connectContext dials the configured URLs in order, returning the first connection
 // that can be established and bound.
 //
 // Each connection is handed to the watchdog as soon as it exists, since a

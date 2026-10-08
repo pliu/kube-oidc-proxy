@@ -185,15 +185,15 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 
 	primaryLDAP.AddUserToNewGroup("release-managers")
 
-	// The directory changed, but requests continue to use the complete mapping
-	// built at startup until a refresh replaces it.
+	// Memberships changed in LDAP, but cache hits still serve the record
+	// persisted by the first authenticated request until it is refreshed.
 	assertIdentity(t, request(http.MethodGet, apiPath),
 		"all-staff", "engineering", "platform-admins", "system:authenticated")
 	primaryLDAP.AssertRequests(t, 1, 2, 1)
 	secondaryLDAP.AssertRequests(t, 1, 2, 1)
 
 	// The refresh endpoint is a stub for now: it answers, but does not search
-	// the directories again, so the mapping is unchanged.
+	// the directories again, so the cached memberships are unchanged.
 	refreshResponse := request(http.MethodPost, proxy.LDAPRefreshPath)
 	if refreshResponse.StatusCode != http.StatusOK {
 		t.Fatalf("LDAP refresh response status = %d, want %d",

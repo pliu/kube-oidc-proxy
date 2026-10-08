@@ -93,7 +93,7 @@ func TestUserStartupAndWatch(t *testing.T) {
 	if err := d.Run(stop); err != nil {
 		t.Fatal(err)
 	}
-	if !d.HasMapping() {
+	if !d.HasSynced() {
 		t.Fatal("empty cache is not ready")
 	}
 	e := userTestEntry(t, d, "10", "Developers")

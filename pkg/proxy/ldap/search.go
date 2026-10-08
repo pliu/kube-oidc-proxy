@@ -4,6 +4,7 @@ package ldap
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,9 +24,6 @@ const (
 )
 
 // duplicateUserError reports two entries of one backend claiming one username.
-// It is a type of its own so that the condition can be reported as a metric,
-// which is what an operator needs to notice a directory that needs cleaning up
-// rather than one that is merely unreachable.
 type duplicateUserError struct {
 	username string
 	first    string
@@ -84,10 +82,6 @@ func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
 
 		name, ok := groupNames[key]
 		if !ok {
-			if unknown == nil {
-				continue
-			}
-
 			if name, err = unknown(groupDN, key); err != nil {
 				return nil, err
 			}
@@ -108,8 +102,8 @@ func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
 	return groups, nil
 }
 
-// searchUser queries every backend and unions only complete successful results.
-func (d *Directory) searchUserContext(ctx context.Context, key string) ([]string, bool, error) {
+// searchUserContext queries every backend and unions only complete successful results.
+func (d *resolver) searchUserContext(ctx context.Context, key string) ([]string, bool, error) {
 	type foundUser struct {
 		groups []string
 		found  bool
@@ -127,31 +121,31 @@ func (d *Directory) searchUserContext(ctx context.Context, key string) ([]string
 		return nil, false, err
 	}
 
-	merged := make(map[string][]string)
-	var found bool
+	groups := make([]string, 0)
+	seen := make(map[string]struct{})
+	found := false
 	for _, result := range results {
-		if !result.found {
-			continue
+		found = found || result.found
+		for _, group := range result.groups {
+			if _, duplicate := seen[group]; duplicate {
+				continue
+			}
+			seen[group] = struct{}{}
+			groups = append(groups, group)
 		}
-
-		found = true
-		merge(merged, map[string][]string{key: result.groups})
 	}
-
 	if !found {
 		return nil, false, nil
 	}
-
-	finalise(merged)
-
-	return merged[key], true, nil
+	sort.Strings(groups)
+	return groups, true, nil
 }
 
-// searchUser searches this backend for one user, returning the groups they
+// searchUserContext searches this backend for one user, returning the groups they
 // hold in it. The second return value reports whether the backend holds them
 // at all.
 //
-// Membership DNs are resolved directly; no directory sweep is required.
+// Membership DNs are resolved directly within configured group search bases.
 func (b *backend) searchUserContext(ctx context.Context, username string) ([]string, bool, error) {
 	groupNames := make(map[string]string)
 
@@ -175,7 +169,7 @@ func (b *backend) searchUserContext(ctx context.Context, username string) ([]str
 			}
 
 			for _, entry := range res.Entries {
-				// The mapping is keyed on the attribute value, so an entry is only
+				// Cached identities use the attribute value, so an entry is only
 				// this user if that is what it holds. A directory is free to match
 				// a filter by rules of its own - case, trailing spaces - and an
 				// entry it returned for a name that is not the one asked for would
@@ -304,8 +298,7 @@ func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(strin
 }
 
 // underGroupSearchBase reports whether a normalised DN lies under one of the
-// configured group search bases, which is the same restriction the sweep gets
-// from searching those bases and nothing else.
+// configured group search bases.
 func (b *backend) underGroupSearchBase(key string) bool {
 	for _, base := range b.groupBaseKeys {
 		if key == base || strings.HasSuffix(key, ","+base) {
@@ -317,7 +310,7 @@ func (b *backend) underGroupSearchBase(key string) bool {
 }
 
 // emittedGroupName returns the group name to impersonate, or "" if the group
-// should be left out of the mapping: it has no name attribute, or the name
+// should be left out of the memberships: it has no name attribute, or the name
 // uses the reserved system: prefix.
 func emittedGroupName(dn, name, attr string) string {
 	if skipEmptyGroup(dn, name, attr) || skipReservedGroup(dn, name) {

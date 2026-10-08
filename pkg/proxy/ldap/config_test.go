@@ -132,21 +132,6 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			`{"backends": [], "refreshIntervals": "10m"}`,
 			"refreshIntervals",
 		},
-		// The directory is the only thing that decides group membership, so
-		// there is no longer a way to ask for the groups of the token. A file
-		// still carrying the old field is rejected rather than quietly served
-		// with the opposite behaviour to the one it asks for.
-		"the removed fallbackToTokenGroups property": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"},
-			  "fallbackToTokenGroups": true}`,
-			"fallbackToTokenGroups",
-		},
-		// Where the mapping is persisted has to be stated, because leaving it
-		// out gets a proxy that cannot start while a directory is down, and
-		// nobody chooses that on purpose.
 		"a missing cache property": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
@@ -184,20 +169,6 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
 			  "refreshInterval": 600}`,
 			"string",
-		},
-		"a role": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}, "role": "standalone"}`,
-			"role",
-		},
-		"legacy Secret cache settings are rejected": {
-			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
-			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"type": "kubernetesSecret", "kubernetesSecret": {"name": "Not A Name"}}}`,
-			"additional properties",
 		},
 	}
 

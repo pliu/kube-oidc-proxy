@@ -18,11 +18,6 @@ const (
 	// LDAPRefreshPath is the path an authenticated user can POST to in order to
 	// request a refresh (currently a stub).
 	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
-
-	// LDAPRefreshUserParam names the one user to refresh, for a caller who
-	// knows what changed in the directory and does not need every other user
-	// searched for again to pick it up.
-	LDAPRefreshUserParam = "user"
 )
 
 // errImpersonationNotAccepted is returned for a request that carries
@@ -40,14 +35,9 @@ type GroupAugmenter interface {
 	CanRefresh(string) bool
 }
 
-// withLDAPRefresh serves the endpoint that triggers a rebuild of the LDAP user
-// to group mapping. It sits after authentication in the chain,
-// so only authenticated users can trigger a refresh. The path is not a valid
-// API server path, so it can never shadow a request meant for Kubernetes.
-//
-// The endpoint is a stub for now: it authenticates and authorises the caller,
-// then acknowledges the request without rebuilding anything. The mapping is
-// refreshed by the elected leader on the configured interval.
+// withLDAPRefresh authenticates and authorizes the stub refresh endpoint.
+// It acknowledges the request without performing work. Periodic cached-user
+// refresh is handled independently by the elected leader.
 func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if p.ldapDirectory == nil || req.URL.Path != LDAPRefreshPath {
@@ -82,7 +72,6 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 		klog.V(2).Infof("LDAP refresh requested by %q (%s), which is not implemented yet",
 			requester.GetName(), remoteAddr)
 
-		// TODO: refresh cached users through the same per-user machinery.
 		rw.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(rw).Encode(struct{}{}); err != nil {
 			klog.Errorf("failed to write LDAP refresh response (%s): %s", remoteAddr, err)

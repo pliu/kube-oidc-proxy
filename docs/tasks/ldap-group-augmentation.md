@@ -130,7 +130,8 @@ each replica refreshes independently under the same write preconditions.
 
 Successful unchanged checks advance an in-memory timestamp. Membership and
 `found` changes are persisted immediately; unchanged timestamps are written at
-most once per hour per record. There is no directory-wide atomic snapshot.
+most once per hour per record. Updates propagate independently for each user
+and replica.
 
 | Situation | Behavior |
 | --- | --- |

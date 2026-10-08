@@ -106,15 +106,15 @@ func TestUnchangedRefreshAvoidsWriteAndAdvancesMemoryTime(t *testing.T) {
 	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
-	before := d.Stats().LastRefresh
+	before := checkedAt(d, "alice")
 	count := len(client.Actions())
-	if _, err := d.RefreshUser(context.Background(), "alice"); err != nil {
+	if _, err := d.resolve(context.Background(), "alice", true); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.Actions()) != count+1 {
 		t.Fatal("unchanged record was written")
 	}
-	if !d.Stats().LastRefresh.After(before) {
+	if !checkedAt(d, "alice").After(before) {
 		t.Fatal("in-memory check timestamp did not advance")
 	}
 }
@@ -150,8 +150,15 @@ func TestUpdateConflictIsNotRetried(t *testing.T) {
 	d.resolver.backends[0].dial = func(string) (conn, error) {
 		return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
 	}
-	result, err := d.RefreshUser(context.Background(), "alice")
-	if err != nil || attempts != 1 || result.Found {
+	result, err := d.resolve(context.Background(), "alice", true)
+	if err != nil || attempts != 1 || result.Record.Found {
 		t.Fatalf("%+v %v attempts=%d", result, err, attempts)
 	}
+}
+
+func checkedAt(d *UserDirectory, username string) time.Time {
+	name, _ := cache.UserConfigMapName(d.scope(), username)
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.users[name].checked
 }

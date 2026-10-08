@@ -19,7 +19,6 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	clientazv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	fakesubjectaccessreview "github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview/fake"
 )
@@ -32,15 +31,8 @@ type fakeAugmenter struct {
 	// allows everyone, as the real directory does.
 	refreshUsers []string
 
-	refreshErr   error
-	refreshCount int
-
-	// directory is what a search for one user finds, standing in for the
-	// directories being searched for somebody the mapping does not hold.
-	directory map[string][]string
-
-	directoryErr error
-	userRefresh  []string
+	resolveErr   error
+	resolveCount int
 }
 
 func (f *fakeAugmenter) CanRefresh(username string) bool {
@@ -58,45 +50,15 @@ func (f *fakeAugmenter) CanRefresh(username string) bool {
 }
 
 func (f *fakeAugmenter) Resolve(ctx gocontext.Context, username string) ([]string, bool, error) {
-	if f.directoryErr != nil {
-		return nil, false, f.directoryErr
+	if f.resolveErr != nil {
+		return nil, false, f.resolveErr
 	}
-	groups, found := f.Groups(username)
+	f.resolveCount++
+	groups, found := f.mapping[username]
 	return groups, found, nil
 }
 
-func (f *fakeAugmenter) Groups(username string) ([]string, bool) {
-	groups, ok := f.mapping[username]
-	return groups, ok
-}
-
-func (f *fakeAugmenter) RefreshUser(_ gocontext.Context, username string) (*ldap.UserStats, error) {
-	f.userRefresh = append(f.userRefresh, username)
-
-	if f.directoryErr != nil {
-		return nil, f.directoryErr
-	}
-
-	groups, found := f.directory[username]
-
-	return &ldap.UserStats{
-		User:    username,
-		Found:   found,
-		Groups:  len(groups),
-		Changed: found,
-	}, nil
-}
-
 func (f *fakeAugmenter) Run(stopCh <-chan struct{}) error { return nil }
-
-func (f *fakeAugmenter) Refresh() error {
-	f.refreshCount++
-	return f.refreshErr
-}
-
-func (f *fakeAugmenter) Stats() *ldap.Stats {
-	return &ldap.Stats{Users: len(f.mapping)}
-}
 
 // serveWithLDAP runs a request that authenticates as tokenUser through the full
 // handler chain, with the given directory in place.
@@ -201,11 +163,11 @@ func TestGroupsUnchangedWhenLDAPDisabled(t *testing.T) {
 }
 
 // The endpoint is a stub for now: it answers an allowed caller without
-// rebuilding the mapping, whole or for one user.
+// resolving memberships or scheduling a refresh.
 func TestLDAPRefreshEndpointIsAStub(t *testing.T) {
 	tests := map[string]url.Values{
-		"the whole mapping": nil,
-		"one user":          {LDAPRefreshUserParam: {"bob@example.net"}},
+		"no query":      nil,
+		"ignored query": {"user": {"bob@example.net"}},
 	}
 
 	for name, query := range tests {
@@ -225,9 +187,8 @@ func TestLDAPRefreshEndpointIsAStub(t *testing.T) {
 				t.Fatalf("got unexpected response code, exp=%d got=%d", http.StatusOK, resp.StatusCode)
 			}
 
-			if directory.refreshCount != 0 || len(directory.userRefresh) != 0 {
-				t.Errorf("expected no refresh, got %d rebuilds and user refreshes of %v",
-					directory.refreshCount, directory.userRefresh)
+			if directory.resolveCount != 0 {
+				t.Errorf("stub resolved memberships %d times", directory.resolveCount)
 			}
 		})
 	}
@@ -278,8 +239,8 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 					test.expCode, resp.StatusCode)
 			}
 
-			if directory.refreshCount != 0 {
-				t.Errorf("expected no refresh, got %d", directory.refreshCount)
+			if directory.resolveCount != 0 {
+				t.Errorf("expected no membership lookup, got %d", directory.resolveCount)
 			}
 		})
 	}
@@ -304,8 +265,8 @@ func TestLDAPRefreshEndpointRequiresAuthentication(t *testing.T) {
 			http.StatusUnauthorized, resp.StatusCode)
 	}
 
-	if directory.refreshCount != 0 {
-		t.Errorf("expected no refresh, got %d", directory.refreshCount)
+	if directory.resolveCount != 0 {
+		t.Errorf("expected no membership lookup, got %d", directory.resolveCount)
 	}
 }
 
@@ -324,8 +285,8 @@ func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 			http.StatusMethodNotAllowed, resp.StatusCode)
 	}
 
-	if directory.refreshCount != 0 {
-		t.Errorf("expected no refresh, got %d", directory.refreshCount)
+	if directory.resolveCount != 0 {
+		t.Errorf("expected no membership lookup, got %d", directory.resolveCount)
 	}
 }
 
@@ -498,7 +459,7 @@ func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
 func TestLDAPResolutionFailureReturnsServiceUnavailable(t *testing.T) {
 	p := newTestProxy(t)
 	defer p.ctrl.Finish()
-	p.ldapDirectory = &fakeAugmenter{directoryErr: errors.New("persistence failed")}
+	p.ldapDirectory = &fakeAugmenter{resolveErr: errors.New("persistence failed")}
 	response := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet), &user.DefaultInfo{Name: "alice", Groups: []string{"from-token"}})
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status %d", response.StatusCode)

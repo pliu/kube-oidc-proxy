@@ -53,11 +53,11 @@ type Config struct {
 
 	// RefreshInterval is a pointer so that a file asking for a refresh
 	// interval of "0s" is rejected rather than quietly defaulted, which would
-	// leave the mapping refreshing on a schedule nobody asked for.
+	// leave cached users refreshing on a schedule nobody asked for.
 	RefreshInterval *Duration `json:"refreshInterval,omitempty"`
 
-	// RefreshUsers is the set of users allowed to trigger a refresh. If empty,
-	// any authenticated user may trigger one.
+	// RefreshUsers authorizes callers of the stub refresh endpoint. If empty,
+	// any authenticated user may call it.
 	RefreshUsers []string `json:"refreshUsers,omitempty"`
 
 	// Cache selects the namespace and scope of required per-user ConfigMaps.
@@ -65,12 +65,11 @@ type Config struct {
 
 	// UsernamePrefix is not part of the configuration file. It is the OIDC
 	// username prefix, threaded in from the OIDC options, and is stripped from
-	// the username of a request before it is looked up in the mapping so that
-	// the mapping can be keyed on the raw attribute value.
+	// request usernames before looking up their canonical cache identities.
 	UsernamePrefix string `json:"-"`
 }
 
-// BackendConfig describes one directory to build a mapping from.
+// BackendConfig describes one directory queried for user memberships.
 type BackendConfig struct {
 	Name string   `json:"name"`
 	URLs []string `json:"urls"`
@@ -381,14 +380,9 @@ func (b *BackendConfig) bindPasswordFor() (string, error) {
 	return strings.TrimRight(string(password), "\r\n"), nil
 }
 
-// mappingHash identifies the parts of the configuration that determine what a
-// built mapping contains. A mapping persisted under a different hash describes
-// a different directory layout, so it is discarded rather than served.
-//
-// Credentials, TLS settings and URLs are left out: they change how the
-// directory is reached, not what the mapping ends up holding, and a password
-// rotation should not throw away the persisted mapping.
-func (c *Config) mappingHash() string {
+// searchFingerprint identifies settings that determine LDAP memberships.
+// Connection settings and credentials do not affect record compatibility.
+func (c *Config) searchFingerprint() string {
 	type backend struct {
 		Name               string   `json:"name"`
 		UserSearchBases    []string `json:"userSearchBases"`

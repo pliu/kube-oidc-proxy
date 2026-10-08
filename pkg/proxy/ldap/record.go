@@ -14,7 +14,7 @@ import (
 // Use on a defaulted, validated Config. Credentials, connection settings, and
 // refresh intervals do not invalidate records; search settings and prefixes do.
 func (c *Config) UserRecordFingerprint() string {
-	data, _ := json.Marshal([]string{c.mappingHash(), c.UsernamePrefix})
+	data, _ := json.Marshal([]string{c.searchFingerprint(), c.UsernamePrefix})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }

@@ -47,7 +47,7 @@ func TestStandaloneLookupSecurityRules(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}})
 			test.mutate(c)
-			d := newTestDirectory(t, testConfig(), c)
+			d := newTestResolver(t, testConfig(), c)
 			groups, _, err := d.searchUserContext(context.Background(), "alice")
 			if test.failure != "" {
 				if err == nil || !strings.Contains(err.Error(), test.failure) {
@@ -65,7 +65,7 @@ func TestStandaloneLookupSecurityRules(t *testing.T) {
 func TestStandaloneLookupMergesAllBackendsAndRejectsPartialResult(t *testing.T) {
 	a := connWithUsers([]string{"One", "Shared"}, map[string][]string{"alice": {"One", "Shared"}})
 	b := connWithUsers([]string{"Two", "Shared"}, map[string][]string{"alice": {"Two", "Shared"}})
-	d := newTestDirectory(t, testConfig(testBackend("a"), testBackend("b")), a, b)
+	d := newTestResolver(t, testConfig(testBackend("a"), testBackend("b")), a, b)
 	groups, found, err := d.searchUserContext(context.Background(), "alice")
 	if err != nil || !found || !reflect.DeepEqual(groups, []string{"One", "Shared", "Two"}) {
 		t.Fatalf("%v %v %v", groups, found, err)
@@ -89,7 +89,7 @@ func TestStandaloneLookupRangedMemberships(t *testing.T) {
 		}
 		return &goldap.SearchResult{Entries: c.entries[req.BaseDN]}, nil
 	}
-	d := newTestDirectory(t, testConfig(), c)
+	d := newTestResolver(t, testConfig(), c)
 	groups, found, err := d.searchUserContext(context.Background(), "alice")
 	if err != nil || !found || len(groups) != 3 {
 		t.Fatalf("%v %v %v", groups, found, err)
@@ -104,7 +104,7 @@ func TestStandaloneLookupEscapesUsernameAndBoundsGroups(t *testing.T) {
 			filter = req.Filter
 			return &goldap.SearchResult{}, nil
 		}
-		d := newTestDirectory(t, testConfig(), c)
+		d := newTestResolver(t, testConfig(), c)
 		if _, _, err := d.searchUserContext(context.Background(), "alice*)(uid=*)"); err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +128,7 @@ func TestStandaloneLookupEscapesUsernameAndBoundsGroups(t *testing.T) {
 			}
 			return &goldap.SearchResult{}, nil
 		}
-		d := newTestDirectory(t, testConfig(), c)
+		d := newTestResolver(t, testConfig(), c)
 		groups, _, err := d.searchUserContext(context.Background(), "alice")
 		if err == nil || !strings.Contains(err.Error(), "exceeds the limit") || groups != nil {
 			t.Fatalf("truncated lookup accepted: %v %v", groups, err)

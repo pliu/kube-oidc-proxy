@@ -149,7 +149,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
 					Name: "ldap cache synchronization",
 					Check: func() error {
-						if !directory.HasMapping() {
+						if !directory.HasSynced() {
 							return errors.New("LDAP cache initial synchronization is incomplete")
 						}
 

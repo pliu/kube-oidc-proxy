@@ -218,8 +218,8 @@ func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan stru
 		return nil, nil, err
 	}
 
-	// Build the initial user -> group mapping before serving any requests,
-	// then keep it refreshed in the background.
+	// Restore and watch persisted user records before serving requests.
+	// An empty cache is valid; LDAP lookups happen on authenticated misses.
 	if p.ldapDirectory != nil {
 		if err := p.ldapDirectory.Run(stopCh); err != nil {
 			return nil, nil, err

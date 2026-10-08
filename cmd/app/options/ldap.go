@@ -10,8 +10,7 @@ import (
 
 // LDAPOptions points at the file holding the LDAP configuration.
 // The configuration itself is a JSON document rather than a set of flags,
-// since it describes a list of backends and how the mapping they are merged
-// into is persisted, neither of which a flat flag set expresses well.
+// since it describes LDAP backends and per-user ConfigMap persistence.
 type LDAPOptions struct {
 	ConfigFile string
 

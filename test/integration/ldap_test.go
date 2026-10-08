@@ -22,7 +22,7 @@ const (
 
 // mockLDAPServer is deliberately small, but it speaks LDAP over a real TCP
 // connection. It implements the bind and search operations the proxy uses to
-// build its initial user-to-group mapping.
+// resolve an authenticated user and their group memberships.
 type mockLDAPServer struct {
 	listener net.Listener
 
@@ -65,7 +65,7 @@ func (s *mockLDAPServer) URL() string {
 }
 
 // AddUserToNewGroup changes what subsequent LDAP searches return. The proxy
-// should not observe this until it refreshes its in-memory mapping.
+// should not observe this until it refreshes the cached user record.
 func (s *mockLDAPServer) AddUserToNewGroup(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

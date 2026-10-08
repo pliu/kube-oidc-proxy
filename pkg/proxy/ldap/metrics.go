@@ -37,7 +37,7 @@ var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 // registerMetrics publishes the metrics on first use, so that a proxy running
 // without LDAP augmentation configured reports no series at all rather than a
 // last_refresh_success of 0 that nothing will ever set. Registering once keeps
-// building more than one Directory, as the tests do, from panicking.
+// constructing multiple resolvers in one process from panicking.
 var registerMetrics = sync.OnceFunc(func() {
 	prometheus.MustRegister(lastRefreshSuccess, refreshDuration,
 		backendRefreshDuration)
