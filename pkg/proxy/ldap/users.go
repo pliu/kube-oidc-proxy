@@ -27,13 +27,16 @@ type UserDirectory struct {
 	leadership func() context.Context
 	callsMu    sync.Mutex
 	calls      map[string]*userCall
-	resolver   *resolver
-	store      cache.UserStore
-	mu         sync.RWMutex
-	users      map[string]userCell // keyed by deterministic object name, including tombstones
-	synced     atomic.Bool
-	ctx        context.Context
-	cancel     context.CancelFunc
+	// lookups and refreshes count the calls each kind started, admitted
+	// against lookupConcurrency and refreshConcurrency respectively.
+	lookups, refreshes int
+	resolver           *resolver
+	store              cache.UserStore
+	mu                 sync.RWMutex
+	users              map[string]userCell // keyed by deterministic object name, including tombstones
+	synced             atomic.Bool
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // NewUserDirectory refreshes cached users periodically only during the live

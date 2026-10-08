@@ -101,9 +101,6 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 			if _, _, err := d.Resolve(ctx, "bob"); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("same-user waiter could not join: %v", err)
 			}
-			if err := d.RefreshCached(context.Background()); !errors.Is(err, ErrLookupCapacity) {
-				t.Fatalf("refresh bypassed admission: %v", err)
-			}
 			unblock()
 			for i := 0; i < 2; i++ {
 				select {
@@ -119,5 +116,59 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 				t.Fatalf("capacity was not released: %v", err)
 			}
 		})
+	}
+}
+
+func TestRefreshHasSeparateCapacity(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	d.resolver.config.LookupConcurrency = 1
+	d.resolver.config.RefreshConcurrency = 1
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	// Lookups of absent users block at persistence, holding their slot.
+	store := &gatedLookupStore{UserStore: d.store, entered: make(chan string, 4), release: release}
+	d.store = store
+	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+	entered := func(what string) {
+		t.Helper()
+		select {
+		case <-store.entered:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not reach blocked I/O", what)
+		}
+	}
+
+	results := make(chan error, 2)
+	go func() { _, _, err := d.Resolve(context.Background(), "bob"); results <- err }()
+	entered("request lookup")
+	if _, _, err := d.Resolve(context.Background(), "carol"); !errors.Is(err, ErrLookupCapacity) {
+		t.Fatalf("request limit not enforced: %v", err)
+	}
+
+	// Full request capacity must not hold up refresh, and the reverse.
+	go func() { _, err := d.resolve(context.Background(), "dave", true); results <- err }()
+	entered("refresh lookup with request capacity full")
+	if _, err := d.resolve(context.Background(), "erin", true); !errors.Is(err, ErrLookupCapacity) {
+		t.Fatalf("refresh limit not enforced: %v", err)
+	}
+
+	unblock()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("admitted lookup did not complete")
+		}
+	}
+	if _, _, err := d.Resolve(context.Background(), "later"); err != nil {
+		t.Fatalf("request capacity was not released: %v", err)
+	}
+	if _, err := d.resolve(context.Background(), "later-refresh", true); err != nil {
+		t.Fatalf("refresh capacity was not released: %v", err)
 	}
 }

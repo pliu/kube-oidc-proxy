@@ -15,7 +15,9 @@ import (
 const unchangedWriteInterval = time.Hour
 
 // ErrLookupCapacity means this replica has no room for another distinct-user
-// lookup. Existing calls can still be joined and memory hits remain available.
+// lookup of the kind asked for. Request lookups and refresh lookups have
+// separate limits. Existing calls of either kind can still be joined and memory
+// hits remain available.
 var ErrLookupCapacity = errors.New("LDAP lookup capacity exhausted")
 
 type userCall struct {
@@ -52,12 +54,18 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 			return cache.UserEntry{}, err
 		}
 		// Admission happens before allocating shared work or performing I/O.
-		// The map bounds the entire lookup, including persistence, and permits
-		// same-user waiters to join even while capacity is exhausted.
-		if len(d.calls) >= d.resolver.config.LookupConcurrency {
+		// A slot is held for the entire lookup, including persistence, and
+		// same-user waiters can join even while capacity is exhausted. Refresh
+		// has its own limit, so a cycle cannot starve request lookups.
+		active, limit := &d.lookups, d.resolver.config.LookupConcurrency
+		if refresh {
+			active, limit = &d.refreshes, d.resolver.config.RefreshConcurrency
+		}
+		if *active >= limit {
 			d.callsMu.Unlock()
 			return cache.UserEntry{}, ErrLookupCapacity
 		}
+		*active++
 		call = &userCall{done: make(chan struct{})}
 		d.calls[key] = call
 		go func() {
@@ -66,6 +74,7 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 			call.entry, call.err = d.lookup(work, key, refresh)
 			d.callsMu.Lock()
 			delete(d.calls, key)
+			*active--
 			close(call.done)
 			d.callsMu.Unlock()
 		}()

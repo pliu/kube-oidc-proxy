@@ -44,7 +44,13 @@
       "type": "integer",
       "minimum": 1,
       "default": 8,
-      "description": "Maximum concurrent distinct-user lookups per replica, including Kubernetes reads, LDAP and persistence. New identities are rejected when full; existing calls can still be joined. Each LDAP lookup queries all backends."
+      "description": "Maximum concurrent distinct-user lookups started by requests per replica, including Kubernetes reads, LDAP and persistence. New identities are rejected when full; existing calls can still be joined. Each LDAP lookup queries all backends."
+    },
+    "refreshConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4,
+      "description": "Maximum concurrent lookups started by the leader's periodic refresh, counted separately from lookupConcurrency so a refresh cycle never exhausts request capacity."
     }
   },
   "$defs": {

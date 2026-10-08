@@ -30,11 +30,15 @@ func (d *UserDirectory) runRefresh() {
 }
 
 // Leadership loss or replica shutdown cancels scheduling and waiting, while
-// shared lookups retain the independent lifetime owned by resolve.
+// shared lookups retain the independent lifetime owned by resolve. The cycle
+// derives from the replica context so that shutdown cancels it at the same
+// moment as shared lookups, which also derive from it; otherwise a lookup
+// failing on shutdown could be reported before the cycle saw cancellation.
+// Leadership loss does not end shared lookups, so it is linked asynchronously.
 func (d *UserDirectory) refreshWhileLeader(term context.Context) error {
-	cycle, cancel := context.WithCancel(term)
+	cycle, cancel := context.WithCancel(d.ctx)
 	defer cancel()
-	stop := context.AfterFunc(d.ctx, cancel)
+	stop := context.AfterFunc(term, cancel)
 	defer stop()
 	return d.RefreshCached(cycle)
 }
@@ -55,7 +59,7 @@ func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var failures []error
-	for i := 0; i < d.resolver.config.LookupConcurrency; i++ {
+	for i := 0; i < d.resolver.config.RefreshConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

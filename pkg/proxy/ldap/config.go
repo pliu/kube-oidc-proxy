@@ -42,12 +42,16 @@ const (
 	DefaultTimeout            = time.Minute * 5
 	DefaultLookupTimeout      = time.Minute
 	DefaultLookupConcurrency  = 8
+	DefaultRefreshConcurrency = 4
 )
 
 // Config is the decoded contents of an LDAP configuration file.
 type Config struct {
 	LookupTimeout     *Duration `json:"lookupTimeout,omitempty"`
 	LookupConcurrency int       `json:"lookupConcurrency,omitempty"`
+	// RefreshConcurrency bounds the leader's periodic refresh separately, so
+	// that a refresh cycle cannot take the capacity request lookups rely on.
+	RefreshConcurrency int `json:"refreshConcurrency,omitempty"`
 	// Backends are queried for each uncached user. Results from
 	// every backend are merged, so a user held in more than one
 	// directory ends up with the union of their groups.
@@ -239,6 +243,9 @@ func (c *Config) SetDefaults() {
 	if c.LookupConcurrency == 0 {
 		c.LookupConcurrency = DefaultLookupConcurrency
 	}
+	if c.RefreshConcurrency == 0 {
+		c.RefreshConcurrency = DefaultRefreshConcurrency
+	}
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)
 	}
@@ -277,6 +284,9 @@ func (c *Config) Validate() error {
 	}
 	if c.LookupConcurrency < 1 {
 		errs = append(errs, errors.New("lookupConcurrency must be positive"))
+	}
+	if c.RefreshConcurrency < 1 {
+		errs = append(errs, errors.New("refreshConcurrency must be positive"))
 	}
 
 	if len(c.Backends) == 0 {

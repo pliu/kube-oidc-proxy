@@ -25,7 +25,8 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
   "cache": {"namespace": "kube-oidc-proxy", "scope": "main"},
   "refreshInterval": "10m",
   "lookupTimeout": "1m",
-  "lookupConcurrency": 8
+  "lookupConcurrency": 8,
+  "refreshConcurrency": 4
 }
 ```
 
@@ -36,7 +37,8 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
 | `cache.namespace` | Pod namespace | Namespace containing generated user ConfigMaps. Set explicitly outside Kubernetes. |
 | `refreshInterval` | `10m` | Interval between leader refresh cycles. |
 | `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. |
-| `lookupConcurrency` | `8` | Maximum concurrent distinct-user lookups **per replica**, including Kubernetes reads, LDAP and persistence. |
+| `lookupConcurrency` | `8` | Maximum concurrent distinct-user lookups started by requests **per replica**, including Kubernetes reads, LDAP and persistence. |
+| `refreshConcurrency` | `4` | Maximum concurrent lookups started by the leader's periodic refresh, counted separately from `lookupConcurrency`. |
 | `refreshUsers` | Any authenticated user | Allowed callers of the currently stubbed refresh endpoint. |
 
 Each backend requires a unique `name`, one or more `urls`, `userSearchBases`, and
@@ -114,16 +116,20 @@ users can progress concurrently. Canceling one request does not cancel shared
 miss work. Lookup deadlines and shutdown bound that work. Admission is limited
 by `lookupConcurrency` before any shared goroutine or external I/O starts. At
 capacity, new distinct-user lookups fail immediately (HTTP 503); memory hits and
-waiters joining admitted same-user work remain available. Refresh uses the same
-limit, and users that cannot be admitted are retried in the next cycle.
+waiters joining admitted same-user work remain available. Refresh is admitted
+against its own `refreshConcurrency` limit, so a refresh cycle never takes
+capacity from request lookups; a user already being looked up by a request is
+joined rather than looked up twice. Refresh lookups that cannot be admitted are
+retried in the next cycle.
 
 Across replicas, lookups may overlap and perform duplicate LDAP queries. There
 is no distributed single-flight lock. Create conflicts and resource-version
 update preconditions arbitrate writes. Each lookup captures the committed
 version **before** LDAP; a conflicting lookup discards its answer and reloads
 the winning record, without retrying the stale update. Watches eventually
-synchronize all replicas. With `N` replicas and concurrency `C`, up to `N × C`
-user LDAP lookups can run cluster-wide; each queries all configured backends.
+synchronize all replicas. With `N` replicas, request concurrency `C` and refresh
+concurrency `R`, up to `N × C + R` user LDAP lookups can run cluster-wide (only
+the leader refreshes); each queries all configured backends.
 
 The elected leader snapshots only cached users each cycle, refreshing with
 bounded concurrency and committing each independently. Users added during a
@@ -132,9 +138,9 @@ ends; that event directly stops scheduling and waiting for the cycle. Shared in-
 lookups retain their independent timeout so another waiter is not canceled;
 optimistic writes protect overlapping operations during handover.
 
-Successful unchanged checks advance an in-memory timestamp. Membership and
-`found` changes are persisted immediately; unchanged timestamps are written at
-most once per hour per record. Updates propagate independently for each user
+Membership and `found` changes are persisted immediately. A check that finds
+nothing changed rewrites the record's `lastSuccessfulLookup` at most once per
+hour. Updates propagate independently for each user
 and replica.
 
 | Situation | Behavior |

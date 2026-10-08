@@ -171,6 +171,7 @@ ldap:
   cacheScope: main
   config:
     lookupConcurrency: 8
+    refreshConcurrency: 4
     lookupTimeout: 1m
     refreshInterval: 10m
     backends:
