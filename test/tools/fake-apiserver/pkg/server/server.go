@@ -5,8 +5,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	"net"
 	"net/http"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -14,7 +16,9 @@ import (
 type Server struct {
 	keyFile, certFile string
 
-	stopCh <-chan struct{}
+	stopCh  <-chan struct{}
+	leaseMu sync.Mutex
+	leases  map[string]coordinationv1.Lease
 }
 
 func New(keyFile, certFile string, stopCh <-chan struct{}) (*Server, error) {
@@ -33,6 +37,7 @@ func New(keyFile, certFile string, stopCh <-chan struct{}) (*Server, error) {
 		keyFile:  keyFile,
 		certFile: certFile,
 		stopCh:   stopCh,
+		leases:   make(map[string]coordinationv1.Lease),
 	}, nil
 }
 
@@ -67,6 +72,9 @@ func (s *Server) Run(bindAddress, listenPort string) (<-chan struct{}, error) {
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	if s.serveLease(rw, r) {
+		return
+	}
 	log.Infof("(%s) Fake API server received url %s", r.URL, r.RemoteAddr)
 
 	log.Infof("(%s) Request headers:", r.RemoteAddr)

@@ -160,30 +160,25 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 
 			// Elect one replica leader. Every replica serves requests
 			// whether or not it leads.
-			var elector *leader.Elector
-			if opts.LeaderElection.LeaderElect {
-				namespace := opts.LeaderElection.ResourceNamespace
-				if namespace == "" {
-					namespace, err = cache.InClusterNamespace()
-					if err != nil {
-						return fmt.Errorf("no --leader-elect-resource-namespace set and %s "+
-							"(set --leader-elect=false when running outside a cluster)", err)
-					}
-				}
-
-				elector, err = leader.New(kubeclient, leader.Config{
-					Namespace:     namespace,
-					Name:          opts.LeaderElection.ResourceName,
-					LeaseDuration: opts.LeaderElection.LeaseDuration.Duration,
-					RenewDeadline: opts.LeaderElection.RenewDeadline.Duration,
-					RetryPeriod:   opts.LeaderElection.RetryPeriod.Duration,
-				})
+			namespace := opts.LeaderElection.ResourceNamespace
+			if namespace == "" {
+				namespace, err = cache.InClusterNamespace()
 				if err != nil {
-					return err
+					return fmt.Errorf("no --leader-elect-resource-namespace set: %w", err)
 				}
 			}
 
-			if ldapUsers != nil && elector != nil {
+			elector, err := leader.New(kubeclient, leader.Config{
+				Namespace:     namespace,
+				Name:          opts.LeaderElection.ResourceName,
+				LeaseDuration: opts.LeaderElection.LeaseDuration.Duration,
+				RenewDeadline: opts.LeaderElection.RenewDeadline.Duration,
+				RetryPeriod:   opts.LeaderElection.RetryPeriod.Duration,
+			})
+			if err != nil {
+				return err
+			}
+			if ldapUsers != nil {
 				ldapUsers.SetLeaderCheck(elector.IsLeader)
 			}
 
@@ -194,10 +189,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
-			// Start readiness probe. It stays unready until the secure
-			// listener is accepting, so a restored LDAP mapping cannot put
-			// the pod in its Service while the first directory sweep is
-			// still blocking Run.
+			// Stay unready until the secure listener is accepting.
 			ready := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
 				p.OIDCHealthCheck, ldapReadiness...)
 
@@ -207,28 +199,19 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
-			// The port is bound before any of this, so an early request
-			// would be taken and then left hanging rather than refused.
-			// Serve returns once the listener is accepting: mark only then,
-			// so the Service cannot route requests that would wait out the
-			// first directory sweep.
+			// Serve has started accepting requests; allow Service traffic.
 			ready.MarkServing()
 
 			// Contended for only once serving, so that a replica that fails
 			// to start never holds the Lease.
-			var electionDone <-chan struct{}
-			if elector != nil {
-				electionDone = elector.Run(stopCh)
-			}
+			electionDone := elector.Run(stopCh)
 
 			<-waitCh
 			<-listenerStoppedCh
 
 			// Waited on so that the Lease is released before the process
 			// exits, and the next leader can take over at once.
-			if electionDone != nil {
-				<-electionDone
-			}
+			<-electionDone
 
 			if err := p.RunPreShutdownHooks(); err != nil {
 				return err

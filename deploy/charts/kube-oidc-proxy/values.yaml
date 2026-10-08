@@ -56,11 +56,6 @@ extraImpersonationHeaders:
   clientIP: false
   #headers: key1=foo,key2=bar,key1=bar
 
-# Elect one replica leader through a Lease named after the release, in the
-# release namespace. Every replica keeps serving requests either way.
-leaderElection:
-  enabled: true
-
 extraArgs: {}
   #audit-log-path: /audit-log
   #audit-policy-file: /audit/audit.yaml

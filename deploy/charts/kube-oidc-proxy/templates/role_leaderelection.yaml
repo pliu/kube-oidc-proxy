@@ -1,4 +1,3 @@
-{{- if .Values.leaderElection.enabled }}
 kind: Role
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -36,4 +35,3 @@ subjects:
 - kind: ServiceAccount
   name: {{ include "kube-oidc-proxy.fullname" . }}
   namespace: {{ .Release.Namespace }}
-{{- end }}

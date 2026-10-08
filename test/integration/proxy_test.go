@@ -127,7 +127,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		"--tls-private-key-file=" + keyPath,
 		"--readiness-probe-port=" + readinessPort,
 		"--oidc-config-file=" + authnConfigPath,
-		"--leader-elect=false",
+		"--leader-elect-resource-namespace=proxy",
 		"--ldap-config-file=" + ldapConfigPath,
 		"--audit-policy-file=" + policy, "--audit-log-path=" + auditPath, "--audit-log-mode=blocking",
 	})
@@ -136,6 +136,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	go func() { commandErr <- command.Execute() }()
 
 	waitForReady(t, "http://127.0.0.1:"+readinessPort+"/ready", commandErr)
+	waitForLeader(t, apiServer.URL)
 	primaryLDAP.AssertRequests(t, 0, 0, 0)
 	secondaryLDAP.AssertRequests(t, 0, 0, 0)
 

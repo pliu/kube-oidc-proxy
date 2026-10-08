@@ -12,18 +12,15 @@ Resource-version checks protect overlapping writes during leadership handover.
 
 ## Configuring it
 
-Leader election is on by default, and needs nothing but the
+Leader election is mandatory and needs the
 [permissions below](#rbac): the Lease is named `kube-oidc-proxy` and lives in
 the namespace the proxy runs in.
 
 Running the proxy outside a cluster - against a kubeconfig on a workstation,
-say - there is no namespace to default to. Either name one with
-`--leader-elect-resource-namespace`, or turn election off with
-`--leader-elect=false`.
+say - there is no namespace to default to. Set `--leader-elect-resource-namespace` to a namespace in the target cluster.
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `--leader-elect` | `true` | Take part in electing a leader. Set to `false` to run outside a cluster. |
 | `--leader-elect-resource-name` | `kube-oidc-proxy` | The name of the Lease. |
 | `--leader-elect-resource-namespace` | the pod's namespace | The namespace of the Lease. Taken from `$POD_NAMESPACE` if set, and from the service account namespace file otherwise. |
 | `--leader-elect-lease-duration` | `15s` | How long a Lease that is not renewed is honoured, and so the longest a leader that has stopped can go unreplaced. |
@@ -31,8 +28,7 @@ say - there is no namespace to default to. Either name one with
 | `--leader-elect-retry-period` | `2s` | How often replicas try to take or renew the Lease. |
 
 The Helm chart names the Lease after the release, puts it in the release
-namespace, and grants the permissions below. `leaderElection.enabled: false`
-turns election off and leaves the permissions out. The manifest in
+namespace, and always grants the permissions below. The manifest in
 `deploy/yaml` grants them too.
 
 A replica starts contending only once it is serving, so one that fails to start

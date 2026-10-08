@@ -27,12 +27,9 @@ type HealthCheck struct {
 	// blips.
 	oidcReady atomic.Bool
 
-	// serving is set once the secure listener is accepting connections.
-	// Without this, a restored LDAP mapping (or an initialised OIDC
-	// authenticator) would report the pod Ready while Run is still blocked
-	// on the first directory sweep and nothing is accepting on the bound
-	// port. The port is bound long before then, so a connection would be
-	// taken and the request left hanging rather than refused.
+	// serving is set once the secure listener is accepting connections, so
+	// initialized authenticators and caches cannot report readiness before
+	// the proxy can handle requests.
 	serving atomic.Bool
 }
 

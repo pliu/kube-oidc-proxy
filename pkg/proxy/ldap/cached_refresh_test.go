@@ -47,6 +47,9 @@ func TestRefreshOnlyCachedUsersIncludingAbsent(t *testing.T) {
 
 func TestPeriodicRefreshRequiresLeadership(t *testing.T) {
 	d, _ := userTestDirectory(t)
+	if d.isLeader() {
+		t.Fatal("directory assumed leadership before an elector was configured")
+	}
 	d.resolver.config.RefreshInterval = NewDuration(10 * time.Millisecond)
 	var calls atomic.Int64
 	d.resolver.backends[0].dial = func(string) (conn, error) { calls.Add(1); return connWithUsers(nil, nil), nil }

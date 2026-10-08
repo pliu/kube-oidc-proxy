@@ -61,12 +61,8 @@ spec:
           {{- if .Values.extraImpersonationHeaders.headers }}
           - "--extra-user-headers={{ .Values.extraImpersonationHeaders.headers }}"
           {{ end }}
-          {{- if not .Values.leaderElection.enabled }}
-          - "--leader-elect=false"
-          {{- else }}
           - "--leader-elect-resource-name={{ include "kube-oidc-proxy.fullname" . }}"
           - "--leader-elect-resource-namespace={{ .Release.Namespace }}"
-          {{ end }}
           {{- range $key, $value := .Values.extraArgs -}}
           - "--{{ $key }}={{ $value -}}"
           {{ end }}

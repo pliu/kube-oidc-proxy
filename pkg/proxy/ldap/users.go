@@ -46,7 +46,7 @@ func NewUserDirectory(config *Config, store cache.UserStore) (*UserDirectory, er
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UserDirectory{isLeader: func() bool { return true }, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
+	return &UserDirectory{isLeader: func() bool { return false }, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
 }
 
 // Core Kubernetes ConfigMap resource versions are monotonically increasing

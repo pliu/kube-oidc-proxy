@@ -28,8 +28,7 @@ var isLeader = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help:      "1 if this replica holds the leader election lease, and 0 otherwise.",
 })
 
-// registerMetrics publishes the metrics on first use, so that a proxy running
-// without leader election reports no series at all.
+// registerMetrics publishes the metrics once, when the first elector is constructed.
 var registerMetrics = sync.OnceFunc(func() {
 	prometheus.MustRegister(isLeader)
 })

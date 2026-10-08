@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/pflag"
 	cliflag "k8s.io/component-base/cli/flag"
 )
 
@@ -13,18 +14,8 @@ func TestLeaderElectionOptionsValidate(t *testing.T) {
 		mutate  func(*LeaderElectionOptions)
 		expErrs int
 	}{
-		"disabled is never an error": {
-			mutate: func(l *LeaderElectionOptions) {
-				l.LeaderElect = false
-				l.ResourceName = ""
-			},
-		},
 		"the defaults are valid": {
 			mutate: func(*LeaderElectionOptions) {},
-		},
-		"a lock other than leases": {
-			mutate:  func(l *LeaderElectionOptions) { l.ResourceLock = "endpoints" },
-			expErrs: 1,
 		},
 		"no lease name": {
 			mutate:  func(l *LeaderElectionOptions) { l.ResourceName = "" },
@@ -49,5 +40,15 @@ func TestLeaderElectionOptionsValidate(t *testing.T) {
 				t.Errorf("expected %d errors, got %v", test.expErrs, errs)
 			}
 		})
+	}
+}
+
+func TestLeaderElectionCannotBeDisabled(t *testing.T) {
+	flags := new(cliflag.NamedFlagSets)
+	NewLeaderElectionOptions(flags)
+	fs := flags.FlagSet("Leader Election")
+	fs.Init("Leader Election", pflag.ContinueOnError)
+	if err := fs.Parse([]string{"--leader-elect=false"}); err == nil {
+		t.Fatal("expected the removed leader-elect flag to be rejected")
 	}
 }

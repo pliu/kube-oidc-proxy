@@ -162,7 +162,7 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 		"--tls-private-key-file=" + keyPath,
 		"--readiness-probe-port=" + readinessPort,
 		"--oidc-config-file=" + authnConfigPath,
-		"--leader-elect=false",
+		"--leader-elect-resource-namespace=proxy",
 	})
 
 	commandErr := make(chan error, 1)
@@ -170,6 +170,7 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 
 	// Ready only once every issuer's keys have been fetched.
 	waitForReady(t, "http://127.0.0.1:"+readinessPort+"/ready", commandErr)
+	waitForLeader(t, apiServer.URL)
 
 	rootCAs := x509.NewCertPool()
 	if !rootCAs.AppendCertsFromPEM(bundle.CertBytes) {
