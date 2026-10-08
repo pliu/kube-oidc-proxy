@@ -146,7 +146,7 @@ including potentially stale grants until a refresh succeeds. There is no maximum
 stale age or eviction policy. A user's ConfigMap must fit Kubernetes object size
 limits; an oversized record fails persistence and is never partially served.
 
-## Deployment and migration
+## Deployment
 
 ConfigMaps contain readable usernames and memberships. LDAP remains the
 authority; these are generated cache records. Restrict write access to the
@@ -166,15 +166,9 @@ Role/RoleBinding. Mount bind credentials and CA files using `extraVolumes` and
 `extraVolumeMounts`. The chart supplies `cache` from its cache settings. See the
 [chart values](../../deploy/charts/kube-oidc-proxy/values.yaml).
 
-Legacy directory snapshots in files or Secrets are **not imported**. Remove
-`cache.type`, `cache.file`, and `cache.kubernetesSecret`; configure namespace and
-scope instead. Obsolete settings are rejected at startup. Roll out with an empty
-per-user cache, populated by authenticated traffic. The first request for an
-uncached user waits for LDAP and Kubernetes persistence. LDAP must be reachable
-for those requests, so schedule migration accordingly. No migration tool is
-provided; existing legacy objects/files may be retained for rollback and removed
-separately by an operator. Do not run mixed old/new versions expecting them to
-share persisted memberships.
+This is a greenfield deployment. Start with an empty per-user cache, populated
+by authenticated traffic. The first request for an uncached user waits for LDAP
+and Kubernetes persistence, so both services must be reachable for that request.
 
 The authenticated POST `/kube-oidc-proxy/ldap/refresh` endpoint remains explicitly
 stubbed: it returns `{}` after authorization and performs no refresh. Periodic

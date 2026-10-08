@@ -11,8 +11,8 @@ test comparing persisted memberships with forwarded and audited identities.
 Same-user coalescing and lookup concurrency are local to each replica.
 Cross-replica correctness uses ConfigMap create conflicts and resource-version
 updates; it permits duplicate LDAP queries. Unchanged-record timestamps are
-persisted at most hourly. Legacy snapshots are not imported. See
-[configuration and migration](ldap-group-augmentation.md) for rollout details.
+persisted at most hourly. This is a greenfield deployment with no migration
+requirements. See [configuration and deployment](ldap-group-augmentation.md).
 
 ## Intended behavior
 
@@ -195,7 +195,7 @@ Updates across users and propagation across replicas are eventually consistent;
 there is no directory-wide atomic snapshot. The first uncached request waits for
 LDAP and Kubernetes persistence.
 
-## 8. Configuration, deployment, and migration
+## 8. Configuration and deployment
 
 Update LDAP configuration/schema for the ConfigMap namespace, cache scope, refresh
 interval, and lookup concurrency/timeouts. Remove obsolete whole-snapshot cache
@@ -209,10 +209,9 @@ Document that ConfigMaps contain readable usernames and memberships and must be
 writable only by the authorized proxy/controller identity. They are generated
 cache records; LDAP remains the authority.
 
-Choose and document the legacy snapshot migration policy before rollout. The
-default proposal is to start with an empty per-user cache and populate it on
-authenticated traffic; provide an explicit migration tool only if existing
-memberships must remain available through an LDAP outage during deployment.
+This is a greenfield deployment; no migration tooling or compatibility with
+legacy snapshots is required. Start with an empty per-user cache and populate it
+on authenticated traffic.
 
 Reconcile the stubbed manual refresh endpoint with the new model: either keep it
 explicitly stubbed or implement it through the same per-user refresh machinery.
@@ -227,7 +226,7 @@ Implement and review in this order:
 3. In-memory cache, startup restore, watch synchronization, and concurrency rules.
 4. Authentication-path cache misses and persistence-before-publication behavior.
 5. Leader-only periodic refresh of cached users and revised readiness.
-6. Deployment/schema updates, migration documentation, and obsolete code removal.
+6. Deployment/schema updates, deployment documentation, and obsolete code removal.
 
 Meaningful tests should cover readable round trips; empty and absent users; cold
 startup without LDAP enumeration; cache hits performing no external I/O; lookup

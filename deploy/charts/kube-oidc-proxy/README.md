@@ -182,6 +182,6 @@ ldap:
 
 Replicas coalesce misses locally and coordinate writes through ConfigMap
 resource versions. Concurrency is per replica; the leader refreshes only cached
-users. ConfigMaps expose readable identities/memberships. Legacy file/Secret
-snapshots are not imported; the first uncached request requires LDAP access.
-See [LDAP configuration and migration](../../../docs/tasks/ldap-group-augmentation.md).
+users. ConfigMaps expose readable identities/memberships. The cache starts empty;
+the first uncached request requires LDAP and Kubernetes persistence.
+See [LDAP configuration and deployment](../../../docs/tasks/ldap-group-augmentation.md).
