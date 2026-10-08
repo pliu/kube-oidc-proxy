@@ -93,7 +93,7 @@ func testConfig(backends ...*BackendConfig) *Config {
 		backends = []*BackendConfig{testBackend("ldap")}
 	}
 
-	return &Config{Cache: &CacheConfig{Scope: "main"},
+	return &Config{Cache: &CacheConfig{},
 		Backends:        backends,
 		RefreshInterval: NewDuration(time.Minute * 10),
 	}
@@ -458,7 +458,7 @@ func TestSearchFingerprintCoversBackendLayout(t *testing.T) {
 		"a rotated password":      {func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},
 		"a changed url":           {func(c *Config) { c.Backends[0].URLs = []string{"ldaps://other.example.net:636"} }, false},
 		"a changed refresh":       {func(c *Config) { c.RefreshInterval = NewDuration(time.Hour) }, false},
-		"a changed cache setting": {func(c *Config) { c.Cache = &CacheConfig{Scope: "other"} }, false},
+		"a changed cache setting": {func(c *Config) { c.Cache = &CacheConfig{Namespace: "other"} }, false},
 		"a changed timeout":       {func(c *Config) { c.Backends[0].Timeout = NewDuration(time.Hour) }, false},
 	}
 

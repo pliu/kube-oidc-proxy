@@ -6,8 +6,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "backends",
-    "cache"
+    "backends"
   ],
   "properties": {
     "backends": {
@@ -32,7 +31,7 @@
       }
     },
     "cache": {
-      "description": "Required per-user ConfigMap persistence scope.",
+      "description": "Where per-user ConfigMaps are stored.",
       "$ref": "#/$defs/cache"
     },
     "lookupTimeout": {
@@ -168,22 +167,12 @@
     "cache": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "scope"
-      ],
       "properties": {
         "namespace": {
           "type": "string",
           "minLength": 1,
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
           "description": "Defaults to the pod namespace."
-        },
-        "scope": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 63,
-          "pattern": "^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$",
-          "description": "Shared by replicas with identical LDAP and identity settings; separates unrelated caches."
         }
       }
     }

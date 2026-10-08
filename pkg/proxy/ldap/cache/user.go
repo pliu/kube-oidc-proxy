@@ -8,9 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
-
-	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
 const (
@@ -135,11 +134,41 @@ func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
 	return r.normalized()
 }
 
-// UserConfigMapName hashes scope and canonical identity separately from LDAP
-// configuration so a configuration change replaces the same user's record.
-func UserConfigMapName(scope, username string) (string, error) {
-	if strings.TrimSpace(scope) == "" || strings.TrimSpace(username) == "" {
-		return "", errors.New("user ConfigMap name requires a cache scope and username")
+// userConfigMapPrefix starts the name of every user ConfigMap.
+const userConfigMapPrefix = "kube-oidc-proxy-user-"
+
+// UserConfigMapName derives a readable ConfigMap name from the canonical
+// username, so an operator can find a user's record by name. It is independent
+// of LDAP configuration, so a configuration change replaces the same record.
+//
+// A ConfigMap name must be a DNS subdomain, so characters it cannot hold become
+// '-', a '.' that would not sit between two letters or digits becomes '-', and
+// names over the length limit are cut short. Distinct usernames can therefore
+// share a name; the record's username field, not the name, identifies its user.
+func UserConfigMapName(username string) (string, error) {
+	if strings.TrimSpace(username) == "" {
+		return "", errors.New("user ConfigMap name requires a username")
 	}
-	return "kube-oidc-proxy-user-" + util.HashJSON([]string{scope, username}), nil
+
+	mapped := []byte(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(username)))
+	// strings.Map replaced every non-ASCII rune with one '-', so the result is ASCII.
+	alnum := func(c byte) bool { return c >= 'a' && c <= 'z' || c >= '0' && c <= '9' }
+	for i, c := range mapped {
+		// The prefix ends in '-', so a leading '.' never follows a letter or digit.
+		if c == '.' && (i == 0 || !alnum(mapped[i-1]) || i == len(mapped)-1 || !alnum(mapped[i+1])) {
+			mapped[i] = '-'
+		}
+	}
+
+	name := userConfigMapPrefix + string(mapped)
+	if len(name) > validation.DNS1123SubdomainMaxLength {
+		name = name[:validation.DNS1123SubdomainMaxLength]
+	}
+	// A name must end in a letter or digit; the prefix guarantees one remains.
+	return strings.TrimRight(name, "-."), nil
 }

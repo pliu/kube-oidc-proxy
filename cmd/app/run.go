@@ -148,7 +148,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				if err != nil {
 					return err
 				}
-				ldapCache, err := cache.NewConfigMaps(kubeclient, cacheNamespace, ldapConfig.Cache.Scope, ldapConfig.UserRecordFingerprint())
+				ldapCache, err := cache.NewConfigMaps(kubeclient, cacheNamespace, ldapConfig.UserRecordFingerprint())
 				if err != nil {
 					return err
 				}

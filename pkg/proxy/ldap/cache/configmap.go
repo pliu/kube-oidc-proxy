@@ -5,19 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	typed "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
-const ScopeLabel = "kube-oidc-proxy.jetstack.io/cache-scope"
 const ManagedLabel = "app.kubernetes.io/managed-by"
 
 // managedBy is the ManagedLabel value of every ConfigMap this cache owns.
@@ -47,35 +46,28 @@ type UserStore interface {
 
 type ConfigMaps struct {
 	client      typed.ConfigMapInterface
-	scope       string
 	fingerprint string
-	selector    string
 }
 
-func NewConfigMaps(client kubernetes.Interface, namespace, scope, fingerprint string) (*ConfigMaps, error) {
-	if client == nil || namespace == "" || scope == "" || fingerprint == "" {
-		return nil, errors.New("ConfigMap cache requires client, namespace, scope and fingerprint")
+func NewConfigMaps(client kubernetes.Interface, namespace, fingerprint string) (*ConfigMaps, error) {
+	if client == nil || namespace == "" || fingerprint == "" {
+		return nil, errors.New("ConfigMap cache requires client, namespace and fingerprint")
 	}
-	if errs := validation.IsValidLabelValue(scope); len(errs) != 0 {
-		return nil, fmt.Errorf("invalid cache scope: %s", strings.Join(errs, ", "))
-	}
-	return &ConfigMaps{client: client.CoreV1().ConfigMaps(namespace), scope: scope, fingerprint: fingerprint,
-		selector: managedLabels(scope).String()}, nil
+	return &ConfigMaps{client: client.CoreV1().ConfigMaps(namespace), fingerprint: fingerprint}, nil
 }
 
-func managedLabels(scope string) labels.Set {
-	return labels.Set{ManagedLabel: managedBy, ScopeLabel: scope}
-}
+// managedLabels marks, selects and identifies every ConfigMap this cache owns.
+var managedLabels = labels.Set{ManagedLabel: managedBy}
 
-// owns reports whether a ConfigMap carries this cache's managed labels.
-func (s *ConfigMaps) owns(cm *corev1.ConfigMap) bool {
-	return cm.Labels[ManagedLabel] == managedBy && cm.Labels[ScopeLabel] == s.scope
+// owns reports whether a ConfigMap carries this cache's managed label.
+func owns(cm *corev1.ConfigMap) bool {
+	return cm.Labels[ManagedLabel] == managedBy
 }
 
 func (s *ConfigMaps) Decode(cm *corev1.ConfigMap) UserEntry {
 	e := UserEntry{Name: cm.Name, ResourceVersion: cm.ResourceVersion}
-	if !s.owns(cm) {
-		e.Invalid = errors.New("ConfigMap is outside managed cache scope")
+	if !owns(cm) {
+		e.Invalid = errors.New("ConfigMap is not managed by kube-oidc-proxy")
 		return e
 	}
 	record, err := decodeUserRecord([]byte(cm.Data[UserRecordKey]), s.fingerprint)
@@ -83,7 +75,7 @@ func (s *ConfigMaps) Decode(cm *corev1.ConfigMap) UserEntry {
 		e.Invalid = err
 		return e
 	}
-	name, err := UserConfigMapName(s.scope, record.Username)
+	name, err := UserConfigMapName(record.Username)
 	if err != nil || name != cm.Name || record.Username != strings.ToLower(record.Username) {
 		e.Invalid = errors.New("ConfigMap identity does not match its name")
 		return e
@@ -92,8 +84,11 @@ func (s *ConfigMaps) Decode(cm *corev1.ConfigMap) UserEntry {
 	return e
 }
 
+// Get returns the record stored under username's ConfigMap name. Another
+// username can share that name; its record is then returned as Invalid, with
+// its version, so the caller can replace it rather than serve its groups.
 func (s *ConfigMaps) Get(ctx context.Context, username string) (UserEntry, error) {
-	name, err := UserConfigMapName(s.scope, username)
+	name, err := UserConfigMapName(username)
 	if err != nil {
 		return UserEntry{}, err
 	}
@@ -104,14 +99,19 @@ func (s *ConfigMaps) Get(ctx context.Context, username string) (UserEntry, error
 	if err != nil {
 		return UserEntry{}, err
 	}
-	if !s.owns(cm) {
+	if !owns(cm) {
 		return UserEntry{}, fmt.Errorf("refusing unmanaged ConfigMap %q", cm.Name)
 	}
-	return s.Decode(cm), nil
+	e := s.Decode(cm)
+	if e.Record != nil && e.Record.Username != username {
+		e.Invalid = fmt.Errorf("ConfigMap %q holds the record of %q", cm.Name, e.Record.Username)
+		e.Record = nil
+	}
+	return e, nil
 }
 
 func (s *ConfigMaps) List(ctx context.Context) (UserList, error) {
-	list, err := s.client.List(ctx, metav1.ListOptions{LabelSelector: s.selector})
+	list, err := s.client.List(ctx, metav1.ListOptions{LabelSelector: managedLabels.String()})
 	if err != nil {
 		return UserList{}, err
 	}
@@ -132,12 +132,12 @@ func (s *ConfigMaps) Upsert(ctx context.Context, record *UserRecord, expectedVer
 	if record.ConfigurationFingerprint != s.fingerprint {
 		return UserEntry{}, errors.New("incompatible configuration fingerprint")
 	}
-	name, err := UserConfigMapName(s.scope, record.Username)
+	name, err := UserConfigMapName(record.Username)
 	if err != nil {
 		return UserEntry{}, err
 	}
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: expectedVersion,
-		Labels: managedLabels(s.scope)}, Data: map[string]string{UserRecordKey: string(data)}}
+		Labels: maps.Clone(managedLabels)}, Data: map[string]string{UserRecordKey: string(data)}}
 	if expectedVersion == "" {
 		cm, err = s.client.Create(ctx, cm, metav1.CreateOptions{})
 	} else {
@@ -150,5 +150,5 @@ func (s *ConfigMaps) Upsert(ctx context.Context, record *UserRecord, expectedVer
 }
 
 func (s *ConfigMaps) Watch(ctx context.Context, version string) (watch.Interface, error) {
-	return s.client.Watch(ctx, metav1.ListOptions{LabelSelector: s.selector, ResourceVersion: version, AllowWatchBookmarks: true})
+	return s.client.Watch(ctx, metav1.ListOptions{LabelSelector: managedLabels.String(), ResourceVersion: version, AllowWatchBookmarks: true})
 }

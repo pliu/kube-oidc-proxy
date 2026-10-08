@@ -98,27 +98,46 @@ func TestUserRecordRejectsInvalidDocuments(t *testing.T) {
 }
 
 func TestUserConfigMapNames(t *testing.T) {
-	name, err := UserConfigMapName("main", "alice@example.net")
-	if err != nil {
-		t.Fatal(err)
+	tests := map[string]string{
+		"alice":               "kube-oidc-proxy-user-alice",
+		"alice@example.net":   "kube-oidc-proxy-user-alice-example.net",
+		"Alice@Example.NET":   "kube-oidc-proxy-user-alice-example.net",
+		"first.last@corp.com": "kube-oidc-proxy-user-first.last-corp.com",
+		"corp\\alice_b":       "kube-oidc-proxy-user-corp-alice-b",
+		"oidc:alice":          "kube-oidc-proxy-user-oidc-alice",
+		".alice.":             "kube-oidc-proxy-user--alice",
+		"a..b":                "kube-oidc-proxy-user-a--b",
+		"a.-b":                "kube-oidc-proxy-user-a--b",
+		"grüppe":              "kube-oidc-proxy-user-gr-ppe",
+		"@@@":                 "kube-oidc-proxy-user",
 	}
-	if errs := validation.IsDNS1123Subdomain(name); len(errs) != 0 {
-		t.Fatalf("invalid ConfigMap name %q: %v", name, errs)
-	}
-	for _, pair := range [][2]string{{"other", "alice@example.net"}, {"main", "bob@example.net"}, {"ma", "inalice@example.net"}} {
-		other, err := UserConfigMapName(pair[0], pair[1])
-		if err != nil || other == name {
-			t.Fatalf("scope/identity not distinguished: %q, %v", other, err)
+	for username, want := range tests {
+		got, err := UserConfigMapName(username)
+		if err != nil || got != want {
+			t.Errorf("%q: got %q, %v; want %q", username, got, err, want)
+		}
+		if errs := validation.IsDNS1123Subdomain(got); len(errs) != 0 {
+			t.Errorf("%q: invalid ConfigMap name %q: %v", username, got, errs)
 		}
 	}
-	again, _ := UserConfigMapName("main", "alice@example.net")
-	if again != name {
-		t.Fatal("name is not deterministic")
+
+	// Readable names collide by design; the stored username tells them apart.
+	a, _ := UserConfigMapName("alice@example.net")
+	b, _ := UserConfigMapName("alice-example.net")
+	if a != b {
+		t.Fatalf("expected %q and %q to share a name", a, b)
 	}
-	if _, err := UserConfigMapName("", "alice"); err == nil {
-		t.Fatal("accepted empty scope")
+
+	long, err := UserConfigMapName(strings.Repeat("a", 300) + "@example.net")
+	if err != nil || len(long) != validation.DNS1123SubdomainMaxLength || len(validation.IsDNS1123Subdomain(long)) != 0 {
+		t.Fatalf("long username not cut to a valid name: %d %q %v", len(long), long, err)
 	}
-	if _, err := UserConfigMapName("main", ""); err == nil {
+	cut, _ := UserConfigMapName(strings.Repeat("a", 231) + ".b")
+	if len(validation.IsDNS1123Subdomain(cut)) != 0 {
+		t.Fatalf("cut name ends badly: %q", cut)
+	}
+
+	if _, err := UserConfigMapName(" "); err == nil {
 		t.Fatal("accepted empty username")
 	}
 }

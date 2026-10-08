@@ -158,7 +158,7 @@ tls:
 
 ### LDAP per-user cache
 
-Set `ldap.enabled: true`, `ldap.cacheScope: main`, and configure
+Set `ldap.enabled: true` and configure
 `ldap.config.backends`. The chart supplies the ConfigMap namespace (release
 namespace by default) and grants the service account ConfigMap
 `get/list/watch/create/update` in that namespace. Set `ldap.cacheNamespace` to
@@ -168,7 +168,6 @@ an existing dedicated namespace for isolation. Mount password/CA files using
 ```yaml
 ldap:
   enabled: true
-  cacheScope: main
   config:
     lookupConcurrency: 8
     refreshConcurrency: 4

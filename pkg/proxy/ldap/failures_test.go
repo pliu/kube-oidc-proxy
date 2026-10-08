@@ -33,7 +33,7 @@ func TestConflictDiscardsLookupAndReloadsWinner(t *testing.T) {
 	d, client := userTestDirectory(t)
 	winner := userTestEntry(t, d, "200", "Winner")
 	data, _ := cache.EncodeUserRecord(winner.Record)
-	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: winner.Name, Namespace: "proxy", ResourceVersion: "200", Labels: map[string]string{cache.ManagedLabel: "kube-oidc-proxy", cache.ScopeLabel: "main"}}, Data: map[string]string{cache.UserRecordKey: string(data)}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: winner.Name, Namespace: "proxy", ResourceVersion: "200", Labels: map[string]string{cache.ManagedLabel: "kube-oidc-proxy"}}, Data: map[string]string{cache.UserRecordKey: string(data)}}
 	d.resolver.backends[0].dial = func(string) (conn, error) {
 		if err := client.Tracker().Create(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, "proxy"); err != nil {
 			t.Error(err)
@@ -80,10 +80,10 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 	for _, managed := range []bool{true, false} {
 		t.Run(map[bool]string{true: "managed", false: "unmanaged"}[managed], func(t *testing.T) {
 			d, client := userTestDirectory(t)
-			name, _ := cache.UserConfigMapName("main", "alice")
+			name, _ := cache.UserConfigMapName("alice")
 			cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proxy"}, Data: map[string]string{cache.UserRecordKey: "broken: ["}}
 			if managed {
-				cm.Labels = map[string]string{cache.ManagedLabel: "kube-oidc-proxy", cache.ScopeLabel: "main"}
+				cm.Labels = map[string]string{cache.ManagedLabel: "kube-oidc-proxy"}
 			}
 			if _, err := client.CoreV1().ConfigMaps("proxy").Create(context.Background(), cm, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)

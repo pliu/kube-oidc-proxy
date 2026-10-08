@@ -175,12 +175,12 @@ func (d *UserDirectory) consume(stream watch.Interface) {
 
 func (d *UserDirectory) HasSynced() bool { return d.synced.Load() }
 func (d *UserDirectory) cached(key string) (cache.UserEntry, bool) {
-	name, _ := cache.UserConfigMapName(d.scope(), key)
+	name, _ := cache.UserConfigMapName(key)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	cell, ok := d.users[name]
-	return cell.entry, ok && !cell.deleted && cell.entry.Invalid == nil && cell.entry.Record != nil
+	// Distinct usernames can share a ConfigMap name, so only a record that
+	// names this user may answer for it.
+	return cell.entry, ok && !cell.deleted && cell.entry.Invalid == nil && cell.entry.Record != nil &&
+		cell.entry.Record.Username == key
 }
-
-// scope is configured explicitly by the per-user cache constructor.
-func (d *UserDirectory) scope() string { return d.resolver.config.Cache.Scope }

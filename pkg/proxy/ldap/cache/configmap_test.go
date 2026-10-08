@@ -18,7 +18,7 @@ import (
 func TestConfigMapRecords(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewClientset()
-	store, err := NewConfigMaps(client, "proxy", "main", "fingerprint")
+	store, err := NewConfigMaps(client, "proxy", "fingerprint")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestConfigMapRecords(t *testing.T) {
 }
 
 func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
-	store, err := NewConfigMaps(fake.NewClientset(), "proxy", "main", "fingerprint")
+	store, err := NewConfigMaps(fake.NewClientset(), "proxy", "fingerprint")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,11 +69,11 @@ func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	name, err := UserConfigMapName("main", "alice")
+	name, err := UserConfigMapName("alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "42", Labels: map[string]string{ManagedLabel: "kube-oidc-proxy", ScopeLabel: "main"}}, Data: map[string]string{UserRecordKey: string(data)}}
+	base := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "42", Labels: map[string]string{ManagedLabel: "kube-oidc-proxy"}}, Data: map[string]string{UserRecordKey: string(data)}}
 	if entry := store.Decode(base); entry.Invalid != nil || entry.Record == nil {
 		t.Fatalf("valid record rejected: %+v", entry)
 	}
@@ -83,7 +83,7 @@ func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
 			cm.Data[UserRecordKey] = strings.Replace(string(data), "username: alice", "username: bob", 1)
 		},
 		"uppercase identity with matching name": func(cm *corev1.ConfigMap) {
-			cm.Name, _ = UserConfigMapName("main", "Alice")
+			cm.Name, _ = UserConfigMapName("Alice")
 			cm.Data[UserRecordKey] = strings.Replace(string(data), "username: alice", "username: Alice", 1)
 		},
 		"wrong configuration": func(cm *corev1.ConfigMap) {
@@ -95,7 +95,6 @@ func TestConfigMapDecodePreservesValidationBoundaries(t *testing.T) {
 		"unknown field":    func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "unknown: true\n" },
 		"duplicate field":  func(cm *corev1.ConfigMap) { cm.Data[UserRecordKey] += "username: bob\n" },
 		"unmanaged object": func(cm *corev1.ConfigMap) { delete(cm.Labels, ManagedLabel) },
-		"different scope":  func(cm *corev1.ConfigMap) { cm.Labels[ScopeLabel] = "other" },
 	}
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {

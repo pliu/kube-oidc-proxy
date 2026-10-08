@@ -18,7 +18,7 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 	config := testConfig()
 	config.UsernamePrefix = "oidc:"
 	config.SetDefaults()
-	store, err := cache.NewConfigMaps(fake.NewClientset(), "proxy", "main", config.UserRecordFingerprint())
+	store, err := cache.NewConfigMaps(fake.NewClientset(), "proxy", config.UserRecordFingerprint())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,5 +189,25 @@ func TestCanceledRefreshWaiterDoesNotCancelSharedMiss(t *testing.T) {
 	close(release)
 	if err := <-miss; err != nil {
 		t.Fatalf("refresh waiter canceled shared work: %v", err)
+	}
+}
+
+func TestCollidingNamesNeverShareGroups(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		return connWithUsers([]string{"AtGroup", "DashGroup"}, map[string][]string{
+			"alice@example.net": {"AtGroup"},
+			"alice-example.net": {"DashGroup"},
+		}), nil
+	}
+	want := map[string]string{"alice@example.net": "AtGroup", "alice-example.net": "DashGroup"}
+	// Alternate so each lookup finds the other user's record under the shared name.
+	for i := 0; i < 3; i++ {
+		for _, username := range []string{"alice@example.net", "alice-example.net"} {
+			groups, found, err := d.Resolve(context.Background(), username)
+			if err != nil || !found || len(groups) != 1 || groups[0] != want[username] {
+				t.Fatalf("%s got %v %t %v, want [%s]", username, groups, found, err, want[username])
+			}
+		}
 	}
 }

@@ -22,7 +22,7 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
     "userSearchBases": ["OU=Users,DC=example,DC=net"],
     "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
   }],
-  "cache": {"namespace": "kube-oidc-proxy", "scope": "main"},
+  "cache": {"namespace": "kube-oidc-proxy"},
   "refreshInterval": "10m",
   "lookupTimeout": "1m",
   "lookupConcurrency": 8,
@@ -33,7 +33,6 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `backends` | Required | Query every backend and union memberships. |
-| `cache.scope` | Required | Label and name scope shared by replicas with identical LDAP/identity settings. |
 | `cache.namespace` | Pod namespace | Namespace containing generated user ConfigMaps. Set explicitly outside Kubernetes. |
 | `refreshInterval` | `10m` | Interval between leader refresh cycles. |
 | `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. |
@@ -73,12 +72,25 @@ requests. Exceeding either bound fails the lookup without truncating memberships
 
 ## Persistence and replicas
 
-Each canonical username has one deterministic hashed ConfigMap name derived
-from `cache.scope` and the username. Managed objects carry these labels:
+Each canonical username has one readable ConfigMap name, so an operator can
+find a user's record directly:
+
+```text
+alice@example.net  ->  kube-oidc-proxy-user-alice-example.net
+```
+
+The username is lowercased; characters a ConfigMap name cannot hold become `-`,
+as does a `.` that is not between two letters or digits, and names longer than
+253 characters are cut short. Distinct usernames can therefore share a name
+(`alice@example.net` and `alice-example.net` both map to the name above). The
+`username` field of the record, not the name, identifies whose record it is: a
+lookup never uses a record stored for a different username, and instead looks
+the user up and replaces it. Two such users looked up in turn keep replacing each
+other's record, costing extra LDAP lookups but never mixing their groups. Managed
+objects carry this label:
 
 ```yaml
 app.kubernetes.io/managed-by: kube-oidc-proxy
-kube-oidc-proxy.jetstack.io/cache-scope: main
 ```
 
 The `user.yaml` data key contains readable, strictly validated YAML:
@@ -99,7 +111,9 @@ records. They remain cached indefinitely and eligible for refresh. Search bases,
 filters, attribute mappings, backend names/order, and OIDC username prefix
 contribute to the configuration fingerprint. Credentials, URLs, TLS settings,
 refresh intervals and concurrency settings do not invalidate memberships.
-Use separate scopes for deployments with different membership configurations.
+Deployments sharing a cache namespace share records. Give deployments with
+different membership configurations separate cache namespaces; in one
+namespace they would keep rejecting and replacing each other's records.
 
 Every replica lists managed records at startup and watches from the returned
 resource version. Interrupted or expired watches cause a relist. Local writes
@@ -170,8 +184,7 @@ is provided. Kubernetes RBAC cannot restrict list/watch/create by these labels;
 use a dedicated cache namespace for stronger isolation from unrelated objects.
 The namespace must exist before starting the proxy.
 
-For Helm, enable `ldap.enabled`, set `ldap.cacheScope` and optionally
-`ldap.cacheNamespace`, and supply backend settings under `ldap.config`. The chart
+For Helm, enable `ldap.enabled`, optionally set `ldap.cacheNamespace`, and supply backend settings under `ldap.config`. The chart
 writes `ldap.json`, mounts it, sets the argument, and creates the namespaced
 Role/RoleBinding. Mount bind credentials and CA files using `extraVolumes` and
 `extraVolumeMounts`. The chart supplies `cache` from its cache settings. See the

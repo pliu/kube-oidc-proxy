@@ -20,7 +20,7 @@ import (
 func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 	t.Helper()
 	config := testConfig()
-	config.Cache = &CacheConfig{Namespace: "proxy", Scope: "main"}
+	config.Cache = &CacheConfig{Namespace: "proxy"}
 	client := fake.NewClientset()
 	var revision atomic.Int64
 	revision.Store(100)
@@ -48,7 +48,7 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 		obj.(*corev1.ConfigMapList).ResourceVersion = fmt.Sprint(revision.Load())
 		return true, obj, nil
 	})
-	store, err := cache.NewConfigMaps(client, "proxy", "main", config.UserRecordFingerprint())
+	store, err := cache.NewConfigMaps(client, "proxy", config.UserRecordFingerprint())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func userTestEntry(t *testing.T, d *UserDirectory, version string, groups ...str
 	if err != nil {
 		t.Fatal(err)
 	}
-	name, _ := cache.UserConfigMapName("main", "alice")
+	name, _ := cache.UserConfigMapName("alice")
 	return cache.UserEntry{Name: name, ResourceVersion: version, Record: record}
 }
 
@@ -98,7 +98,7 @@ func TestUserStartupAndWatch(t *testing.T) {
 	}
 	e := userTestEntry(t, d, "10", "Developers")
 	data, _ := cache.EncodeUserRecord(e.Record)
-	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: e.Name, Namespace: "proxy", ResourceVersion: "10", Labels: map[string]string{cache.ManagedLabel: "kube-oidc-proxy", cache.ScopeLabel: "main"}}, Data: map[string]string{cache.UserRecordKey: string(data)}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: e.Name, Namespace: "proxy", ResourceVersion: "10", Labels: map[string]string{cache.ManagedLabel: "kube-oidc-proxy"}}, Data: map[string]string{cache.UserRecordKey: string(data)}}
 	if _, err := client.CoreV1().ConfigMaps("proxy").Create(context.Background(), cm, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}

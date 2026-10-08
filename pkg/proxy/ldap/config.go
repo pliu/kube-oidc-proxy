@@ -66,7 +66,7 @@ type Config struct {
 	// any authenticated user may call it.
 	RefreshUsers []string `json:"refreshUsers,omitempty"`
 
-	// Cache selects the namespace and scope of required per-user ConfigMaps.
+	// Cache selects the namespace of per-user ConfigMaps. Optional.
 	Cache *CacheConfig `json:"cache,omitempty"`
 
 	// UsernamePrefix is not part of the configuration file. It is the OIDC
@@ -103,10 +103,9 @@ type BackendConfig struct {
 	GroupNameAttribute string   `json:"groupNameAttribute,omitempty"`
 }
 
-// CacheConfig scopes per-user ConfigMaps. Namespace defaults to the pod namespace.
+// CacheConfig places per-user ConfigMaps. Namespace defaults to the pod namespace.
 type CacheConfig struct {
 	Namespace string `json:"namespace,omitempty"`
-	Scope     string `json:"scope"`
 }
 
 // Duration is a time.Duration held in JSON as a string such as "10m".
@@ -249,6 +248,9 @@ func (c *Config) SetDefaults() {
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)
 	}
+	if c.Cache == nil {
+		c.Cache = &CacheConfig{}
+	}
 
 	for _, backend := range c.Backends {
 		if backend == nil {
@@ -359,14 +361,9 @@ func (b *BackendConfig) validate(id string) []error {
 
 func (c *CacheConfig) validate() []error {
 	if c == nil {
-		return []error{errors.New("cache must be configured")}
+		return nil
 	}
 	var errs []error
-	if c.Scope == "" {
-		errs = append(errs, errors.New("cache.scope must be set"))
-	} else if problems := validation.IsValidLabelValue(c.Scope); len(problems) != 0 {
-		errs = append(errs, fmt.Errorf("cache.scope: %s", strings.Join(problems, ", ")))
-	}
 	if c.Namespace != "" {
 		if problems := validation.IsDNS1123Label(c.Namespace); len(problems) != 0 {
 			errs = append(errs, fmt.Errorf("cache.namespace: %s", strings.Join(problems, ", ")))

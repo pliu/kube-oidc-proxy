@@ -19,8 +19,7 @@ const minimalConfig = `{
       "userSearchBases": ["OU=Users,DC=example,DC=net"],
       "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
     }
-  ],
-  "cache": {"scope": "main"}
+  ]
 }`
 
 func TestParseConfigAppliesDefaults(t *testing.T) {
@@ -31,6 +30,11 @@ func TestParseConfigAppliesDefaults(t *testing.T) {
 
 	if got := config.RefreshInterval.Duration(); got != DefaultRefreshInterval {
 		t.Errorf("expected a default refresh interval of %s, got %s", DefaultRefreshInterval, got)
+	}
+
+	// An omitted cache stores ConfigMaps in the pod namespace.
+	if config.Cache == nil || config.Cache.Namespace != "" {
+		t.Errorf("expected an empty default cache configuration, got %+v", config.Cache)
 	}
 
 	backend := config.Backends[0]
@@ -84,7 +88,7 @@ func TestParseConfigReadsEveryField(t *testing.T) {
   "refreshInterval": "1h30m",
   "refreshUsers": ["alice@example.net"],
   "cache": {
-    "scope": "main", "namespace": "kube-oidc-proxy"
+    "namespace": "kube-oidc-proxy"
   }
 }`
 
@@ -103,7 +107,7 @@ func TestParseConfigReadsEveryField(t *testing.T) {
 	if got := config.RefreshInterval.Duration(); got != time.Hour+time.Minute*30 {
 		t.Errorf("expected a refresh interval of 1h30m, got %s", got)
 	}
-	if config.Cache.Scope != "main" || config.Cache.Namespace != "kube-oidc-proxy" {
+	if config.Cache.Namespace != "kube-oidc-proxy" {
 		t.Fatalf("unexpected cache: %+v", config.Cache)
 	}
 
@@ -132,11 +136,12 @@ func TestParseConfigRejectsBadDocuments(t *testing.T) {
 			`{"backends": [], "refreshIntervals": "10m"}`,
 			"refreshIntervals",
 		},
-		"a missing cache property": {
+		"the removed cache scope property": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
-			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}]}`,
-			"cache",
+			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
+			  "cache": {"scope": "main"}}`,
+			"scope",
 		},
 		"a misspelled backend property": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
@@ -201,7 +206,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  {"name": "corp", "urls": ["ldaps://two.example.net:636"],
 			   "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			   "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"duplicate backend name",
 		},
 		"both a bind password and a bind password file": {
@@ -210,7 +215,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "bindPassword": "password", "bindPasswordFile": "/etc/password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"cannot set both bindPassword and bindPasswordFile",
 		},
 		"a bind password with no bind DN": {
@@ -218,7 +223,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "bindPassword": "password",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"without a bindDN",
 		},
 		"both a CA file and skipped verification": {
@@ -226,14 +231,14 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "caFile": "/etc/ca.pem", "insecureSkipTLSVerify": true,
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"cannot set both caFile and insecureSkipTLSVerify",
 		},
 		"a refresh interval of zero": {
 			`{"backends": [{"name": "corp", "urls": ["ldaps://ldap.example.net:636"],
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"},
+			  "cache": {},
 			  "refreshInterval": "0s"}`,
 			"refreshInterval must be a positive duration",
 		},
@@ -242,7 +247,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "timeout": "0s",
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"]}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"timeout must be a positive duration",
 		},
 		"a removed groupPrefix field": {
@@ -250,7 +255,7 @@ func TestValidateRejectsContradictoryConfigs(t *testing.T) {
 			  "userSearchBases": ["OU=Users,DC=example,DC=net"],
 			  "groupSearchBases": ["OU=Groups,DC=example,DC=net"],
 			  "groupPrefix": "ldap:"}],
-			  "cache": {"scope": "main"}}`,
+			  "cache": {}}`,
 			"groupPrefix",
 		},
 	}
