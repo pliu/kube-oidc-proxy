@@ -113,6 +113,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			// augmented from, if configured. Left nil when they are not, so
 			// that the proxy keeps taking groups from the token.
 			var ldapDirectory proxy.GroupAugmenter
+			var ldapUsers *ldap.UserDirectory
 			var ldapReadiness []probe.NamedCheck
 			if opts.LDAP.Enabled() {
 				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
@@ -148,10 +149,9 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				}
 
 				ldapDirectory = directory
+				ldapUsers = directory
 
-				// A proxy that has not got hold of a mapping yet would answer
-				// every request by stripping the user of their groups, so it
-				// stays out of its Service until it has one.
+				// Readiness requires initial ConfigMap synchronization, even when empty.
 				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
 					Name: "ldap cache synchronization",
 					Check: func() error {
@@ -187,6 +187,10 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				if err != nil {
 					return err
 				}
+			}
+
+			if ldapUsers != nil && elector != nil {
+				ldapUsers.SetLeaderCheck(elector.IsLeader)
 			}
 
 			// Initialise proxy with OIDC token authenticator

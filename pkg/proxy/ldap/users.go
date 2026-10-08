@@ -23,6 +23,7 @@ type userCell struct {
 // UserDirectory serves per-user persisted records. Its map lock protects only
 // memory; LDAP and Kubernetes work happen outside it.
 type UserDirectory struct {
+	isLeader func() bool
 	callsMu  sync.Mutex
 	calls    map[string]*userCall
 	slots    chan struct{}
@@ -44,7 +45,7 @@ func NewUserDirectory(config *Config, store cache.UserStore) (*UserDirectory, er
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UserDirectory{resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
+	return &UserDirectory{isLeader: func() bool { return true }, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
 }
 
 // Core Kubernetes ConfigMap resource versions are monotonically increasing
@@ -121,6 +122,7 @@ func (d *UserDirectory) Run(stop <-chan struct{}) error {
 	}
 	d.synced.Store(true)
 	go d.synchronize(stream)
+	go d.runRefresh()
 	return nil
 }
 

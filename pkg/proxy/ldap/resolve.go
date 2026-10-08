@@ -37,6 +37,10 @@ func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string,
 }
 
 func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (cache.UserEntry, bool, error) {
+	return d.resolveWork(ctx, key, refresh, d.ctx)
+}
+
+func (d *UserDirectory) resolveWork(ctx context.Context, key string, refresh bool, parent context.Context) (cache.UserEntry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return cache.UserEntry{}, false, err
 	}
@@ -46,7 +50,7 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 		call = &userCall{done: make(chan struct{})}
 		d.calls[key] = call
 		go func() {
-			work, cancel := context.WithTimeout(d.ctx, d.resolver.config.LookupTimeout.Duration())
+			work, cancel := context.WithTimeout(parent, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
 			call.entry, call.changed, call.err = d.lookup(work, key, refresh)
 			d.callsMu.Lock()
