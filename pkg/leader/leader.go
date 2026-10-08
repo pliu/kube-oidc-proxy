@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -124,11 +125,7 @@ func New(client kubernetes.Interface, config Config) (*Elector, error) {
 // say - is not fatal. The proxy has other work than leading, so it goes back
 // to contending rather than exiting.
 func (e *Elector) Run(stopCh <-chan struct{}) <-chan struct{} {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-stopCh
-		cancel()
-	}()
+	ctx := wait.ContextForChannel(stopCh)
 
 	done := make(chan struct{})
 	go func() {

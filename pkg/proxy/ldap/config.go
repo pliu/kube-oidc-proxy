@@ -3,8 +3,6 @@ package ldap
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +16,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	k8sErrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
 // Schema is the JSON schema every configuration file is checked against before
@@ -381,6 +381,13 @@ func (b *BackendConfig) bindPasswordFor() (string, error) {
 	return strings.TrimRight(string(password), "\r\n"), nil
 }
 
+// UserRecordFingerprint identifies membership and username mapping settings.
+// Use on a defaulted, validated Config. Credentials, connection settings, and
+// refresh intervals do not invalidate records; search settings and prefixes do.
+func (c *Config) UserRecordFingerprint() string {
+	return util.HashJSON([]string{c.searchFingerprint(), c.UsernamePrefix})
+}
+
 // searchFingerprint identifies settings that determine LDAP memberships.
 // Connection settings and credentials do not affect record compatibility.
 func (c *Config) searchFingerprint() string {
@@ -413,12 +420,5 @@ func (c *Config) searchFingerprint() string {
 
 	// Marshalling a slice of structs is deterministic, so the same
 	// configuration always hashes the same way.
-	data, err := json.Marshal(backends)
-	if err != nil {
-		return ""
-	}
-
-	sum := sha256.Sum256(data)
-
-	return hex.EncodeToString(sum[:])
+	return util.HashJSON(backends)
 }

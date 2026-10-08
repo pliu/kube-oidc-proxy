@@ -3,7 +3,7 @@ package ldap
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/klog/v2"
 )
@@ -39,10 +40,10 @@ type UserDirectory struct {
 // leadership term returned by leadership; nil denotes a follower.
 func NewUserDirectory(config *Config, store cache.UserStore, leadership func() context.Context) (*UserDirectory, error) {
 	if store == nil {
-		return nil, fmt.Errorf("per-user LDAP cache requires ConfigMap persistence")
+		return nil, errors.New("per-user LDAP cache requires ConfigMap persistence")
 	}
 	if leadership == nil {
-		return nil, fmt.Errorf("per-user LDAP cache requires a leadership context provider")
+		return nil, errors.New("per-user LDAP cache requires a leadership context provider")
 	}
 	resolver, err := newResolver(config)
 	if err != nil {
@@ -105,13 +106,7 @@ func (d *UserDirectory) restoreUsers(ctx context.Context) (string, error) {
 // Run lists then watches from that list's revision, closing the startup gap.
 // Empty caches are ready; LDAP availability is irrelevant to startup.
 func (d *UserDirectory) Run(stop <-chan struct{}) error {
-	go func() {
-		select {
-		case <-stop:
-			d.cancel()
-		case <-d.ctx.Done():
-		}
-	}()
+	context.AfterFunc(wait.ContextForChannel(stop), d.cancel)
 	version, err := d.restoreUsers(d.ctx)
 	if err != nil {
 		d.cancel()

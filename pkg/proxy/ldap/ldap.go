@@ -21,6 +21,8 @@ type resolver struct {
 	config       *Config
 	backends     []*backend
 	refreshUsers map[string]struct{}
+	// fingerprint is the UserRecordFingerprint of config, fixed at startup.
+	fingerprint string
 }
 
 // backend is one configured LDAP directory.
@@ -68,7 +70,8 @@ func newResolver(config *Config) (*resolver, error) {
 		refreshUsers[usernameKey(username, config.UsernamePrefix)] = struct{}{}
 	}
 
-	d := &resolver{config: config, backends: backends, refreshUsers: refreshUsers}
+	d := &resolver{config: config, backends: backends, refreshUsers: refreshUsers,
+		fingerprint: config.UserRecordFingerprint()}
 
 	// Published from here rather than at init, so that a proxy running without
 	// augmentation configured reports no series at all.

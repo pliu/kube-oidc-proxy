@@ -2,15 +2,15 @@
 package cache
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
 const (
@@ -44,19 +44,19 @@ func NewUserRecord(username string, found bool, groups []string, fingerprint str
 
 func (r *UserRecord) validate() error {
 	if r == nil {
-		return fmt.Errorf("nil user record")
+		return errors.New("nil user record")
 	}
 	if r.Version != UserRecordVersion {
 		return fmt.Errorf("unsupported user record version %d", r.Version)
 	}
 	if strings.TrimSpace(r.Username) == "" || strings.TrimSpace(r.ConfigurationFingerprint) == "" {
-		return fmt.Errorf("user record requires a username and configuration fingerprint")
+		return errors.New("user record requires a username and configuration fingerprint")
 	}
 	if r.LastSuccessfulLookup.IsZero() {
-		return fmt.Errorf("user record requires a last successful lookup time")
+		return errors.New("user record requires a last successful lookup time")
 	}
 	if !r.Found && len(r.Groups) != 0 {
-		return fmt.Errorf("absent user cannot have group memberships")
+		return errors.New("absent user cannot have group memberships")
 	}
 	for _, group := range r.Groups {
 		if strings.TrimSpace(group) == "" || strings.HasPrefix(group, "system:") {
@@ -67,14 +67,8 @@ func (r *UserRecord) validate() error {
 }
 
 func (r *UserRecord) orderGroups() {
-	sort.Strings(r.Groups)
-	unique := r.Groups[:0]
-	for _, group := range r.Groups {
-		if len(unique) == 0 || group != unique[len(unique)-1] {
-			unique = append(unique, group)
-		}
-	}
-	r.Groups = unique
+	slices.Sort(r.Groups)
+	r.Groups = slices.Compact(r.Groups)
 }
 
 // normalized validates once and returns an independent record with canonical
@@ -109,7 +103,7 @@ func DecodeUserRecord(data []byte, username, fingerprint string) (*UserRecord, e
 		return nil, err
 	}
 	if r.Username != username {
-		return nil, fmt.Errorf("user record identity or configuration does not match")
+		return nil, errors.New("user record identity or configuration does not match")
 	}
 	return r, nil
 }
@@ -129,14 +123,14 @@ func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
 		return nil, fmt.Errorf("decode user record: %w", err)
 	}
 	if document.Found == nil || document.Groups == nil {
-		return nil, fmt.Errorf("user record requires found and groups")
+		return nil, errors.New("user record requires found and groups")
 	}
 	r := &UserRecord{
 		Version: document.Version, Username: document.Username, Found: *document.Found, Groups: *document.Groups,
 		ConfigurationFingerprint: document.ConfigurationFingerprint, LastSuccessfulLookup: document.LastSuccessfulLookup,
 	}
 	if r.ConfigurationFingerprint != fingerprint {
-		return nil, fmt.Errorf("user record identity or configuration does not match")
+		return nil, errors.New("user record identity or configuration does not match")
 	}
 	return r.normalized()
 }
@@ -145,12 +139,7 @@ func decodeUserRecord(data []byte, fingerprint string) (*UserRecord, error) {
 // configuration so a configuration change replaces the same user's record.
 func UserConfigMapName(scope, username string) (string, error) {
 	if strings.TrimSpace(scope) == "" || strings.TrimSpace(username) == "" {
-		return "", fmt.Errorf("user ConfigMap name requires a cache scope and username")
+		return "", errors.New("user ConfigMap name requires a cache scope and username")
 	}
-	data, err := json.Marshal([]string{scope, username})
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return "kube-oidc-proxy-user-" + hex.EncodeToString(sum[:]), nil
+	return "kube-oidc-proxy-user-" + util.HashJSON([]string{scope, username}), nil
 }

@@ -1,22 +1,7 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
 package ldap
 
-import (
-	"testing"
-	"time"
-)
-
-func TestUserRecordCanonicalIdentity(t *testing.T) {
-	c := testConfig()
-	c.UsernamePrefix = "oidc:"
-	r, err := c.NewUserRecord("oidc:alice@example.net", true, []string{"Developers"}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Username != "oidc:alice@example.net" || r.ConfigurationFingerprint != c.UserRecordFingerprint() {
-		t.Fatalf("incorrect identity/configuration: %#v", r)
-	}
-}
+import "testing"
 
 func TestUserRecordFingerprint(t *testing.T) {
 	base := testConfig().UserRecordFingerprint()

@@ -3,6 +3,7 @@ package ldap
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -68,11 +69,11 @@ func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 			if loser.err != nil {
 				t.Fatal(loser.err)
 			}
-			if !equalGroups(winner.entry.Record.Groups, loser.entry.Record.Groups) {
+			if !slices.Equal(winner.entry.Record.Groups, loser.entry.Record.Groups) {
 				t.Fatalf("stale result served: winner=%v loser=%v", winner.entry.Record.Groups, loser.entry.Record.Groups)
 			}
 			stored, err := first.store.Get(context.Background(), "alice")
-			if err != nil || !equalGroups(stored.Record.Groups, winner.entry.Record.Groups) {
+			if err != nil || !slices.Equal(stored.Record.Groups, winner.entry.Record.Groups) {
 				t.Fatalf("stale result persisted: %+v %v", stored, err)
 			}
 		})

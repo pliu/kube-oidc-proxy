@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
@@ -92,11 +93,12 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
-	record, err := d.resolver.config.NewUserRecord(key, found, groups, time.Now())
+	// key is already the canonical identity; it must not be canonicalized again.
+	record, err := cache.NewUserRecord(key, found, groups, d.resolver.fingerprint, time.Now())
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
-	changed := previous.Record == nil || previous.Record.Found != found || !equalGroups(previous.Record.Groups, record.Groups)
+	changed := previous.Record == nil || previous.Record.Found != found || !slices.Equal(previous.Record.Groups, record.Groups)
 	if !changed && record.LastSuccessfulLookup.Sub(previous.Record.LastSuccessfulLookup) < unchangedWriteInterval {
 		d.apply(previous, false)
 		return d.committed(key)
@@ -123,19 +125,4 @@ func (d *UserDirectory) committed(key string) (cache.UserEntry, error) {
 		return current, nil
 	}
 	return cache.UserEntry{}, fmt.Errorf("cache record changed or was deleted while resolving %q", key)
-}
-
-// equalGroups compares sorted membership lists.
-func equalGroups(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
 }

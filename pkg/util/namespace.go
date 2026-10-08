@@ -10,7 +10,16 @@ import (
 const namespaceEnvVar = "POD_NAMESPACE"
 const namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
-func InClusterNamespace() (string, error) {
+// NamespaceOrInCluster returns namespace, or the namespace the process is
+// running in when it is empty.
+func NamespaceOrInCluster(namespace string) (string, error) {
+	if namespace != "" {
+		return namespace, nil
+	}
+	return inClusterNamespace()
+}
+
+func inClusterNamespace() (string, error) {
 	if namespace := strings.TrimSpace(os.Getenv(namespaceEnvVar)); namespace != "" {
 		return namespace, nil
 	}

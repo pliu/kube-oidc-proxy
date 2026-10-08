@@ -112,12 +112,9 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 
 			// Elect one replica leader. Every replica serves requests
 			// whether or not it leads.
-			namespace := opts.LeaderElection.ResourceNamespace
-			if namespace == "" {
-				namespace, err = util.InClusterNamespace()
-				if err != nil {
-					return fmt.Errorf("no --leader-elect-resource-namespace set: %w", err)
-				}
+			namespace, err := util.NamespaceOrInCluster(opts.LeaderElection.ResourceNamespace)
+			if err != nil {
+				return fmt.Errorf("no --leader-elect-resource-namespace set: %w", err)
 			}
 
 			elector, err := leader.New(kubeclient, leader.Config{
@@ -147,12 +144,9 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 					return err
 				}
 
-				cacheNamespace := ldapConfig.Cache.Namespace
-				if cacheNamespace == "" {
-					cacheNamespace, err = util.InClusterNamespace()
-					if err != nil {
-						return err
-					}
+				cacheNamespace, err := util.NamespaceOrInCluster(ldapConfig.Cache.Namespace)
+				if err != nil {
+					return err
 				}
 				ldapCache, err := cache.NewConfigMaps(kubeclient, cacheNamespace, ldapConfig.Cache.Scope, ldapConfig.UserRecordFingerprint())
 				if err != nil {

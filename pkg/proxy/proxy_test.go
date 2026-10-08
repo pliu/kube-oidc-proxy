@@ -183,8 +183,6 @@ func TestError(t *testing.T) {
 }
 
 func TestHasImpersonation(t *testing.T) {
-	p := new(Proxy)
-
 	// no impersonation headers
 	noImpersonation := []http.Header{
 		{},
@@ -210,7 +208,7 @@ func TestHasImpersonation(t *testing.T) {
 	}
 
 	// impersonation headers
-	hasImpersonation := []http.Header{
+	withImpersonation := []http.Header{
 		{
 			"Impersonate-User": []string{"bar", "foo"},
 		},
@@ -259,13 +257,13 @@ func TestHasImpersonation(t *testing.T) {
 	}
 
 	for _, h := range noImpersonation {
-		if p.hasImpersonation(h) {
+		if hasImpersonation(h) {
 			t.Errorf("expected no impersonation but got true, '%s'", h)
 		}
 	}
 
-	for _, h := range hasImpersonation {
-		if !p.hasImpersonation(h) {
+	for _, h := range withImpersonation {
+		if !hasImpersonation(h) {
 			t.Errorf("expected impersonation but got false, '%s'", h)
 		}
 	}

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
+	"slices"
 
 	"k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -128,7 +128,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// This is refused rather than ignored. A caller that asked to act as
 		// somebody else and is quietly served as themselves has been told the
 		// wrong thing about who did the work.
-		if p.ldapDirectory != nil && p.hasImpersonation(req.Header) {
+		if p.ldapDirectory != nil && hasImpersonation(req.Header) {
 			klog.V(2).Infof("rejecting impersonation headers from %q while groups are taken from the directory (%s)",
 				requester.GetName(), remoteAddr)
 			p.handleError(rw, req, errImpersonationNotAccepted)
@@ -161,7 +161,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// was authorised.
 		effective := requester
 
-		if p.hasImpersonation(req.Header) {
+		if hasImpersonation(req.Header) {
 			// if impersonation headers are present, let's check to see
 			// if the user is authorized to perform the impersonation
 			target, err := p.subjectAccessReviewer.CheckAuthorizedForImpersonation(req, requester)
@@ -178,16 +178,10 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			}
 		}
 
-		// Ensure group contains allauthenticated builtin
-		allAuthFound := false
-		groups := effective.GetGroups()
-		for _, elem := range groups {
-			if elem == user.AllAuthenticated {
-				allAuthFound = true
-				break
-			}
-		}
-		if !allAuthFound {
+		// Ensure group contains allauthenticated builtin. Cloned so that the
+		// append cannot write into the backing array of the identity's groups.
+		groups := slices.Clone(effective.GetGroups())
+		if !slices.Contains(groups, user.AllAuthenticated) {
 			groups = append(groups, user.AllAuthenticated)
 		}
 
@@ -221,21 +215,15 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			// so they're recorded in the API server's audit log
 			extra["originaluser.jetstack.io-user"] = []string{requester.GetName()}
 
-			numGroups := len(requester.GetGroups())
-			if numGroups > 0 {
-				groupNames := make([]string, numGroups)
-				for i, groupName := range requester.GetGroups() {
-					groupNames[i] = groupName
-				}
-
-				extra["originaluser.jetstack.io-groups"] = groupNames
+			if len(requester.GetGroups()) > 0 {
+				extra["originaluser.jetstack.io-groups"] = slices.Clone(requester.GetGroups())
 			}
 
 			if requester.GetUID() != "" {
 				extra["originaluser.jetstack.io-uid"] = []string{requester.GetUID()}
 			}
 
-			if requester.GetExtra() != nil && len(requester.GetExtra()) > 0 {
+			if len(requester.GetExtra()) > 0 {
 				jsonExtras, errJsonMarshal := json.Marshal(requester.GetExtra())
 				if errJsonMarshal != nil {
 					p.handleError(rw, req, errJsonMarshal)
@@ -327,9 +315,9 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func (p *Proxy) hasImpersonation(header http.Header) bool {
+func hasImpersonation(header http.Header) bool {
 	for h := range header {
-		if strings.HasPrefix(strings.ToLower(h), "impersonate-") {
+		if subjectaccessreview.IsImpersonationHeader(h) {
 			return true
 		}
 	}

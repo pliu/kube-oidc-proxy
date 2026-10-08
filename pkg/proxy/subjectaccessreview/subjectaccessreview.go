@@ -31,6 +31,12 @@ func (e *ImpersonationDeniedError) Error() string {
 	return fmt.Sprintf("%s is not allowed to impersonate extra info '%s'='%s'", e.Requester, strings.TrimPrefix(e.Resource, "userextras/"), e.Name)
 }
 
+// IsImpersonationHeader reports whether an HTTP header name is one of the
+// Impersonate-* family, matched case insensitively.
+func IsImpersonationHeader(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "impersonate-")
+}
+
 type SubjectAccessReview struct {
 	subjectAccessReviewer clientazv1.SubjectAccessReviewInterface
 }
@@ -45,10 +51,10 @@ func (s *SubjectAccessReview) CheckAuthorizedForImpersonation(req *http.Request,
 	target := &user.DefaultInfo{Groups: []string{}, Extra: map[string][]string{}}
 	var headersToRemove []string
 	for key, values := range req.Header {
-		lower := strings.ToLower(key)
-		if !strings.HasPrefix(lower, "impersonate-") {
+		if !IsImpersonationHeader(key) {
 			continue
 		}
+		lower := strings.ToLower(key)
 		if req.Header.Get("Impersonate-User") == "" {
 			return nil, ErrorNoImpersonationUserFound
 		}

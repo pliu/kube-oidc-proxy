@@ -62,7 +62,7 @@ func userTestDirectory(t *testing.T) (*UserDirectory, *fake.Clientset) {
 
 func userTestEntry(t *testing.T, d *UserDirectory, version string, groups ...string) cache.UserEntry {
 	t.Helper()
-	record, err := d.resolver.config.NewUserRecord("alice", true, groups, time.Now())
+	record, err := cache.NewUserRecord("alice", true, groups, d.resolver.fingerprint, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
