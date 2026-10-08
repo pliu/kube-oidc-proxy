@@ -26,7 +26,6 @@ type UserDirectory struct {
 	isLeader func() bool
 	callsMu  sync.Mutex
 	calls    map[string]*userCall
-	slots    chan struct{}
 	resolver *resolver
 	store    cache.UserStore
 	mu       sync.RWMutex
@@ -50,7 +49,7 @@ func NewUserDirectory(config *Config, store cache.UserStore, isLeader func() boo
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UserDirectory{isLeader: isLeader, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
+	return &UserDirectory{isLeader: isLeader, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), ctx: ctx, cancel: cancel}, nil
 }
 
 // Core Kubernetes ConfigMap resource versions are monotonically increasing

@@ -13,6 +13,10 @@ import (
 
 const unchangedWriteInterval = time.Hour
 
+// ErrLookupCapacity means this replica has no room for another distinct-user
+// lookup. Existing calls can still be joined and memory hits remain available.
+var ErrLookupCapacity = errors.New("LDAP lookup capacity exhausted")
+
 type userCall struct {
 	done  chan struct{}
 	entry cache.UserEntry
@@ -22,13 +26,7 @@ type userCall struct {
 // Resolve returns cache hits without external I/O. Waiter cancellation does
 // not cancel shared work, which has its own timeout and shutdown context.
 func (d *UserDirectory) Resolve(ctx context.Context, username string) ([]string, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, false, err
-	}
 	key := usernameKey(username, d.resolver.config.UsernamePrefix)
-	if entry, ok := d.cached(key); ok {
-		return append([]string{}, entry.Record.Groups...), entry.Record.Found, nil
-	}
 	entry, err := d.resolve(ctx, key, false)
 	if err != nil {
 		return nil, false, err
@@ -40,9 +38,25 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 	if err := ctx.Err(); err != nil {
 		return cache.UserEntry{}, err
 	}
+	if !refresh {
+		if entry, ok := d.cached(key); ok {
+			return entry, nil
+		}
+	}
 	d.callsMu.Lock()
 	call := d.calls[key]
 	if call == nil {
+		if err := d.ctx.Err(); err != nil {
+			d.callsMu.Unlock()
+			return cache.UserEntry{}, err
+		}
+		// Admission happens before allocating shared work or performing I/O.
+		// The map bounds the entire lookup, including persistence, and permits
+		// same-user waiters to join even while capacity is exhausted.
+		if len(d.calls) >= d.resolver.config.LookupConcurrency {
+			d.callsMu.Unlock()
+			return cache.UserEntry{}, ErrLookupCapacity
+		}
 		call = &userCall{done: make(chan struct{})}
 		d.calls[key] = call
 		go func() {
@@ -65,11 +79,6 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 }
 
 func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (cache.UserEntry, error) {
-	if !refresh {
-		if entry, ok := d.cached(key); ok {
-			return entry, nil
-		}
-	}
 	// Capture the committed version BEFORE LDAP, even when watch delivery lags.
 	previous, err := d.store.Get(ctx, key)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
@@ -79,13 +88,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		d.apply(previous, false)
 		return d.committed(key)
 	}
-	select {
-	case <-ctx.Done():
-		return cache.UserEntry{}, ctx.Err()
-	case d.slots <- struct{}{}:
-	}
 	groups, found, err := d.resolver.searchUser(ctx, key)
-	<-d.slots
 	if err != nil {
 		return cache.UserEntry{}, err
 	}

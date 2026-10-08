@@ -38,13 +38,13 @@
     "lookupTimeout": {
       "$ref": "#/$defs/duration",
       "default": "1m",
-      "description": "Total time for one lookup, including queueing, LDAP and persistence."
+      "description": "Total time for one admitted lookup, including Kubernetes reads, LDAP and persistence."
     },
     "lookupConcurrency": {
       "type": "integer",
       "minimum": 1,
       "default": 8,
-      "description": "Maximum concurrent user LDAP lookups per replica. Each lookup queries all backends."
+      "description": "Maximum concurrent distinct-user lookups per replica, including Kubernetes reads, LDAP and persistence. New identities are rejected when full; existing calls can still be joined. Each LDAP lookup queries all backends."
     }
   },
   "$defs": {

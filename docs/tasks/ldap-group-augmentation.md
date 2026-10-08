@@ -35,8 +35,8 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
 | `cache.scope` | Required | Label and name scope shared by replicas with identical LDAP/identity settings. |
 | `cache.namespace` | Pod namespace | Namespace containing generated user ConfigMaps. Set explicitly outside Kubernetes. |
 | `refreshInterval` | `10m` | Interval between leader refresh cycles. |
-| `lookupTimeout` | `1m` | Total shared lookup deadline, including queueing, LDAP and persistence. |
-| `lookupConcurrency` | `8` | Maximum concurrent user LDAP lookups **per replica**. |
+| `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. |
+| `lookupConcurrency` | `8` | Maximum concurrent distinct-user lookups **per replica**, including Kubernetes reads, LDAP and persistence. |
 | `refreshUsers` | Any authenticated user | Allowed callers of the currently stubbed refresh endpoint. |
 
 Each backend requires a unique `name`, one or more `urls`, `userSearchBases`, and
@@ -111,7 +111,11 @@ Cache hits use only memory. A miss checks Kubernetes first, queries every LDAP
 backend if needed, then persists before publishing memberships in memory.
 Same-user misses and refreshes share work **within one replica**; independent
 users can progress concurrently. Canceling one request does not cancel shared
-miss work. Lookup deadlines and shutdown bound that work.
+miss work. Lookup deadlines and shutdown bound that work. Admission is limited
+by `lookupConcurrency` before any shared goroutine or external I/O starts. At
+capacity, new distinct-user lookups fail immediately (HTTP 503); memory hits and
+waiters joining admitted same-user work remain available. Refresh uses the same
+limit, and users that cannot be admitted are retried in the next cycle.
 
 Across replicas, lookups may overlap and perform duplicate LDAP queries. There
 is no distributed single-flight lock. Create conflicts and resource-version
