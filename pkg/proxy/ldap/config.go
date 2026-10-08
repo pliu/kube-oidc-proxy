@@ -107,7 +107,9 @@ type BackendConfig struct {
 }
 
 type CacheConfig struct {
-	Type CacheType `json:"type"`
+	Namespace string    `json:"namespace,omitempty"`
+	Scope     string    `json:"scope,omitempty"`
+	Type      CacheType `json:"type"`
 
 	File             *FileCacheConfig   `json:"file,omitempty"`
 	KubernetesSecret *SecretCacheConfig `json:"kubernetesSecret,omitempty"`
