@@ -14,7 +14,7 @@ import (
 
 func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 	first, _ := userTestDirectory(t)
-	second, err := NewUserDirectory(first.resolver.config, first.store)
+	second, err := NewUserDirectory(first.resolver.config, first.store, first.isLeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestInterruptedWatchRelistsAndRemovesDeletedUser(t *testing.T) {
 
 func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	old, _ := userTestDirectory(t)
-	next, err := NewUserDirectory(old.resolver.config, old.store)
+	next, err := NewUserDirectory(old.resolver.config, old.store, old.isLeader)
 	if err != nil {
 		t.Fatal(err)
 	}

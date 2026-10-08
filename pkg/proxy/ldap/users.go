@@ -18,7 +18,6 @@ import (
 type userCell struct {
 	entry   cache.UserEntry
 	deleted bool
-	checked time.Time
 }
 
 // UserDirectory serves per-user persisted records. Its map lock protects only
@@ -37,16 +36,21 @@ type UserDirectory struct {
 	cancel   context.CancelFunc
 }
 
-func NewUserDirectory(config *Config, store cache.UserStore) (*UserDirectory, error) {
+// NewUserDirectory refreshes cached users periodically only while isLeader
+// reports that this replica holds the leader election Lease.
+func NewUserDirectory(config *Config, store cache.UserStore, isLeader func() bool) (*UserDirectory, error) {
 	if store == nil {
 		return nil, fmt.Errorf("per-user LDAP cache requires ConfigMap persistence")
+	}
+	if isLeader == nil {
+		return nil, fmt.Errorf("per-user LDAP cache requires a leader election check")
 	}
 	resolver, err := newResolver(config)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UserDirectory{isLeader: func() bool { return false }, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
+	return &UserDirectory{isLeader: isLeader, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), slots: make(chan struct{}, config.LookupConcurrency), ctx: ctx, cancel: cancel}, nil
 }
 
 // Core Kubernetes ConfigMap resource versions are monotonically increasing
@@ -76,11 +80,7 @@ func (d *UserDirectory) applyLocked(entry cache.UserEntry, deleted bool) {
 	if entry.Invalid != nil {
 		klog.Errorf("invalid LDAP cache ConfigMap %q: %v", entry.Name, entry.Invalid)
 	}
-	cell := userCell{entry: entry, deleted: deleted}
-	if entry.Record != nil {
-		cell.checked = entry.Record.LastSuccessfulLookup
-	}
-	d.users[entry.Name] = cell
+	d.users[entry.Name] = userCell{entry: entry, deleted: deleted}
 }
 
 func (d *UserDirectory) restoreUsers(ctx context.Context) (string, error) {

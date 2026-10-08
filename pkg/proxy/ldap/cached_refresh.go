@@ -10,9 +10,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// SetLeaderCheck connects periodic refresh to the elector before Run.
-func (d *UserDirectory) SetLeaderCheck(check func() bool) { d.isLeader = check }
-
 func (d *UserDirectory) runRefresh() {
 	ticker := time.NewTicker(d.resolver.config.RefreshInterval.Duration())
 	defer ticker.Stop()

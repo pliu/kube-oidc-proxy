@@ -100,22 +100,18 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 	}
 }
 
-func TestUnchangedRefreshAvoidsWriteAndAdvancesMemoryTime(t *testing.T) {
+func TestUnchangedRefreshAvoidsWrite(t *testing.T) {
 	d, client := userTestDirectory(t)
 	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
 	if _, _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
-	before := checkedAt(d, "alice")
 	count := len(client.Actions())
 	if _, err := d.resolve(context.Background(), "alice", true); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.Actions()) != count+1 {
 		t.Fatal("unchanged record was written")
-	}
-	if !checkedAt(d, "alice").After(before) {
-		t.Fatal("in-memory check timestamp did not advance")
 	}
 }
 
@@ -127,7 +123,7 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, _, err := d.resolver.searchUserContext(ctx, "alice"); err == nil {
+	if _, _, err := d.resolver.searchUser(ctx, "alice"); err == nil {
 		t.Fatal("canceled lookup succeeded")
 	}
 	if time.Since(start) > time.Second {
@@ -154,11 +150,4 @@ func TestUpdateConflictIsNotRetried(t *testing.T) {
 	if err != nil || attempts != 1 || result.Record.Found {
 		t.Fatalf("%+v %v attempts=%d", result, err, attempts)
 	}
-}
-
-func checkedAt(d *UserDirectory, username string) time.Time {
-	name, _ := cache.UserConfigMapName(d.scope(), username)
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.users[name].checked
 }

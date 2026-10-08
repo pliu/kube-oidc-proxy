@@ -84,7 +84,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		return cache.UserEntry{}, ctx.Err()
 	case d.slots <- struct{}{}:
 	}
-	groups, found, err := d.resolver.searchUserContext(ctx, key)
+	groups, found, err := d.resolver.searchUser(ctx, key)
 	<-d.slots
 	if err != nil {
 		return cache.UserEntry{}, err
@@ -96,13 +96,6 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 	changed := previous.Record == nil || previous.Record.Found != found || !equalGroups(previous.Record.Groups, record.Groups)
 	if !changed && record.LastSuccessfulLookup.Sub(previous.Record.LastSuccessfulLookup) < unchangedWriteInterval {
 		d.apply(previous, false)
-		d.mu.Lock()
-		cell := d.users[previous.Name]
-		if cell.entry.ResourceVersion == previous.ResourceVersion {
-			cell.checked = record.LastSuccessfulLookup
-		}
-		d.users[previous.Name] = cell
-		d.mu.Unlock()
 		return d.committed(key)
 	}
 	committed, err := d.store.Upsert(ctx, record, previous.ResourceVersion)

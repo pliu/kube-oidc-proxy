@@ -19,6 +19,7 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
+	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
 func NewRunCommand(stopCh <-chan struct{}) *cobra.Command {
@@ -109,60 +110,11 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
-			// Set up the LDAP backends that the groups of a request are
-			// augmented from, if configured. Left nil when they are not, so
-			// that the proxy keeps taking groups from the token.
-			var ldapDirectory proxy.GroupAugmenter
-			var ldapUsers *ldap.UserDirectory
-			var ldapReadiness []probe.NamedCheck
-			if opts.LDAP.Enabled() {
-				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
-				if err != nil {
-					return err
-				}
-
-				ldapConfig, err := opts.LDAP.Config(usernamePrefix)
-				if err != nil {
-					return err
-				}
-
-				namespace := ldapConfig.Cache.Namespace
-				if namespace == "" {
-					namespace, err = cache.InClusterNamespace()
-					if err != nil {
-						return err
-					}
-				}
-				ldapCache, err := cache.NewConfigMaps(kubeclient, namespace, ldapConfig.Cache.Scope, ldapConfig.UserRecordFingerprint())
-				if err != nil {
-					return err
-				}
-				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache)
-				if err != nil {
-					return err
-				}
-
-				ldapDirectory = directory
-				ldapUsers = directory
-
-				// Readiness requires initial ConfigMap synchronization, even when empty.
-				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
-					Name: "ldap cache synchronization",
-					Check: func() error {
-						if !directory.HasSynced() {
-							return errors.New("LDAP cache initial synchronization is incomplete")
-						}
-
-						return nil
-					},
-				})
-			}
-
 			// Elect one replica leader. Every replica serves requests
 			// whether or not it leads.
 			namespace := opts.LeaderElection.ResourceNamespace
 			if namespace == "" {
-				namespace, err = cache.InClusterNamespace()
+				namespace, err = util.InClusterNamespace()
 				if err != nil {
 					return fmt.Errorf("no --leader-elect-resource-namespace set: %w", err)
 				}
@@ -178,8 +130,53 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			if err != nil {
 				return err
 			}
-			if ldapUsers != nil {
-				ldapUsers.SetLeaderCheck(elector.IsLeader)
+
+			// Set up the LDAP backends that the groups of a request are
+			// augmented from, if configured. Left nil when they are not, so
+			// that the proxy keeps taking groups from the token.
+			var ldapDirectory proxy.GroupAugmenter
+			var ldapReadiness []probe.NamedCheck
+			if opts.LDAP.Enabled() {
+				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
+				if err != nil {
+					return err
+				}
+
+				ldapConfig, err := opts.LDAP.Config(usernamePrefix)
+				if err != nil {
+					return err
+				}
+
+				cacheNamespace := ldapConfig.Cache.Namespace
+				if cacheNamespace == "" {
+					cacheNamespace, err = util.InClusterNamespace()
+					if err != nil {
+						return err
+					}
+				}
+				ldapCache, err := cache.NewConfigMaps(kubeclient, cacheNamespace, ldapConfig.Cache.Scope, ldapConfig.UserRecordFingerprint())
+				if err != nil {
+					return err
+				}
+				// Only the leader refreshes cached users periodically.
+				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache, elector.IsLeader)
+				if err != nil {
+					return err
+				}
+
+				ldapDirectory = directory
+
+				// Readiness requires initial ConfigMap synchronization, even when empty.
+				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
+					Name: "ldap cache synchronization",
+					Check: func() error {
+						if !directory.HasSynced() {
+							return errors.New("LDAP cache initial synchronization is incomplete")
+						}
+
+						return nil
+					},
+				})
 			}
 
 			// Initialise proxy with OIDC token authenticator

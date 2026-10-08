@@ -115,10 +115,10 @@ func (b *backend) timeLimit() int {
 	return seconds
 }
 
-// withConnContext dials the backend, runs fn against the bound connection, and
+// withConn dials the backend, runs fn against the bound connection, and
 // closes it. A directory that goes quiet is cut off by the watchdog, and the
 // resulting error is reported as the timeout it is.
-func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) error {
+func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -133,7 +133,7 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 
 	ctx, cancel := context.WithTimeout(ctx, b.config.Timeout.Duration())
 	defer cancel()
-	c, err := b.connectContext(ctx, w)
+	c, err := b.connect(ctx, w)
 	if err != nil {
 		return w.wrap(err)
 	}
@@ -149,17 +149,17 @@ func (b *backend) withConnContext(ctx context.Context, fn func(conn) error) erro
 	return err
 }
 
-// connectContext dials the configured URLs in order, returning the first connection
+// connect dials the configured URLs in order, returning the first connection
 // that can be established and bound.
 //
 // Each connection is handed to the watchdog as soon as it exists, since a
 // directory that accepts the connection and then never answers the bind hangs
 // just as thoroughly as one that never answers a search.
-func (b *backend) connectContext(ctx context.Context, w *watchdog) (conn, error) {
+func (b *backend) connect(ctx context.Context, w *watchdog) (conn, error) {
 	var errs []string
 
 	for _, rawURL := range b.config.URLs {
-		c, err := b.dialContext(ctx, rawURL)
+		c, err := b.dialURL(ctx, rawURL)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", rawURL, err))
 			continue
@@ -258,7 +258,7 @@ func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {
 
 // The dialer itself has a socket timeout. A canceled caller returns promptly;
 // a connection arriving after cancellation is closed rather than leaked.
-func (b *backend) dialContext(ctx context.Context, url string) (conn, error) {
+func (b *backend) dialURL(ctx context.Context, url string) (conn, error) {
 	type result struct {
 		c   conn
 		err error

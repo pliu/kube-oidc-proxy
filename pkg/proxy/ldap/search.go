@@ -50,45 +50,34 @@ func (e *duplicateUserError) Error() string {
 }
 
 // groupsOf turns the memberOf of one entry into the group names it is to be
-// given.
-func (b *backend) groupsOf(c conn, entry *goldap.Entry, groupNames map[string]string,
-	unknown func(groupDN, key string) (string, error)) ([]string, error) {
+// given, keeping only the groups that were found under the configured group
+// search bases. A group named twice - by two DNs that normalise the same way -
+// is given once, since a user must not be impersonated as a member of it
+// twice.
+func (b *backend) groupsOf(c conn, entry *goldap.Entry) ([]string, error) {
 	dns, err := b.memberOfDNs(c, entry)
 	if err != nil {
 		return nil, err
 	}
 
-	return groupsFromDNs(entry.DN, dns, groupNames, unknown)
-}
-
-// groupsFromDNs turns the memberOf of one entry into the group names it is to
-// be given, keeping only the groups that were found under the configured group
-// search bases. A group named twice - by two DNs that normalise the same way -
-// is given once, since a user must not be impersonated as a member of it
-// twice.
-//
-// unknown resolves a DN that has not yet been seen in this lookup.
-func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
-	unknown func(groupDN, key string) (string, error)) ([]string, error) {
+	resolve := b.discoverGroup(c)
 	groups := make([]string, 0)
 	seen := make(map[string]struct{})
 
-	for _, groupDN := range memberOf {
+	for _, groupDN := range dns {
 		key, err := normaliseDN(groupDN)
 		if err != nil {
 			return nil, fmt.Errorf("user %q has an invalid %s DN %q: %s",
-				dn, memberOfAttribute, groupDN, err)
+				entry.DN, memberOfAttribute, groupDN, err)
 		}
 
-		name, ok := groupNames[key]
-		if !ok {
-			if name, err = unknown(groupDN, key); err != nil {
-				return nil, err
-			}
+		name, err := resolve(groupDN, key)
+		if err != nil {
+			return nil, err
+		}
 
-			if name == "" {
-				continue
-			}
+		if name == "" {
+			continue
 		}
 
 		if _, duplicate := seen[name]; duplicate {
@@ -102,8 +91,8 @@ func groupsFromDNs(dn string, memberOf []string, groupNames map[string]string,
 	return groups, nil
 }
 
-// searchUserContext queries every backend and unions only complete successful results.
-func (d *resolver) searchUserContext(ctx context.Context, key string) ([]string, bool, error) {
+// searchUser queries every backend and unions only complete successful results.
+func (d *resolver) searchUser(ctx context.Context, key string) ([]string, bool, error) {
 	type foundUser struct {
 		groups []string
 		found  bool
@@ -111,7 +100,7 @@ func (d *resolver) searchUserContext(ctx context.Context, key string) ([]string,
 
 	results, err := eachBackend(d.backends, func(b *backend) (foundUser, error) {
 		start := time.Now()
-		groups, found, err := b.searchUserContext(ctx, key)
+		groups, found, err := b.searchUser(ctx, key)
 		if err == nil {
 			backendRefreshDuration.WithLabelValues(b.config.Name).Observe(time.Since(start).Seconds())
 		}
@@ -141,18 +130,16 @@ func (d *resolver) searchUserContext(ctx context.Context, key string) ([]string,
 	return groups, true, nil
 }
 
-// searchUserContext searches this backend for one user, returning the groups they
+// searchUser searches this backend for one user, returning the groups they
 // hold in it. The second return value reports whether the backend holds them
 // at all.
 //
 // Membership DNs are resolved directly within configured group search bases.
-func (b *backend) searchUserContext(ctx context.Context, username string) ([]string, bool, error) {
-	groupNames := make(map[string]string)
-
+func (b *backend) searchUser(ctx context.Context, username string) ([]string, bool, error) {
 	var groups []string
 	var claimedBy string
 
-	err := b.withConnContext(ctx, func(c conn) error {
+	err := b.withConn(ctx, func(c conn) error {
 		// The username is a value from an authenticated request, so it reaches the
 		// filter escaped: a name carrying parentheses or an asterisk must not be
 		// able to widen the search it appears in.
@@ -194,7 +181,7 @@ func (b *backend) searchUserContext(ctx context.Context, username string) ([]str
 				claimedBy = entry.DN
 
 				var err error
-				groups, err = b.groupsOf(c, entry, groupNames, b.discoverGroup(c, groupNames))
+				groups, err = b.groupsOf(c, entry)
 				if err != nil {
 					return err
 				}
@@ -215,11 +202,16 @@ func (b *backend) searchUserContext(ctx context.Context, username string) ([]str
 }
 
 // discoverGroup resolves membership DNs within configured bases and filters.
-// The per-lookup map also detects ambiguous group names.
-func (b *backend) discoverGroup(c conn, groupNames map[string]string) func(string, string) (string, error) {
+// The per-lookup map remembers resolved names and detects ambiguous ones.
+func (b *backend) discoverGroup(c conn) func(groupDN, key string) (string, error) {
+	groupNames := make(map[string]string)
 	var discovered int
 
 	return func(groupDN, key string) (string, error) {
+		if name, ok := groupNames[key]; ok {
+			return name, nil
+		}
+
 		// A user is routinely a member of groups outside the search bases, and
 		// those are meant to be dropped. Answering that from the DN costs
 		// nothing, and leaves the searches below for the DNs that could

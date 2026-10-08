@@ -373,7 +373,7 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 	w := newWatchdog(time.Minute)
 	defer w.stop()
 
-	got, err := d.backends[0].connectContext(context.Background(), w)
+	got, err := d.backends[0].connect(context.Background(), w)
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
@@ -396,7 +396,7 @@ func TestConnectSetsTheStartTLSServerName(t *testing.T) {
 	w := newWatchdog(time.Minute)
 	defer w.stop()
 
-	if _, err := d.backends[0].connectContext(context.Background(), w); err != nil {
+	if _, err := d.backends[0].connect(context.Background(), w); err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
 
