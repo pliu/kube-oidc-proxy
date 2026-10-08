@@ -40,6 +40,8 @@ const (
 	DefaultGroupNameAttribute = "cn"
 	DefaultRefreshInterval    = time.Minute * 10
 	DefaultTimeout            = time.Minute * 5
+	DefaultLookupTimeout      = time.Minute
+	DefaultLookupConcurrency  = 8
 )
 
 // Config is the decoded contents of an LDAP configuration file.
@@ -103,8 +105,7 @@ type CacheConfig struct {
 	Scope     string `json:"scope"`
 }
 
-// Duration is a time.Duration held in JSON as a string such as "10m", the form
-// the flags it replaced took.
+// Duration is a time.Duration held in JSON as a string such as "10m".
 type Duration time.Duration
 
 // Duration is nil safe, so that an unset optional duration reads as zero
@@ -233,10 +234,10 @@ func ValidateSchema(data []byte) error {
 // SetDefaults fills in the fields a configuration file is allowed to leave out.
 func (c *Config) SetDefaults() {
 	if c.LookupTimeout == nil {
-		c.LookupTimeout = NewDuration(time.Minute)
+		c.LookupTimeout = NewDuration(DefaultLookupTimeout)
 	}
 	if c.LookupConcurrency == 0 {
-		c.LookupConcurrency = 8
+		c.LookupConcurrency = DefaultLookupConcurrency
 	}
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)

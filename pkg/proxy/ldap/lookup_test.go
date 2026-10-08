@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestStandaloneLookupWithoutSweep(t *testing.T) {
+func TestSearchUserResolvesOneUserAndHonoursCancellation(t *testing.T) {
 	c := connWithUsers([]string{"Full Group Name"}, map[string][]string{"alice@example.net": {"Full Group Name"}})
 	d := newTestResolver(t, testConfig(), c)
 	groups, found, err := d.searchUser(context.Background(), "alice@example.net")

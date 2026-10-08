@@ -21,7 +21,7 @@ const (
 
 	// maxRangeRequests bounds the follow up searches made to collect a
 	// truncated attribute, so that a directory which never advances the window
-	// cannot hold a refresh here indefinitely.
+	// cannot hold a lookup here indefinitely.
 	maxRangeRequests = 1000
 )
 

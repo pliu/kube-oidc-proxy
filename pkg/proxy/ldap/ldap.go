@@ -16,8 +16,6 @@ import (
 	"sync"
 )
 
-var ErrNoBackends = errors.New("no LDAP backends configured")
-
 // resolver queries configured LDAP backends for one identity.
 type resolver struct {
 	config       *Config
@@ -30,7 +28,7 @@ type backend struct {
 	config    *BackendConfig
 	tlsConfig *tls.Config
 
-	// bindPassword is resolved up front, so that a refresh does not depend on
+	// bindPassword is resolved up front, so that a lookup does not depend on
 	// a file that may have gone away since startup.
 	bindPassword string
 
@@ -44,16 +42,12 @@ type backend struct {
 // newResolver prepares LDAP backends without contacting the directories.
 func newResolver(config *Config) (*resolver, error) {
 	if config == nil {
-		return nil, ErrNoBackends
+		return nil, errors.New("no LDAP configuration")
 	}
 
 	// Defaulting here as well as when a config file is read holds a config
 	// built in code to the same shape as one read from disk.
 	config.SetDefaults()
-
-	if len(config.Backends) == 0 {
-		return nil, ErrNoBackends
-	}
 
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -106,7 +100,7 @@ func newBackend(config *BackendConfig) (*backend, error) {
 
 	// Parsed here rather than on the path that uses them, so that a search base
 	// which is not a DN at all is reported where somebody is watching instead
-	// of once per refresh of a user.
+	// of once per lookup of a user.
 	for _, base := range config.GroupSearchBases {
 		key, err := normaliseDN(base)
 		if err != nil {
@@ -146,10 +140,9 @@ func usernameKey(username, prefix string) string {
 }
 
 // eachBackend searches every backend in parallel and returns the results in
-// configuration order. A refresh takes roughly as long as the slowest backend
+// configuration order. A lookup takes roughly as long as the slowest backend
 // rather than the sum of all of them. The first error in configuration order
-// is returned, so errors and results stay
-// deterministic.
+// is returned, so errors and results stay deterministic.
 func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T, error) {
 	type result struct {
 		value T

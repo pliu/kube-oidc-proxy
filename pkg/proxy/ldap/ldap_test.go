@@ -155,7 +155,7 @@ func TestNewValidatesConfig(t *testing.T) {
 		mutate func(*Config)
 		expErr string
 	}{
-		"no backends":             {func(c *Config) { c.Backends = nil }, "no LDAP backends configured"},
+		"no backends":             {func(c *Config) { c.Backends = nil }, "at least one backend must be configured"},
 		"no name":                 {func(c *Config) { c.Backends[0].Name = "" }, "name must be set"},
 		"no URL":                  {func(c *Config) { c.Backends[0].URLs = nil }, "at least one url must be set"},
 		"no user search base":     {func(c *Config) { c.Backends[0].UserSearchBases = nil }, "at least one userSearchBase must be set"},
