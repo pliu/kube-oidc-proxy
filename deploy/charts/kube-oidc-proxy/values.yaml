@@ -123,7 +123,11 @@ affinity: {}
 # Optional LDAP augmentation with readable per-user ConfigMap persistence.
 ldap:
   enabled: false
-  # Defaults to the release namespace. Use a dedicated namespace to isolate RBAC.
+  # Defaults to the release namespace. Prefer a dedicated namespace: the proxy
+  # trusts the per-user ConfigMaps there, unsigned, as group memberships, so
+  # anyone who can create or update ConfigMaps in it can grant any user any
+  # non-system: group - equivalent to cluster-admin. Allow only the proxy to
+  # write ConfigMaps in this namespace.
   cacheNamespace: ""
   # LDAP JSON settings, including backends, refreshInterval, lookupTimeout,
   # lookupConcurrency and refreshConcurrency. The chart supplies cache.namespace.

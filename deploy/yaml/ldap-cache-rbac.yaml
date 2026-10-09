@@ -1,4 +1,9 @@
 # Apply when LDAP augmentation is enabled. The LDAP cache namespace must match.
+#
+# Security: the proxy trusts these ConfigMaps as group memberships, unsigned.
+# Any subject that can create or update ConfigMaps in this namespace can grant
+# any user any non-system: group, which is equivalent to cluster-admin. Use a
+# namespace dedicated to the cache and bind write access to the proxy only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

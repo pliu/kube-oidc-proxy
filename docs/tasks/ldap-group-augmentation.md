@@ -173,14 +173,28 @@ limits; an oversized record fails persistence and is never partially served.
 ## Deployment
 
 ConfigMaps contain readable usernames and memberships. LDAP remains the
-authority; these are generated cache records. Restrict write access to the
-authorized proxy/controller service account. Readers can see these identities.
+authority; these are generated cache records. Readers can see these identities.
 The proxy refuses to overwrite unrelated objects at its generated names.
+
+> **Security: write access to the cache namespace is equivalent to
+> cluster-admin.** The proxy serves memberships from these ConfigMaps without
+> consulting LDAP, and records carry no signature. Anyone able to create or
+> update ConfigMaps in the cache namespace can write a record granting any user
+> any group that does not start with `system:` - including groups bound to
+> `cluster-admin` - which applies on every replica until the next successful
+> refresh of that user. The configuration fingerprint is a plain hash of the
+> search settings, not a secret, and offers no protection.
+>
+> Use a dedicated cache namespace that holds nothing else, and allow only the
+> proxy's service account to `create`, `update` or `patch` ConfigMaps there.
+> Treat every other subject with those verbs in the namespace, including
+> namespace admins, CI pipelines and operators bound through broad ClusterRoles,
+> as holding cluster-admin.
 
 Grant namespaced ConfigMap `get`, `list`, `watch`, `create`, and `update` access.
 Deletion permission is unnecessary. [A manifest](../../deploy/yaml/ldap-cache-rbac.yaml)
-is provided. Kubernetes RBAC cannot restrict list/watch/create by these labels;
-use a dedicated cache namespace for stronger isolation from unrelated objects.
+is provided. Kubernetes RBAC cannot restrict list/watch/create by these labels,
+so the namespace itself is the trust boundary described above.
 The namespace must exist before starting the proxy.
 
 For Helm, enable `ldap.enabled`, optionally set `ldap.cacheNamespace`, and supply backend settings under `ldap.config`. The chart
