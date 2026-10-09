@@ -473,6 +473,40 @@ func TestHandlers(t *testing.T) {
 				"Impersonate-Extra-Foo-Bar": []string{"e", "f"},
 			},
 		},
+		"a token naming a service account is refused rather than impersonated": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer fake-token"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{Name: "system:serviceaccount:kube-system:clusterrole-aggregation-controller"},
+				},
+				pass: true,
+			},
+			expCode: http.StatusForbidden,
+			expBody: errReservedUsername.Error(),
+		},
+
+		"a token naming the anonymous user is refused": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer fake-token"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{Name: user.Anonymous},
+				},
+				pass: true,
+			},
+			expCode: http.StatusForbidden,
+			expBody: errReservedUsername.Error(),
+		},
+
 		"an authed request does not run with the reserved groups its token claims": {
 			req: &http.Request{
 				Header: http.Header{

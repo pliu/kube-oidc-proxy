@@ -19,6 +19,10 @@ import (
 // Impersonate- headers. See withImpersonateRequest for why they are refused.
 var errImpersonationNotAccepted = errors.New("impersonation headers are not accepted")
 
+// errReservedUsername is returned for a token whose username is one Kubernetes
+// reserves. See isReservedUsername.
+var errReservedUsername = errors.New("usernames starting with system: are not accepted")
+
 func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	// Set up proxy handlers
 	handler = p.auditor.WithRequest(handler)
@@ -65,6 +69,13 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 
 		var remoteAddr string
 		req, remoteAddr = reqctx.RemoteAddr(req)
+
+		if isReservedUsername(info.User.GetName()) {
+			klog.V(2).Infof("rejecting token with reserved username %q (%s)",
+				info.User.GetName(), remoteAddr)
+			p.handleError(rw, req, errReservedUsername)
+			return
+		}
 
 		klog.V(4).Infof("authenticated request: %s", remoteAddr)
 
@@ -115,7 +126,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// Keep the name from the token but take the groups from the directory.
 		if p.ldapDirectory != nil {
 			var err error
-			requester, err = p.augmentGroups(req.Context(), requester, remoteAddr)
+			requester, err = p.augmentGroups(req.Context(), requester)
 			if err != nil {
 				klog.Errorf("LDAP group resolution failed (%s): %v", remoteAddr, err)
 				http.Error(rw, "Group resolution unavailable", http.StatusServiceUnavailable)
@@ -175,6 +186,11 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 			// Impersonation headers, which are never honoured
 		case errImpersonationNotAccepted:
 			http.Error(rw, errImpersonationNotAccepted.Error(), http.StatusForbidden)
+			return
+
+			// A token naming an identity Kubernetes reserves
+		case errReservedUsername:
+			http.Error(rw, errReservedUsername.Error(), http.StatusForbidden)
 			return
 
 			// No impersonation configuration found in context

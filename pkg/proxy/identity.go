@@ -46,9 +46,21 @@ func buildImpersonation(requester user.Info, remoteAddr string, config *Config) 
 	}
 }
 
-// reservedGroupPrefix starts the groups Kubernetes reserves for identities it
-// assigns itself, such as system:masters.
-const reservedGroupPrefix = "system:"
+// reservedPrefix starts the users and groups Kubernetes reserves for
+// identities it assigns itself, such as system:masters,
+// system:serviceaccount:<namespace>:<name> and system:anonymous.
+const reservedPrefix = "system:"
+
+// isReservedUsername reports whether a token names one of the identities
+// Kubernetes reserves. The proxy may impersonate any user, service accounts
+// included, so a token whose username is system:serviceaccount:kube-system:x -
+// from an identity provider that lets a user influence their username, or a
+// claim mapping without a prefix - would run the request as that service
+// account, with whatever it is allowed. Such a token is refused rather than
+// stripped, as there is no identity left to run it as.
+func isReservedUsername(name string) bool {
+	return strings.HasPrefix(name, reservedPrefix)
+}
 
 // withoutReservedGroups removes the groups of an authenticated token that use
 // the reserved system: prefix.
@@ -85,5 +97,5 @@ func withoutReservedGroups(u user.Info, remoteAddr string) user.Info {
 }
 
 func isReservedGroup(group string) bool {
-	return strings.HasPrefix(group, reservedGroupPrefix)
+	return strings.HasPrefix(group, reservedPrefix)
 }

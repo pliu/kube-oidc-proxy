@@ -316,7 +316,7 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 		Extra:  map[string][]string{"foo": {"bar"}},
 	}
 
-	out, err := p.augmentGroups(gocontext.Background(), in, "fakeAddr")
+	out, err := p.augmentGroups(gocontext.Background(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,6 +353,26 @@ func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("got unexpected response code, exp=%d got=%d",
 			http.StatusOK, resp.StatusCode)
+	}
+}
+
+// A token naming an identity Kubernetes reserves is refused before the
+// directory is asked about it.
+func TestReservedUsernameIsRefusedBeforeLookup(t *testing.T) {
+	p := newTestProxy(t)
+	defer p.ctrl.Finish()
+
+	augmenter := &fakeAugmenter{mapping: map[string][]string{"system:admin": {"admins"}}}
+	p.ldapDirectory = augmenter
+
+	resp := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet),
+		&user.DefaultInfo{Name: "system:admin"})
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("got unexpected response code, exp=%d got=%d", http.StatusForbidden, resp.StatusCode)
+	}
+	if augmenter.resolveCount != 0 {
+		t.Errorf("expected no LDAP lookup, got %d", augmenter.resolveCount)
 	}
 }
 

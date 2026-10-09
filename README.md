@@ -162,16 +162,26 @@ When there's an error or failure:
 
 This is similar to success, but without the token information.
 
-## Reserved Groups
+## Reserved Users and Groups
 
-Groups starting with `system:` are reserved by Kubernetes for identities it
-assigns itself. The proxy removes them from every token it authenticates,
-before authorizing impersonation or forwarding the request, and logs each one
-it drops at `-v=2`. The proxy's `ServiceAccount` may impersonate any group, so
-otherwise a token claiming `system:masters` - from an identity provider that
-lets users influence their groups, or a groups claim mapping without a prefix -
-would run as cluster-admin, bypassing RBAC entirely. `system:authenticated` is
-still added to every forwarded identity.
+Users and groups starting with `system:` are reserved by Kubernetes for
+identities it assigns itself. The proxy's `ServiceAccount` may impersonate any
+user and any group, so a token able to name one would run with its privileges.
+An identity provider that lets users influence their claims, or a claim mapping
+without a prefix, would otherwise let a token:
+
+- claim the `system:masters` group, and run as cluster-admin, bypassing RBAC
+  entirely; or
+- name a user such as `system:serviceaccount:kube-system:<name>`, and run as
+  that `ServiceAccount`.
+
+The proxy removes `system:` groups from every token it authenticates, before
+forwarding the request, and logs each one it drops at `-v=2`.
+`system:authenticated` is still added to every forwarded identity. A token whose
+username starts with `system:` is refused with `403 Forbidden`, since there is
+no identity left to run it as. Neither applies to
+[token passthrough](./docs/tasks/token-passthrough.md), where the API server
+authenticates the token itself.
 
 **Upgrading:** deployments that granted cluster administrators access by putting
 `system:masters` in the groups claim must move them to an ordinary group bound
