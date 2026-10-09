@@ -654,6 +654,28 @@ func TestHandlers(t *testing.T) {
 			expBody: "mmosley is not allowed to impersonate uid 'bar'",
 		},
 
+		"an authed request whose token claims system:masters may not impersonate on its authority": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization":    []string{"bearer fake-token"},
+					"Impersonate-User": []string{"admin"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{
+						Name:   "mmosley",
+						Groups: []string{"group1", "system:masters"},
+					},
+				},
+				pass: true,
+				err:  nil,
+			},
+			expCode: http.StatusForbidden,
+			expBody: "mmosley is not allowed to impersonate user 'admin'",
+		},
+
 		"an authed request with impersonation groups missing user should fail": {
 			req: &http.Request{
 				Header: http.Header{
@@ -813,6 +835,29 @@ func TestHandlers(t *testing.T) {
 				"Impersonate-Extra-Foo-Bar": []string{"e", "f"},
 			},
 		},
+		"an authed request does not run with the reserved groups its token claims": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer fake-token"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{
+						Name:   "a-user",
+						Groups: []string{"system:masters", "my-group", "system:unauthenticated"},
+					},
+				},
+				pass: true,
+				err:  nil,
+			},
+			expCode:  http.StatusOK,
+			expBody:  "",
+			expUser:  "a-user",
+			expGroup: []string{"my-group", "system:authenticated"},
+		},
+
 		"an authed request with user, group, extra but disabled impersonation should return no impersonation and should 200": {
 			req: &http.Request{
 				Header: http.Header{

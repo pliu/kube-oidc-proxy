@@ -141,7 +141,7 @@ users:
 In addition to auditing, kube-oidc-proxy logs all requests to standard out so the requests can be captured by a common Security Information and Event Management (SIEM) system.  SIEMs will typically import logs directly from containers via tools like fluentd.  This logging is also useful in debugging.  An example successful event:
 
 ```
-[2021-11-25T01:05:17+0000] AuSuccess src:[10.42.0.5 / 10.42.1.3, 10.42.0.5] URI:/api/v1/namespaces/openunison/pods?limit=500 inbound:[mlbadmin1 / system:masters|system:authenticated /]
+[2021-11-25T01:05:17+0000] AuSuccess src:[10.42.0.5 / 10.42.1.3, 10.42.0.5] URI:/api/v1/namespaces/openunison/pods?limit=500 inbound:[mlbadmin1 / k8s-cluster-admins|system:authenticated /]
 ```
 
 The first block, between `[]` is an ISO-8601 timestamp.  The next text, `AuSuccess`, indicates that authentication was successful.  the `src` block containers the remote address of the request, followed by the value of the `X-Forwarded-For` HTTP header if provided.  The `URI` is the URL path of the request.  The `inbound` section provides the user name, groups, and extra-info provided to the proxy from the JWT.
@@ -153,6 +153,40 @@ When there's an error or failure:
 ```
 
 This is similar to success, but without the token information.
+
+## Reserved Groups
+
+Groups starting with `system:` are reserved by Kubernetes for identities it
+assigns itself. The proxy removes them from every token it authenticates,
+before authorizing impersonation or forwarding the request, and logs each one
+it drops at `-v=2`. The proxy's `ServiceAccount` may impersonate any group, so
+otherwise a token claiming `system:masters` - from an identity provider that
+lets users influence their groups, or a groups claim mapping without a prefix -
+would run as cluster-admin, bypassing RBAC entirely. `system:authenticated` is
+still added to every forwarded identity, and groups requested with an
+authorized `Impersonate-Group` header are unaffected.
+
+**Upgrading:** deployments that granted cluster administrators access by putting
+`system:masters` in the groups claim must move them to an ordinary group bound
+to the `cluster-admin` `ClusterRole`, before upgrading:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-cluster-admins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: k8s-cluster-admins
+```
+
+Unlike `system:masters`, membership granted this way is visible to and
+revocable through RBAC.
 
 ## End-User Impersonation
 
@@ -167,7 +201,7 @@ kube-oidc-proxy supports the impersonation headers for inbound requests.  This a
 In addition to sending this `extra` information, the proxy adds an additional section to the logfile that will identify outbound identity data.  When impersonation headers are present, the `AuSuccess` log will look like:
 
 ```
-[2021-11-25T01:05:17+0000] AuSuccess src:[10.42.0.5 / 10.42.1.3] URI:/api/v1/namespaces/openunison/pods?limit=500 inbound:[mlbadmin1 / system:masters|system:authenticated /] outbound:[mlbadmin2 / group2|system:authenticated /]
+[2021-11-25T01:05:17+0000] AuSuccess src:[10.42.0.5 / 10.42.1.3] URI:/api/v1/namespaces/openunison/pods?limit=500 inbound:[mlbadmin1 / k8s-cluster-admins|system:authenticated /] outbound:[mlbadmin2 / group2|system:authenticated /]
 ```
 
 When using `Impersonate-Extra-` headers, the proxy's `ServiceAccount` must be explicitly authorized via RBAC to impersonate whatever the extra key is named.  This is because extras are treated as subresources which must be explicitly authorized.  

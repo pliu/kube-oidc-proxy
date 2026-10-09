@@ -3,6 +3,7 @@ package fake
 
 import (
 	"context"
+	"slices"
 
 	azv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +25,16 @@ func New(err error) *FakeReviewer {
 func (f *FakeReviewer) Create(ctx context.Context, req *azv1.SubjectAccessReview, co metav1.CreateOptions) (*azv1.SubjectAccessReview, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+
+	// Like the API server, which allows members of system:masters everything
+	// without consulting RBAC.
+	if slices.Contains(req.Spec.Groups, "system:masters") {
+		req.Status = azv1.SubjectAccessReviewStatus{
+			Allowed: true,
+		}
+
+		return req, nil
 	}
 
 	if req.Spec.ResourceAttributes.Resource == "users" && req.Spec.ResourceAttributes.Name == "jjackson" {

@@ -4,10 +4,12 @@ package proxy
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/transport"
+	"k8s.io/klog/v2"
 )
 
 // buildImpersonation assembles an already-authorized identity for forwarding.
@@ -66,4 +68,49 @@ func buildImpersonation(requester, target user.Info, remoteAddr string, config *
 		InboundUser:      requester,
 		ImpersonatedUser: target,
 	}, nil
+}
+
+// reservedGroupPrefix starts the groups Kubernetes reserves for identities it
+// assigns itself, such as system:masters.
+const reservedGroupPrefix = "system:"
+
+// withoutReservedGroups removes the groups of an authenticated token that use
+// the reserved system: prefix.
+//
+// The proxy may impersonate any group, so a group its token claims is a group
+// the request runs with. A token claiming system:masters - from an identity
+// provider that lets a user name their own groups, or a claim mapping without
+// a prefix - would otherwise run the request as cluster-admin, and would take
+// part in the reviews authorizing impersonation too, where system:masters is
+// allowed everything. Dropped here, before anything reads the identity, so
+// that no later step can see them. Groups authorized through Impersonate-Group
+// are not affected. system:authenticated is added back when the request is
+// impersonated.
+func withoutReservedGroups(u user.Info, remoteAddr string) user.Info {
+	groups := u.GetGroups()
+	if !slices.ContainsFunc(groups, isReservedGroup) {
+		return u
+	}
+
+	kept := make([]string, 0, len(groups))
+	for _, group := range groups {
+		if isReservedGroup(group) {
+			klog.V(2).Infof("dropping reserved group %q from the token of %q (%s)",
+				group, u.GetName(), remoteAddr)
+			continue
+		}
+
+		kept = append(kept, group)
+	}
+
+	return &user.DefaultInfo{
+		Name:   u.GetName(),
+		UID:    u.GetUID(),
+		Groups: kept,
+		Extra:  u.GetExtra(),
+	}
+}
+
+func isReservedGroup(group string) bool {
+	return strings.HasPrefix(group, reservedGroupPrefix)
 }

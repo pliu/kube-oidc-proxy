@@ -59,7 +59,7 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 		klog.V(4).Infof("authenticated request: %s", remoteAddr)
 
 		// Add the user info to the request context
-		req = req.WithContext(genericapirequest.WithUser(req.Context(), info.User))
+		req = req.WithContext(genericapirequest.WithUser(req.Context(), withoutReservedGroups(info.User, remoteAddr)))
 		handler.ServeHTTP(rw, req)
 	})
 }

@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -91,5 +92,30 @@ func TestBuildImpersonationBuiltinGroups(t *testing.T) {
 		if !reflect.DeepEqual(result.ImpersonationConfig.Groups, test.want) {
 			t.Errorf("%q with groups %v: got %v, want %v", test.name, test.groups, result.ImpersonationConfig.Groups, test.want)
 		}
+	}
+}
+
+func TestWithoutReservedGroups(t *testing.T) {
+	unreserved := &user.DefaultInfo{Name: "alice", Groups: []string{"developers", "ops"}}
+	if got := withoutReservedGroups(unreserved, "192.0.2.1"); got != unreserved {
+		t.Fatalf("identity without reserved groups was replaced: %+v", got)
+	}
+
+	claimed := &user.DefaultInfo{
+		Name: "alice", UID: "alice-id",
+		Groups: []string{"system:masters", "developers", "system:authenticated", "systems", "system:serviceaccounts"},
+		Extra:  map[string][]string{"scope": {"openid"}},
+	}
+	original := slices.Clone(claimed.Groups)
+
+	got := withoutReservedGroups(claimed, "192.0.2.1")
+	if !reflect.DeepEqual(got.GetGroups(), []string{"developers", "systems"}) {
+		t.Errorf("unexpected groups: %q", got.GetGroups())
+	}
+	if got.GetName() != "alice" || got.GetUID() != "alice-id" || !reflect.DeepEqual(got.GetExtra(), claimed.Extra) {
+		t.Errorf("identity not otherwise preserved: %+v", got)
+	}
+	if !reflect.DeepEqual(claimed.Groups, original) {
+		t.Errorf("token identity was modified: %q", claimed.Groups)
 	}
 }
