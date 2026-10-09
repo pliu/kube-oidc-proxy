@@ -29,6 +29,7 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	handler = p.withLDAPRefresh(handler)
 	handler = p.withAuthenticateRequest(handler)
 	handler = p.withRequestCount(handler)
+	handler = withReceivedAt(handler)
 
 	return handler
 }

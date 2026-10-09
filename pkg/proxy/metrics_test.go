@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 type hijackableResponseWriter struct {
@@ -106,5 +107,45 @@ func TestRequestCountPreservesResponseWriterInterfaces(t *testing.T) {
 
 	if got := testutil.ToFloat64(requestsTotal.WithLabelValues(strconv.Itoa(http.StatusSwitchingProtocols))) - before; got != 1 {
 		t.Errorf("expected a hijacked request to be counted as 101, got %v", got)
+	}
+}
+
+func TestRequestOverheadCoversOnlyForwardedRequests(t *testing.T) {
+	p := newTestProxy(t)
+	p.config = &Config{TokenPassthrough: true}
+	p.fakeRT.expAuthorization = "Bearer token"
+	registerMetrics()
+
+	handler := p.withHandlers(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if _, err := p.RoundTrip(req); err != nil {
+			t.Error(err)
+		}
+	}))
+
+	for name, test := range map[string]struct {
+		header    http.Header
+		forwarded uint64
+	}{
+		"forwarded":          {header: http.Header{"Authorization": {"Bearer token"}}, forwarded: 1},
+		"refused (no token)": {header: http.Header{}, forwarded: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var m dto.Metric
+			if err := requestOverhead.Write(&m); err != nil {
+				t.Fatal(err)
+			}
+			beforeCount := m.GetHistogram().GetSampleCount()
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil)
+			req.Header = test.header
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			if err := requestOverhead.Write(&m); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.GetHistogram().GetSampleCount() - beforeCount; got != test.forwarded {
+				t.Errorf("expected %d observations, got %d", test.forwarded, got)
+			}
+		})
 	}
 }

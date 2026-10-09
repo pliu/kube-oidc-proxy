@@ -249,6 +249,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	// A passthrough request is forwarded as it arrived, with the caller's own
 	// token, which the proxy never removed since it never authenticated it.
 	if p.config.TokenPassthrough {
+		observeOverhead(req)
 		return p.transport.RoundTrip(req)
 	}
 
@@ -284,6 +285,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser)
 
 	// Push request through round trippers to the API server.
+	observeOverhead(req)
 	return rt.RoundTrip(req)
 }
 

@@ -246,6 +246,19 @@ groups their requests would run with: those of their token without any
 `system:` groups, or those of the directory with LDAP group augmentation, plus
 `system:authenticated`.
 
+## Metrics
+
+Prometheus metrics are served at `/metrics` on the readiness probe port, beside
+the probes rather than on the secure port.
+
+| Metric | Meaning |
+| --- | --- |
+| `kube_oidc_proxy_requests_total{code}` | Completed requests by the status code returned to the client, whether the proxy refused them or the API server answered. |
+| `kube_oidc_proxy_request_overhead_seconds` | Time a request spends in the proxy before it is forwarded to the API server: authentication, LDAP group resolution, auditing and impersonation. Requests the proxy refuses are not observed. |
+| `kube_oidc_proxy_is_leader` | See [leader election](./docs/tasks/leader-election.md). |
+
+LDAP group augmentation adds [its own metrics](./docs/tasks/ldap-group-augmentation.md#observability-and-verification).
+
 ## Development
 *NOTE*: building kube-oidc-proxy requires Go version 1.17 or higher.
 

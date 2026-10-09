@@ -3,6 +3,7 @@ package reqctx
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/sebest/xff"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -18,6 +19,9 @@ const (
 
 	// clientAddressKey is the context key for the client address.
 	clientAddressKey
+
+	// receivedAtKey is the context key for when the request reached the proxy.
+	receivedAtKey
 )
 
 type ImpersonationRequest struct {
@@ -49,4 +53,16 @@ func RemoteAddr(req *http.Request) (*http.Request, string) {
 	}
 
 	return req, clientAddress
+}
+
+// WithReceivedAt returns a copy of the request recording when it reached the
+// proxy.
+func WithReceivedAt(req *http.Request, t time.Time) *http.Request {
+	return req.WithContext(request.WithValue(req.Context(), receivedAtKey, t))
+}
+
+// ReceivedAt returns when the request reached the proxy, if recorded.
+func ReceivedAt(req *http.Request) (time.Time, bool) {
+	t, ok := req.Context().Value(receivedAtKey).(time.Time)
+	return t, ok
 }
