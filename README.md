@@ -217,6 +217,28 @@ token, with the groups of its token or, with
 directory. The headers are refused rather than ignored, so that a command such
 as `kubectl auth can-i --as=alice` fails instead of answering for the caller.
 
+`kubectl auth can-i` without `--as` or `--as-group` works as usual and answers
+for the identity the request is impersonated as. To check another user's
+access, create a `SubjectAccessReview`, which needs `create` on
+`subjectaccessreviews` in the `authorization.k8s.io` group:
+
+```sh
+kubectl create -o jsonpath='{.status}' -f - <<EOF
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: alice
+  groups: ["system:authenticated"]
+  resourceAttributes:
+    namespace: default
+    verb: get
+    resource: pods
+EOF
+```
+
+Unlike impersonation, the review does not add groups for the user, so list the
+groups they would have, including `system:authenticated`.
+
 Requests forwarded with the caller's own token through
 [token passthrough](./docs/tasks/token-passthrough.md) are not affected: the
 API server authenticates the token itself and applies its own impersonation
