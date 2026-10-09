@@ -9,6 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	"k8s.io/apimachinery/pkg/runtime"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func sampleCount(t *testing.T, o prometheus.Observer) uint64 {
@@ -70,35 +72,47 @@ func TestRefreshDurationMetrics(t *testing.T) {
 	expectDelta("canceled refresh", before, [3]uint64{0, 0, 0})
 }
 
-func TestUserRefreshFailuresAreCounted(t *testing.T) {
-	d, _ := userTestDirectory(t)
-	realtime := userRefreshFailures.WithLabelValues(triggerRealtime)
-	async := userRefreshFailures.WithLabelValues(triggerAsync)
+func TestUserRefreshFailuresAreCountedBySource(t *testing.T) {
+	d, client := userTestDirectory(t)
+	ldapFailures := userRefreshFailures.WithLabelValues(failureLDAP)
+	kubeFailures := userRefreshFailures.WithLabelValues(failureKubernetes)
+	expectDelta := func(step string, ldapBefore, kubeBefore, wantLDAP, wantKube float64) {
+		t.Helper()
+		if got := testutil.ToFloat64(ldapFailures) - ldapBefore; got != wantLDAP {
+			t.Errorf("%s: ldap failures = %v, want %v", step, got, wantLDAP)
+		}
+		if got := testutil.ToFloat64(kubeFailures) - kubeBefore; got != wantKube {
+			t.Errorf("%s: kubernetes failures = %v, want %v", step, got, wantKube)
+		}
+	}
 
 	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}}), nil
+		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}, "carol": {"Admins"}}), nil
 	}
 	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 
+	// The cache ConfigMap cannot be written.
+	client.PrependReactor("create", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("API unavailable")
+	})
+	ldapBefore, kubeBefore := testutil.ToFloat64(ldapFailures), testutil.ToFloat64(kubeFailures)
+	if _, err := d.Resolve(context.Background(), "carol"); err == nil {
+		t.Fatal("expected an unpersisted lookup to fail")
+	}
+	expectDelta("ConfigMap write", ldapBefore, kubeBefore, 0, 1)
+
+	// The directory cannot be reached, by a request or by the refresh cycle.
 	d.resolver.backends[0].dial = func(string) (conn, error) {
 		return nil, errors.New("directory unavailable")
 	}
-
-	before := testutil.ToFloat64(realtime)
+	ldapBefore, kubeBefore = testutil.ToFloat64(ldapFailures), testutil.ToFloat64(kubeFailures)
 	if _, err := d.Resolve(context.Background(), "bob"); err == nil {
 		t.Fatal("expected the lookup of an uncached user to fail")
 	}
-	if got := testutil.ToFloat64(realtime) - before; got != 1 {
-		t.Errorf("expected one realtime failure, got %v", got)
-	}
-
-	before = testutil.ToFloat64(async)
 	if err := d.RefreshCached(context.Background()); err == nil {
 		t.Fatal("expected the refresh to fail")
 	}
-	if got := testutil.ToFloat64(async) - before; got != 1 {
-		t.Errorf("expected one async failure, got %v", got)
-	}
+	expectDelta("directory", ldapBefore, kubeBefore, 2, 0)
 }

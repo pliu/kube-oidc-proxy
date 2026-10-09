@@ -72,9 +72,6 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 			work, cancel := context.WithTimeout(d.ctx, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
 			call.entry, call.err = d.lookup(work, key, refresh)
-			if call.err != nil && d.ctx.Err() == nil {
-				userRefreshFailures.WithLabelValues(refreshTrigger(refresh)).Inc()
-			}
 			d.callsMu.Lock()
 			delete(d.calls, key)
 			*active--
@@ -91,7 +88,17 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 	}
 }
 
-func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (cache.UserEntry, error) {
+func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (_ cache.UserEntry, err error) {
+	// source is what the step under way depends on, and so what a failure of
+	// it is counted against. A lookup cut short by the replica shutting down
+	// did not fail.
+	source := failureKubernetes
+	defer func() {
+		if err != nil && d.ctx.Err() == nil {
+			userRefreshFailures.WithLabelValues(source).Inc()
+		}
+	}()
+
 	// Capture the committed version BEFORE LDAP, even when watch delivery lags.
 	previous, err := d.store.Get(ctx, key)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
@@ -101,15 +108,18 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		d.apply(previous, false)
 		return d.committed(key)
 	}
+	source = failureLDAP
 	groups, err := d.resolver.searchUser(ctx, key, refresh)
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
 	// key is already the canonical identity; it must not be canonicalized again.
+	// A record that fails validation does so for what the directory returned.
 	record, err := cache.NewUserRecord(key, groups, d.resolver.fingerprint, time.Now())
 	if err != nil {
 		return cache.UserEntry{}, err
 	}
+	source = failureKubernetes
 	changed := previous.Record == nil || !slices.Equal(previous.Record.Groups, record.Groups)
 	if !changed && record.LastSuccessfulLookup.Sub(previous.Record.LastSuccessfulLookup) < unchangedWriteInterval {
 		d.apply(previous, false)

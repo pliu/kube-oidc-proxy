@@ -35,29 +35,27 @@ var (
 		Buckets:   refreshBuckets,
 	}, []string{"backend", "trigger"})
 
-	// userRefreshFailures counts users whose refresh failed, whatever failed:
-	// reading their cached record, any backend, or committing the result. A
+	// userRefreshFailures counts users whose refresh failed, by what failed. A
 	// lookup refused for lack of capacity never started, and one cut short by
 	// the replica shutting down did not fail, so neither is counted.
 	userRefreshFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "user_refresh_failures_total",
-		Help:      "Number of failed refreshes of one user, by trigger: realtime for a request from a user with no cached record, async for the leader's refresh cycle.",
-	}, []string{"trigger"})
+		Help:      "Number of failed refreshes of one user, by source: ldap for the directory, kubernetes for reading or writing the cache ConfigMap.",
+	}, []string{"source"})
 )
 
-// Values of the trigger label of backendRefreshDuration and userRefreshFailures.
+// Values of the source label of userRefreshFailures.
+const (
+	failureLDAP       = "ldap"
+	failureKubernetes = "kubernetes"
+)
+
+// Values of the trigger label of backendRefreshDuration.
 const (
 	triggerRealtime = "realtime"
 	triggerAsync    = "async"
 )
-
-func refreshTrigger(refresh bool) string {
-	if refresh {
-		return triggerAsync
-	}
-	return triggerRealtime
-}
 
 var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 

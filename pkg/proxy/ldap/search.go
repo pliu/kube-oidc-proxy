@@ -93,7 +93,10 @@ func (b *backend) groupsOf(c conn, entry *goldap.Entry) ([]string, error) {
 // searchUser queries every backend and unions only complete successful results.
 // refresh says whether the leader's refresh cycle asked, rather than a request.
 func (d *resolver) searchUser(ctx context.Context, key string, refresh bool) ([]string, error) {
-	trigger := refreshTrigger(refresh)
+	trigger := triggerRealtime
+	if refresh {
+		trigger = triggerAsync
+	}
 	results, err := eachBackend(d.backends, func(b *backend) ([]string, error) {
 		start := time.Now()
 		groups, err := b.searchUser(ctx, key)

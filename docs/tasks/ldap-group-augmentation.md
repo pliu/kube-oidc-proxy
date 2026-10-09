@@ -223,7 +223,7 @@ Existing metrics now describe per-user work:
 | `kube_oidc_proxy_ldap_last_refresh_success` | Last cached-user cycle succeeded for all users. |
 | `kube_oidc_proxy_ldap_full_refresh_duration_seconds` | Duration of a refresh cycle that reached every cached user, including cycles in which some users failed. Cycles cut short by leadership loss or shutdown are not recorded. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend,trigger}` | Duration of a successful refresh of one user against one backend. `trigger` is `realtime` when a request from a user with no cached record waits on it, and `async` for the leader's refresh cycle. |
-| `kube_oidc_proxy_ldap_user_refresh_failures_total{trigger}` | Failed refreshes of one user, whether reading the cached record, a backend or committing the result failed. Lookups refused for lack of capacity and lookups cut short by shutdown are not counted. |
+| `kube_oidc_proxy_ldap_user_refresh_failures_total{source}` | Failed refreshes of one user. `source` is `ldap` when a backend failed or returned groups that cannot be cached, and `kubernetes` when reading or writing the cache ConfigMap failed. Lookups refused for lack of capacity and lookups cut short by shutdown are not counted. |
 
 Unit and race tests cover persistence-before-publication, empty/absent records,
 independent users, local coalescing, cross-replica miss/update races with delayed
