@@ -73,7 +73,7 @@ func (c *cacheAPI) wrap(next http.Handler) http.Handler {
 			w.WriteHeader(201)
 			encode(cm)
 		default:
-			http.Error(w, "unsupported operation", 405)
+			http.Error(w, "unsupported operation", http.StatusMethodNotAllowed)
 		}
 	})
 }

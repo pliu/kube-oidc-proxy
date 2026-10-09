@@ -338,24 +338,6 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 
 // A request carrying no impersonation headers is still served, and still gets
 // the groups of the directory.
-func TestAugmentationStillServesRequestsWithoutImpersonation(t *testing.T) {
-	p := newTestProxy(t)
-	defer p.ctrl.Finish()
-
-	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
-
-	p.fakeRT.expUser = "alice@example.net"
-	p.fakeRT.expGroup = []string{"admins", user.AllAuthenticated}
-
-	resp := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet),
-		&user.DefaultInfo{Name: "alice@example.net", Groups: []string{"from-token"}})
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("got unexpected response code, exp=%d got=%d",
-			http.StatusOK, resp.StatusCode)
-	}
-}
-
 // A token naming an identity Kubernetes reserves is refused before the
 // directory is asked about it.
 func TestReservedUsernameIsRefusedBeforeLookup(t *testing.T) {

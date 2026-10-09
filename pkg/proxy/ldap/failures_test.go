@@ -132,6 +132,19 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 }
 
 // Keep explicit update-conflict coverage separate from create conflicts.
+func TestCanceledLookupNeverDials(t *testing.T) {
+	d, _ := userTestDirectory(t)
+	d.resolver.backends[0].dial = func(string) (conn, error) {
+		t.Error("a canceled lookup dialed the directory")
+		return nil, errors.New("unexpected dial")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := d.resolver.searchUser(ctx, "alice", false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
 func TestUpdateConflictIsNotRetried(t *testing.T) {
 	d, client := userTestDirectory(t)
 	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
