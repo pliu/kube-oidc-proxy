@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -473,23 +472,4 @@ func TestSearchFingerprintCoversBackendLayout(t *testing.T) {
 			}
 		})
 	}
-}
-
-type hangingConn struct {
-	*fakeConn
-
-	closed chan struct{}
-	once   sync.Once
-}
-
-func newHangingConn() *hangingConn {
-	return &hangingConn{
-		fakeConn: &fakeConn{entries: map[string][]*goldap.Entry{}},
-		closed:   make(chan struct{}),
-	}
-}
-
-func (h *hangingConn) Close() error {
-	h.once.Do(func() { close(h.closed) })
-	return nil
 }

@@ -46,8 +46,6 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 		var remoteAddr string
 		req, remoteAddr = reqctx.RemoteAddr(req)
 
-		// A request that authenticated by token passthrough carries no user,
-		// so there is nobody to check against the allowed users.
 		requester, ok := genericapirequest.UserFrom(req.Context())
 		if !ok || len(requester.GetName()) == 0 {
 			p.handleError(rw, req, errNoName)

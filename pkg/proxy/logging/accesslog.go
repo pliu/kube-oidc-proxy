@@ -63,36 +63,22 @@ func remoteHost(remoteAddr string) string {
 	return remoteAddr
 }
 
-// determines if the x-forwarded-for header is present, if so remove
-// the remoteaddr since it is repetitive
+// findXForwardedFor returns the x-forwarded-for header without the address the
+// connection came from, which is logged beside it already.
 func findXForwardedFor(headers http.Header, remoteAddr string) string {
 	xFwdFor := headers.Get("x-forwarded-for")
-	// clean off remoteaddr from x-forwarded-for
-	if xFwdFor != "" {
-
-		newXFwdFor := ""
-		oneFound := false
-		xFwdForIps := strings.Split(xFwdFor, ",")
-
-		for _, ip := range xFwdForIps {
-			ip = strings.TrimSpace(ip)
-
-			if ip != remoteAddr {
-				newXFwdFor = newXFwdFor + ip + ", "
-				oneFound = true
-			}
-
-		}
-
-		if oneFound {
-			newXFwdFor = newXFwdFor[0 : len(newXFwdFor)-2]
-		}
-
-		xFwdFor = newXFwdFor
-
+	if xFwdFor == "" {
+		return ""
 	}
 
-	return xFwdFor
+	var kept []string
+	for _, ip := range strings.Split(xFwdFor, ",") {
+		if ip = strings.TrimSpace(ip); ip != remoteAddr {
+			kept = append(kept, ip)
+		}
+	}
+
+	return strings.Join(kept, ", ")
 }
 
 // logs the failed request

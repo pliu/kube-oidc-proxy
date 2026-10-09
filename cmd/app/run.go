@@ -192,9 +192,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			// exits, and the next leader can take over at once.
 			<-electionDone
 
-			if err := p.RunPreShutdownHooks(); err != nil {
-				return err
-			}
+			p.Shutdown()
 
 			return nil
 		},

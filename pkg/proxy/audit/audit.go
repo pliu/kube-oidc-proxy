@@ -15,7 +15,6 @@ import (
 )
 
 type Audit struct {
-	opts         *options.AuditOptions
 	serverConfig *server.CompletedConfig
 }
 
@@ -62,7 +61,6 @@ func New(opts *options.AuditOptions, externalAddress string, secureServingInfo *
 	completed := serverConfig.Complete(nil)
 
 	return &Audit{
-		opts:         opts,
 		serverConfig: &completed,
 	}, nil
 }
@@ -79,12 +77,10 @@ func (a *Audit) Run(stopCh <-chan struct{}) error {
 }
 
 // Shutdown will shutdown the audit backend if configured.
-func (a *Audit) Shutdown() error {
+func (a *Audit) Shutdown() {
 	if a.serverConfig.AuditBackend != nil {
 		a.serverConfig.AuditBackend.Shutdown()
 	}
-
-	return nil
 }
 
 // WithRequest will wrap the given handler to inject the request information

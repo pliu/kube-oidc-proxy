@@ -4,7 +4,7 @@ package proxy
 import (
 	"bytes"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,7 +24,6 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/mocks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 )
 
@@ -70,6 +69,7 @@ func (f *fakeRW) Header() http.Header {
 func newFakeR() *http.Request {
 	return &http.Request{
 		RemoteAddr: "fakeAddr",
+		URL:        new(url.URL),
 	}
 }
 
@@ -143,8 +143,7 @@ func (f *fakeRT) RoundTrip(h *http.Request) (*http.Response, error) {
 }
 
 func tryError(t *testing.T, expCode int, err error) *fakeRW {
-	p := new(Proxy)
-	p.handleError = p.newErrorHandler()
+	p := newTestProxy(t).Proxy
 
 	frw := newFakeRW()
 	fr := newFakeR()
@@ -286,11 +285,9 @@ func newTestProxy(t *testing.T) *fakeProxy {
 		fakeToken: fakeToken,
 		fakeRT:    fakeRT,
 		Proxy: &Proxy{
-			oidcRequestAuther:     bearertoken.New(fakeToken),
-			clientTransport:       fakeRT,
-			noAuthClientTransport: fakeRT,
-			config:                new(Config),
-			hooks:                 hooks.New(),
+			oidcRequestAuther: bearertoken.New(fakeToken),
+			transport:         fakeRT,
+			config:            new(Config),
 		},
 	}
 
@@ -332,7 +329,7 @@ func TestHandlers(t *testing.T) {
 		"an empty request should 401": {
 			req:     new(http.Request),
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with a badly formed token should 401": {
 			req: &http.Request{
@@ -341,7 +338,7 @@ func TestHandlers(t *testing.T) {
 				},
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with a unauthed token should 401": {
 			req: &http.Request{
@@ -356,7 +353,7 @@ func TestHandlers(t *testing.T) {
 				err:  nil,
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with an error during token auth should 401": {
 			req: &http.Request{
@@ -371,7 +368,7 @@ func TestHandlers(t *testing.T) {
 				err:  errors.New("some error"),
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with an error but passes during token auth should still 401": {
 			req: &http.Request{
@@ -386,7 +383,7 @@ func TestHandlers(t *testing.T) {
 				err:  errors.New("some error"),
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with unauth with impersonation should 401": {
 			req: &http.Request{
@@ -402,7 +399,7 @@ func TestHandlers(t *testing.T) {
 				err:  nil,
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 
 		"an authed request with no username is token should 403": {
@@ -567,7 +564,7 @@ func TestHandlers(t *testing.T) {
 			},
 			config:  &Config{TokenPassthrough: true},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 	}
 
@@ -608,7 +605,7 @@ func TestHandlers(t *testing.T) {
 
 			resp := w.Result()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Errorf("unexpected error: %s", err)
 				t.FailNow()

@@ -24,7 +24,6 @@ import (
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 )
@@ -34,9 +33,9 @@ const (
 )
 
 var (
-	errUnauthorized          = errors.New("Unauthorized")
-	errNoName                = errors.New("No name in OIDC info")
-	errNoImpersonationConfig = errors.New("No impersonation configuration in context")
+	errUnauthorized          = errors.New("unauthorized")
+	errNoName                = errors.New("no name in OIDC info")
+	errNoImpersonationConfig = errors.New("no impersonation configuration in context")
 )
 
 type Config struct {
@@ -62,13 +61,13 @@ type Proxy struct {
 	// ldapDirectory is nil unless LDAP group augmentation is enabled.
 	ldapDirectory GroupAugmenter
 
-	restConfig            *rest.Config
-	clientTransport       http.RoundTripper
-	noAuthClientTransport http.RoundTripper
+	restConfig *rest.Config
+	// transport carries requests to the API server: with the proxy's own
+	// credentials, or with none under token passthrough.
+	transport http.RoundTripper
 
 	config *Config
 
-	hooks       *hooks.Hooks
 	handleError errorHandlerFn
 }
 
@@ -92,11 +91,9 @@ func New(ctx context.Context,
 
 	p := &Proxy{
 		restConfig:        restConfig,
-		hooks:             hooks.New(),
 		secureServingInfo: ssinfo,
 		config:            config,
-		// Nil unless LDAP group augmentation is configured.
-		ldapDirectory: ldapDirectory,
+		ldapDirectory:     ldapDirectory,
 	}
 
 	// Passthrough leaves authentication to the API server, so it trusts no
@@ -171,10 +168,12 @@ func newTokenAuthenticator(ctx context.Context, oidcOptions *options.OIDCAuthent
 }
 
 func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
+	// Carries the proxy's own credentials, which impersonate the user.
+	transportConfig := p.restConfig
 	if p.config.TokenPassthrough {
 		// Carries the caller's own token and nothing of the proxy's, so the
 		// API server authenticates the caller.
-		noAuthClientRT, err := p.roundTripperForRestConfig(&rest.Config{
+		transportConfig = &rest.Config{
 			APIPath: p.restConfig.APIPath,
 			Host:    p.restConfig.Host,
 			Timeout: p.restConfig.Timeout,
@@ -182,21 +181,15 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 				CAFile: p.restConfig.CAFile,
 				CAData: p.restConfig.CAData,
 			},
-		})
-		if err != nil {
-			return nil, nil, err
 		}
-
-		p.noAuthClientTransport = noAuthClientRT
-	} else {
-		// Carries the proxy's own credentials, which impersonate the user.
-		clientRT, err := p.roundTripperForRestConfig(p.restConfig)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		p.clientTransport = clientRT
 	}
+
+	rt, err := roundTripperForRestConfig(transportConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	p.transport = rt
 
 	// get API server url
 	url, err := url.Parse(p.restConfig.Host)
@@ -253,8 +246,8 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// A passthrough request is forwarded as it arrived, with the caller's own
 	// token, which the proxy never removed since it never authenticated it.
-	if reqctx.NoImpersonation(req) {
-		return p.noAuthClientTransport.RoundTrip(req)
+	if p.config.TokenPassthrough {
+		return p.transport.RoundTrip(req)
 	}
 
 	// Get the impersonation headers from the context.
@@ -283,7 +276,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Set up impersonation request.
-	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.clientTransport)
+	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.transport)
 
 	// Log the request
 	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser)
@@ -343,7 +336,7 @@ func transportForRestConfig(config *rest.Config) (*http.Transport, error) {
 	}, nil
 }
 
-func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
+func roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
 	tlsTransport, err := transportForRestConfig(config)
 	if err != nil {
 		return nil, err
@@ -377,6 +370,7 @@ func (p *Proxy) OIDCHealthCheck() error {
 	return utilerrors.NewAggregate(errs)
 }
 
-func (p *Proxy) RunPreShutdownHooks() error {
-	return p.hooks.RunPreShutdownHooks()
+// Shutdown flushes and stops the audit backend.
+func (p *Proxy) Shutdown() {
+	p.auditor.Shutdown()
 }

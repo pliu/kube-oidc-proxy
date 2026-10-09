@@ -13,11 +13,8 @@ import (
 type key int
 
 const (
-	// noImpersonationKey is the context key for whether to use impersonation.
-	noImpersonationKey key = iota
-
 	// impersonationConfigKey is the context key for the impersonation config.
-	impersonationConfigKey
+	impersonationConfigKey key = iota
 
 	// clientAddressKey is the context key for the client address.
 	clientAddressKey
@@ -26,17 +23,6 @@ const (
 type ImpersonationRequest struct {
 	ImpersonationConfig *transport.ImpersonationConfig
 	InboundUser         user.Info
-}
-
-// WithNoImpersonation returns a copy of the request in which the noImpersonation context value is set.
-func WithNoImpersonation(req *http.Request) *http.Request {
-	return req.WithContext(request.WithValue(req.Context(), noImpersonationKey, true))
-}
-
-// NoImpersonation returns whether the noImpersonation context key has been set
-func NoImpersonation(req *http.Request) bool {
-	noImp, _ := req.Context().Value(noImpersonationKey).(bool)
-	return noImp
 }
 
 // WithImpersonationConfig returns a copy of parent in which contains the impersonation configuration.

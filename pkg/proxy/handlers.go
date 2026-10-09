@@ -9,7 +9,6 @@ import (
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/klog/v2"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 	"github.com/jetstack/kube-oidc-proxy/pkg/util"
@@ -31,9 +30,6 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	handler = p.withAuthenticateRequest(handler)
 	handler = p.withRequestCount(handler)
 
-	// Add the auditor backend as a shutdown hook
-	p.hooks.AddPreShutdownHook("AuditBackend", p.auditor.Shutdown)
-
 	return handler
 }
 
@@ -49,7 +45,7 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 				return
 			}
 
-			handler.ServeHTTP(rw, reqctx.WithNoImpersonation(req))
+			handler.ServeHTTP(rw, req)
 			return
 		}
 
@@ -91,7 +87,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		// A passthrough request is forwarded as it is, Impersonate- headers
 		// included: it carries the caller's own token, so the API server holds
 		// the caller to their own impersonation rights.
-		if reqctx.NoImpersonation(req) {
+		if p.config.TokenPassthrough {
 			handler.ServeHTTP(rw, req)
 			return
 		}
@@ -153,10 +149,10 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 // newErrorHandler returns a handler failed requests.
 func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, err error) {
 
-	unauthedHandler := audit.NewUnauthenticatedHandler(p.auditor, func(rw http.ResponseWriter, r *http.Request) {
+	unauthedHandler := p.auditor.WithUnauthorized(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		klog.V(2).Infof("unauthenticated user request %s", r.RemoteAddr)
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
-	})
+	}))
 
 	return func(rw http.ResponseWriter, r *http.Request, err error) {
 

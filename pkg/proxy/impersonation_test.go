@@ -98,7 +98,7 @@ func (h *headerRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
 // would forward the client's Authorization in place of the proxy's.
 func TestRoundTripForwardsOnlyTheBuiltIdentity(t *testing.T) {
 	recorder := &headerRecorder{}
-	p := &Proxy{clientTransport: recorder}
+	p := &Proxy{transport: recorder, config: &Config{}}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil)
 	req.Header = http.Header{
