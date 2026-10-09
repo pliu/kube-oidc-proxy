@@ -33,12 +33,31 @@ type Framework struct {
 	config *config.Config
 	helper *helper.Helper
 
+	// bare frameworks deploy neither the mock issuer nor a proxy, leaving the
+	// case to deploy what it needs into the namespace.
+	bare bool
+
 	issuerKeyBundle, proxyKeyBundle *util.KeyBundle
 	issuerURL, proxyURL             *url.URL
 }
 
 func NewDefaultFramework(baseName string) *Framework {
 	return NewFramework(baseName, DefaultConfig)
+}
+
+// NewBareFramework creates a framework that only provides a namespace and
+// clients.
+func NewBareFramework(baseName string) *Framework {
+	f := &Framework{
+		BaseName: baseName,
+		config:   DefaultConfig,
+		bare:     true,
+	}
+
+	JustBeforeEach(f.BeforeEach)
+	AfterEach(f.AfterEach)
+
+	return f
 }
 
 func NewFramework(baseName string, config *config.Config) *Framework {
@@ -74,6 +93,10 @@ func (f *Framework) BeforeEach() {
 
 	f.helper.KubeClient = f.KubeClientSet
 
+	if f.bare {
+		return
+	}
+
 	By("Deploying mock OIDC Issuer")
 	issuerKeyBundle, issuerURL, err := f.helper.DeployIssuer(f.Namespace.Name)
 	Expect(err).NotTo(HaveOccurred())
@@ -92,6 +115,12 @@ func (f *Framework) BeforeEach() {
 
 // AfterEach deletes the namespace, after reading its events.
 func (f *Framework) AfterEach() {
+	if f.bare {
+		By("Deleting test namespace")
+		Expect(f.DeleteKubeNamespace(f.Namespace.Name)).NotTo(HaveOccurred())
+		return
+	}
+
 	// Output logs from proxy of test case.
 	err := f.Helper().Kubectl(f.Namespace.Name).Run("logs", "-lapp=kube-oidc-proxy-e2e")
 	if err != nil {

@@ -54,7 +54,7 @@ integration: ## run in-process integration tests
 
 e2e: ## run end to end tests; needs Docker and kubectl
 	mkdir -p $(ARTIFACTS)
-	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" go test -timeout 30m -v --count=1 ./test/e2e/suite/.
+	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" ARTIFACTS="$(abspath $(ARTIFACTS))" go test -timeout 60m -v --count=1 ./test/e2e/suite/.
 
 build: generate ## build kube-oidc-proxy
 	mkdir -p ./bin/amd64

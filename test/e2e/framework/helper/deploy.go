@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -407,22 +406,20 @@ func (h *Helper) DeployAuditWebhook(ns, logPath string) (corev1.Volume, *url.URL
 }
 
 func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, container corev1.Container, volumes ...corev1.Volume) (*util.KeyBundle, *url.URL, error) {
+	return h.deployAppWithTimeout(ns, name, serviceType, time.Second*20, container, volumes...)
+}
+
+// deployAppWithTimeout deploys an app serving TLS on 6443 behind a Service of
+// its own name, and waits up to readyTimeout for it to become ready.
+func (h *Helper) deployAppWithTimeout(ns, name string, serviceType corev1.ServiceType, readyTimeout time.Duration,
+	container corev1.Container, volumes ...corev1.Volume) (*util.KeyBundle, *url.URL, error) {
 	host, appURL := h.appURL(ns, name, "6443")
 
+	// A NodePort app is reached through the port kind publishes on the host's
+	// loopback address.
 	var netIPs []net.IP
 	if serviceType == corev1.ServiceTypeNodePort {
-		nodes, err := h.KubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			return nil, nil, err
-		}
-
-		for _, n := range nodes.Items {
-			for _, addr := range n.Status.Addresses {
-				if addr.Type == corev1.NodeInternalIP {
-					netIPs = append(netIPs, net.ParseIP(addr.Address))
-				}
-			}
-		}
+		netIPs = append(netIPs, net.IPv4(127, 0, 0, 1))
 	}
 
 	keyBundle, err := util.NewTLSSelfSignedCertKey(host, netIPs, nil)
@@ -441,6 +438,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 					Port:       6443,
 					Protocol:   "TCP",
 					TargetPort: intstr.FromInt(6443),
+					NodePort:   nodePort(serviceType),
 				},
 			},
 			Type: serviceType,
@@ -512,9 +510,8 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 		return nil, nil, err
 	}
 
-	if len(netIPs) > 0 {
-		appURL = fmt.Sprintf("https://%s:%s", netIPs[0],
-			strconv.FormatUint(uint64(svc.Spec.Ports[0].NodePort), 10))
+	if serviceType == corev1.ServiceTypeNodePort {
+		appURL = fmt.Sprintf("https://127.0.0.1:%d", svc.Spec.Ports[0].NodePort)
 	}
 
 	_, err = h.KubeClient.CoreV1().Secrets(ns).Create(context.TODO(), sec, metav1.CreateOptions{})
@@ -532,7 +529,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 		return nil, nil, err
 	}
 
-	if err := h.WaitForDeploymentReady(ns, name, time.Second*20); err != nil {
+	if err := h.WaitForDeploymentReady(ns, name, readyTimeout); err != nil {
 		return nil, nil, err
 	}
 
@@ -549,7 +546,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 }
 
 func (h *Helper) DeleteProxy(ns string) error {
-	return h.deleteApp(ns, kind.ProxyImageName, "oidc-ca")
+	return h.deleteApp(ns, kind.ProxyImageName, "oidc-ca", "oidc-config")
 }
 func (h *Helper) DeleteIssuer(ns string) error {
 	return h.deleteApp(ns, kind.IssuerImageName)
@@ -582,6 +579,15 @@ func (h *Helper) deleteApp(ns, name string, extraSecrets ...string) error {
 	}
 
 	return nil
+}
+
+// nodePort returns the NodePort for a Service of the given type: the one kind
+// publishes on the host, as only one app at a time is exposed that way.
+func nodePort(serviceType corev1.ServiceType) int32 {
+	if serviceType == corev1.ServiceTypeNodePort {
+		return kind.ProxyNodePort
+	}
+	return 0
 }
 
 func (h *Helper) appURL(ns, serviceName, port string) (string, string) {
