@@ -3,8 +3,10 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/pem"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -804,5 +806,64 @@ func TestUpstreamTransportKeepsConnectionsToTheAPIServerWarm(t *testing.T) {
 
 	if transport.TLSHandshakeTimeout == 0 {
 		t.Error("expected the TLS handshake to be bounded")
+	}
+}
+
+func TestPassthroughPreservesUpstreamTLSSettings(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Header.Get("Authorization"))
+	}))
+	defer upstream.Close()
+	cert := upstream.Certificate()
+	if len(cert.DNSNames) == 0 {
+		t.Fatal("test certificate must have a DNS name")
+	}
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	// localhost is absent from this certificate, so verification requires
+	// the configured server name even though the endpoint is reachable.
+	upstreamURL := strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)
+	for name, tlsConfig := range map[string]rest.TLSClientConfig{
+		"server name override": {CAData: ca, ServerName: cert.DNSNames[0]},
+		"skip verification":    {Insecure: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			p.config.TokenPassthrough = true
+			// Client credentials must still be removed while TLS connection
+			// settings are preserved.
+			tlsConfig.CertData = []byte("invalid proxy client certificate")
+			tlsConfig.KeyData = []byte("invalid proxy client key")
+			p.restConfig = &rest.Config{Host: upstreamURL, TLSClientConfig: tlsConfig, BearerToken: "proxy-token"}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			p.secureServingInfo = &server.SecureServingInfo{Listener: listener}
+			stop := make(chan struct{})
+			wait, _, err := p.Run(stop)
+			if err != nil {
+				close(stop)
+				t.Fatal(err)
+			}
+			defer func() { close(stop); <-wait }()
+			req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer caller-token")
+			resp, err := p.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("passthrough TLS request failed: %s", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != "Bearer caller-token" {
+				t.Fatalf("unexpected upstream authorization: %q", body)
+			}
+		})
 	}
 }

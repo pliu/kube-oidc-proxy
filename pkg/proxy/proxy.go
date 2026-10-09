@@ -178,8 +178,10 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 			Host:    p.restConfig.Host,
 			Timeout: p.restConfig.Timeout,
 			TLSClientConfig: rest.TLSClientConfig{
-				CAFile: p.restConfig.CAFile,
-				CAData: p.restConfig.CAData,
+				Insecure:   p.restConfig.Insecure,
+				ServerName: p.restConfig.ServerName,
+				CAFile:     p.restConfig.CAFile,
+				CAData:     p.restConfig.CAData,
 			},
 		}
 	}
