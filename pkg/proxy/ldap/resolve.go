@@ -72,6 +72,9 @@ func (d *UserDirectory) resolve(ctx context.Context, key string, refresh bool) (
 			work, cancel := context.WithTimeout(d.ctx, d.resolver.config.LookupTimeout.Duration())
 			defer cancel()
 			call.entry, call.err = d.lookup(work, key, refresh)
+			if call.err != nil && d.ctx.Err() == nil {
+				userRefreshFailures.WithLabelValues(refreshTrigger(refresh)).Inc()
+			}
 			d.callsMu.Lock()
 			delete(d.calls, key)
 			*active--
@@ -98,7 +101,7 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (c
 		d.apply(previous, false)
 		return d.committed(key)
 	}
-	groups, err := d.resolver.searchUser(ctx, key)
+	groups, err := d.resolver.searchUser(ctx, key, refresh)
 	if err != nil {
 		return cache.UserEntry{}, err
 	}

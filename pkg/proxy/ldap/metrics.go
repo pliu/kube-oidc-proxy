@@ -17,20 +17,47 @@ var (
 		Help:      "1 if the last cached-user refresh cycle succeeded, and 0 if any user failed.",
 	})
 
-	refreshDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+	// Only cycles that reach every cached user are observed. A cycle cut short
+	// by leadership loss or shutdown did not do a full refresh, and its
+	// duration would say nothing about how long one takes.
+	fullRefreshDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
-		Name:      "refresh_duration_seconds",
-		Help:      "Duration of a cached-user refresh cycle, including failed cycles.",
+		Name:      "full_refresh_duration_seconds",
+		Help:      "Duration of a refresh cycle that reached every cached user, including cycles in which some users failed.",
 		Buckets:   refreshBuckets,
 	})
 
+	// backendRefreshDuration covers one user's refresh against one backend.
 	backendRefreshDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Name:      "backend_refresh_duration_seconds",
-		Help:      "Duration of a successful single-user lookup against one backend.",
+		Help:      "Duration of a successful refresh of one user against one LDAP backend, by trigger: realtime for a request from a user with no cached record, async for the leader's refresh cycle.",
 		Buckets:   refreshBuckets,
-	}, []string{"backend"})
+	}, []string{"backend", "trigger"})
+
+	// userRefreshFailures counts users whose refresh failed, whatever failed:
+	// reading their cached record, any backend, or committing the result. A
+	// lookup refused for lack of capacity never started, and one cut short by
+	// the replica shutting down did not fail, so neither is counted.
+	userRefreshFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "user_refresh_failures_total",
+		Help:      "Number of failed refreshes of one user, by trigger: realtime for a request from a user with no cached record, async for the leader's refresh cycle.",
+	}, []string{"trigger"})
 )
+
+// Values of the trigger label of backendRefreshDuration and userRefreshFailures.
+const (
+	triggerRealtime = "realtime"
+	triggerAsync    = "async"
+)
+
+func refreshTrigger(refresh bool) string {
+	if refresh {
+		return triggerAsync
+	}
+	return triggerRealtime
+}
 
 var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 
@@ -39,6 +66,6 @@ var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 // last_refresh_success of 0 that nothing will ever set. Registering once keeps
 // constructing multiple resolvers in one process from panicking.
 var registerMetrics = sync.OnceFunc(func() {
-	prometheus.MustRegister(lastRefreshSuccess, refreshDuration,
-		backendRefreshDuration)
+	prometheus.MustRegister(lastRefreshSuccess, fullRefreshDuration,
+		backendRefreshDuration, userRefreshFailures)
 })

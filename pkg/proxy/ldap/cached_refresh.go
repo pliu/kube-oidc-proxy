@@ -46,6 +46,7 @@ func (d *UserDirectory) refreshWhileLeader(term context.Context) error {
 // RefreshCached snapshots only known users. Each record commits independently;
 // a failed user retains its previous entry while other users can advance.
 func (d *UserDirectory) RefreshCached(ctx context.Context) error {
+	start := time.Now()
 	d.mu.RLock()
 	keys := make([]string, 0, len(d.users))
 	for _, cell := range d.users {
@@ -54,7 +55,6 @@ func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 		}
 	}
 	d.mu.RUnlock()
-	start := time.Now()
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -88,8 +88,9 @@ send:
 	wg.Wait()
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err())
+	} else {
+		fullRefreshDuration.Observe(time.Since(start).Seconds())
 	}
-	refreshDuration.Observe(time.Since(start).Seconds())
 	if len(failures) > 0 {
 		lastRefreshSuccess.Set(0)
 	} else {

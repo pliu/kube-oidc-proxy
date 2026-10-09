@@ -123,7 +123,7 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := d.resolver.searchUser(ctx, "alice"); err == nil {
+	if _, err := d.resolver.searchUser(ctx, "alice", false); err == nil {
 		t.Fatal("canceled lookup succeeded")
 	}
 	if time.Since(start) > time.Second {

@@ -91,12 +91,14 @@ func (b *backend) groupsOf(c conn, entry *goldap.Entry) ([]string, error) {
 }
 
 // searchUser queries every backend and unions only complete successful results.
-func (d *resolver) searchUser(ctx context.Context, key string) ([]string, error) {
+// refresh says whether the leader's refresh cycle asked, rather than a request.
+func (d *resolver) searchUser(ctx context.Context, key string, refresh bool) ([]string, error) {
+	trigger := refreshTrigger(refresh)
 	results, err := eachBackend(d.backends, func(b *backend) ([]string, error) {
 		start := time.Now()
 		groups, err := b.searchUser(ctx, key)
 		if err == nil {
-			backendRefreshDuration.WithLabelValues(b.config.Name).Observe(time.Since(start).Seconds())
+			backendRefreshDuration.WithLabelValues(b.config.Name, trigger).Observe(time.Since(start).Seconds())
 		}
 		return groups, err
 	})
