@@ -13,8 +13,10 @@ func TestUserRecordFingerprint(t *testing.T) {
 		{"prefix", func(c *Config) { c.UsernamePrefix += "different:" }, true},
 		{"user filter", func(c *Config) { c.Backends[0].UserFilter = "(objectClass=person)" }, true},
 		{"group attribute", func(c *Config) { c.Backends[0].GroupNameAttribute = "displayName" }, true},
-		{"credentials", func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},
-		{"URLs", func(c *Config) { c.Backends[0].URLs = []string{"ldaps://replacement.example.net"} }, false},
+		{"password", func(c *Config) { c.Backends[0].BindPassword = "rotated" }, false},
+		{"password file", func(c *Config) { c.Backends[0].BindPasswordFile = "/replacement/password" }, false},
+		{"URLs", func(c *Config) { c.Backends[0].URLs = []string{"ldaps://replacement.example.net"} }, true},
+		{"bind DN", func(c *Config) { c.Backends[0].BindDN = "CN=Other,DC=example,DC=net" }, true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

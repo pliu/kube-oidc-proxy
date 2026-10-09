@@ -107,8 +107,8 @@ lastSuccessfulLookup: "2026-10-08T14:00:00Z"
 
 Empty memberships and absent users (`groups: []`) are valid
 records. They remain cached indefinitely and eligible for refresh. Search bases,
-filters, attribute mappings, backend names/order, and OIDC username prefix
-contribute to the configuration fingerprint. Credentials, URLs, TLS settings,
+filters, attribute mappings, backend names/order, directory URLs, bind DN, and
+OIDC username prefix contribute to the configuration fingerprint. Passwords, TLS settings,
 refresh intervals and concurrency settings do not invalidate memberships.
 Deployments sharing a cache namespace share records. Give deployments with
 different membership configurations separate cache namespaces; in one

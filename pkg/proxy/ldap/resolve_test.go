@@ -14,6 +14,51 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
+func TestResolveRequeriesAfterDirectoryOrBindIdentityChange(t *testing.T) {
+	for name, change := range map[string]func(*Config){
+		"directory URL": func(c *Config) { c.Backends[0].URLs = []string{"ldaps://replacement.example.net"} },
+		"bind identity": func(c *Config) { c.Backends[0].BindDN = "CN=Other,DC=example,DC=net" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			previous, client := userTestDirectory(t)
+			previous.resolver.backends[0].dial = func(string) (conn, error) {
+				return connWithUsers([]string{"Old"}, map[string][]string{"alice": {"Old"}}), nil
+			}
+			if _, err := previous.Resolve(context.Background(), "alice"); err != nil {
+				t.Fatal(err)
+			}
+
+			config := testConfig()
+			change(config)
+			store, err := cache.NewConfigMaps(client, "proxy", config.UserRecordFingerprint())
+			if err != nil {
+				t.Fatal(err)
+			}
+			directory, err := NewUserDirectory(config, store, previous.leadership)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(directory.cancel)
+			calls := 0
+			directory.resolver.backends[0].dial = func(string) (conn, error) {
+				calls++
+				return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
+			}
+			if _, err := directory.restoreUsers(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			groups, err := directory.Resolve(context.Background(), "alice")
+			if err != nil || calls != 1 || !reflect.DeepEqual(groups, []string{"New"}) {
+				t.Fatalf("old memberships reused: groups=%v calls=%d err=%v", groups, calls, err)
+			}
+			saved, err := store.Get(context.Background(), "alice")
+			if err != nil || saved.Invalid != nil || saved.Record == nil || !reflect.DeepEqual(saved.Record.Groups, groups) {
+				t.Fatalf("replacement memberships not persisted: entry=%+v err=%v", saved, err)
+			}
+		})
+	}
+}
+
 func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 	config := testConfig()
 	config.UsernamePrefix = "oidc:"

@@ -389,17 +389,19 @@ func (b *BackendConfig) bindPasswordFor() (string, error) {
 }
 
 // UserRecordFingerprint identifies membership and username mapping settings.
-// Use on a defaulted, validated Config. Credentials, connection settings, and
-// refresh intervals do not invalidate records; search settings and prefixes do.
+// Use on a defaulted, validated Config. Directory URLs, bind identities, search
+// settings and prefixes invalidate records; passwords and refresh intervals do not.
 func (c *Config) UserRecordFingerprint() string {
 	return util.HashJSON([]string{c.searchFingerprint(), c.UsernamePrefix})
 }
 
-// searchFingerprint identifies settings that determine LDAP memberships.
-// Connection settings and credentials do not affect record compatibility.
+// searchFingerprint identifies settings that determine LDAP memberships,
+// including the directory and the identity whose permissions govern the search.
 func (c *Config) searchFingerprint() string {
 	type backend struct {
 		Name               string   `json:"name"`
+		URLs               []string `json:"urls"`
+		BindDN             string   `json:"bindDN"`
 		UserSearchBases    []string `json:"userSearchBases"`
 		UserFilter         string   `json:"userFilter"`
 		UsernameAttribute  string   `json:"usernameAttribute"`
@@ -416,6 +418,8 @@ func (c *Config) searchFingerprint() string {
 
 		backends = append(backends, backend{
 			Name:               b.Name,
+			URLs:               b.URLs,
+			BindDN:             b.BindDN,
 			UserSearchBases:    b.UserSearchBases,
 			UserFilter:         b.UserFilter,
 			UsernameAttribute:  b.UsernameAttribute,
