@@ -89,7 +89,7 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 	}
 
 	if o.SecureServing.BindPort == o.App.ReadinessProbePort {
-		errs = append(errs, errors.New("unable to securely serve on port 8080 (used by readiness probe)"))
+		errs = append(errs, fmt.Errorf("unable to securely serve on port %d (used by readiness probe)", o.App.ReadinessProbePort))
 	}
 
 	if err := o.Audit.Validate(); len(err) > 0 {

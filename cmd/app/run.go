@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -161,8 +162,8 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			}
 
 			// Initialise proxy with OIDC token authenticator
-			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit, ldapDirectory,
-				secureServingInfo, proxyConfig)
+			p, err := proxy.New(wait.ContextForChannel(stopCh), restConfig, opts.OIDCAuthentication,
+				opts.Audit, ldapDirectory, secureServingInfo, proxyConfig)
 			if err != nil {
 				return err
 			}

@@ -4,7 +4,6 @@ package ldap
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -116,7 +115,8 @@ func (d *resolver) searchUser(ctx context.Context, key string) ([]string, error)
 			groups = append(groups, group)
 		}
 	}
-	sort.Strings(groups)
+	// Ordered and deduplicated again by the record built from them, which is
+	// the one place memberships are normalized.
 	return groups, nil
 }
 

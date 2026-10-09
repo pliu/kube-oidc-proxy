@@ -3,18 +3,17 @@ package logging
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-const (
-	UserHeaderClientIPKey = "Remote-Client-IP"
-	timestampLayout       = "2006-01-02T15:04:05-0700"
-)
+const timestampLayout = "2006-01-02T15:04:05-0700"
 
 // logs the request.
 //
@@ -41,14 +40,17 @@ func LogSuccessfulRequest(req *http.Request, inboundUser user.Info) {
 // each followed by a space, as the surrounding log line has always written
 // them. Both halves are quoted: an extra is named by the caller as much as it
 // is valued by them.
+//
+// Written in key order, so that the same identity always logs the same way and
+// lines can be compared or searched for exactly.
 func quotedExtra(extra map[string][]string) string {
-	out := ""
+	var out strings.Builder
 
-	for key, value := range extra {
-		out += fmt.Sprintf("%q=%q ", key, strings.Join(value, "|"))
+	for _, key := range slices.Sorted(maps.Keys(extra)) {
+		fmt.Fprintf(&out, "%q=%q ", key, strings.Join(extra[key], "|"))
 	}
 
-	return out
+	return out.String()
 }
 
 // remoteHost returns the host of a connection's remote address, without its

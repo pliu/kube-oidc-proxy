@@ -80,7 +80,7 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // the whole point of augmenting, and a user who is missing because a directory
 // is misconfigured would otherwise quietly regain whatever their identity
 // provider claimed for them.
-func (p *Proxy) augmentGroups(ctx context.Context, u user.Info, remoteAddr string) (user.Info, error) {
+func (p *Proxy) augmentGroups(ctx context.Context, u user.Info) (user.Info, error) {
 	groups, err := p.ldapDirectory.Resolve(ctx, u.GetName())
 	if err != nil {
 		return nil, err

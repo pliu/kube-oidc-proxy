@@ -83,3 +83,14 @@ func TestRemoteHost(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotedExtraIsInKeyOrder(t *testing.T) {
+	extra := map[string][]string{"scopes": {"a", "b"}, "acr": {"1"}, "org": {"x"}}
+	exp := `"acr"="1" "org"="x" "scopes"="a|b" `
+
+	for i := 0; i < 20; i++ {
+		if got := quotedExtra(extra); got != exp {
+			t.Fatalf("got %s, exp %s", got, exp)
+		}
+	}
+}

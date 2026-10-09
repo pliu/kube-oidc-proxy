@@ -80,7 +80,10 @@ func (c caBundle) CurrentCABundleContent() []byte {
 	return c
 }
 
-func New(restConfig *rest.Config,
+// New builds a proxy. ctx bounds the work the OIDC authenticators do in the
+// background, such as fetching issuer keys, and should end when the proxy stops.
+func New(ctx context.Context,
+	restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
 	ldapDirectory GroupAugmenter,
@@ -99,7 +102,7 @@ func New(restConfig *rest.Config,
 	// Passthrough leaves authentication to the API server, so it trusts no
 	// issuers of its own and has none to wait on.
 	if !config.TokenPassthrough {
-		tokenAuther, healthChecks, err := newTokenAuthenticator(oidcOptions)
+		tokenAuther, healthChecks, err := newTokenAuthenticator(ctx, oidcOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +126,7 @@ func New(restConfig *rest.Config,
 // newTokenAuthenticator builds one authenticator per trusted issuer. Each only
 // answers for tokens whose iss is its own, so the union accepts a token from
 // any of them.
-func newTokenAuthenticator(oidcOptions *options.OIDCAuthenticationOptions) (authenticator.Token, []func() error, error) {
+func newTokenAuthenticator(ctx context.Context, oidcOptions *options.OIDCAuthenticationOptions) (authenticator.Token, []func() error, error) {
 	issuers, err := oidcOptions.Issuers()
 	if err != nil {
 		return nil, nil, err
@@ -155,7 +158,7 @@ func newTokenAuthenticator(oidcOptions *options.OIDCAuthenticationOptions) (auth
 			opts.KeySet = newStaticKeySet(issuer.PublicKeys, issuer.SigningAlgs)
 		}
 
-		tokenAuther, err := oidc.New(context.TODO(), opts)
+		tokenAuther, err := oidc.New(ctx, opts)
 		if err != nil {
 			return nil, nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
 		}
