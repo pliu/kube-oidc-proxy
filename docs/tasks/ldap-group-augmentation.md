@@ -25,7 +25,7 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
     "groupSearchBases": ["OU=Groups,DC=example,DC=net"]
   }],
   "cache": {"namespace": "kube-oidc-proxy"},
-  "refreshInterval": "10m",
+  "refreshInterval": "1h",
   "lookupTimeout": "1m",
   "lookupConcurrency": 8,
   "refreshConcurrency": 4
@@ -36,7 +36,7 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
 | --- | --- | --- |
 | `backends` | Required | Query every backend and union memberships. |
 | `cache.namespace` | Pod namespace | Namespace containing generated user ConfigMaps. Set explicitly outside Kubernetes. |
-| `refreshInterval` | `10m` | Interval between leader refresh cycles. |
+| `refreshInterval` | `1h` | Interval between leader refresh cycles. |
 | `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. |
 | `lookupConcurrency` | `8` | Maximum concurrent distinct-user lookups started by requests **per replica**, including Kubernetes reads, LDAP and persistence. |
 | `refreshConcurrency` | `4` | Maximum concurrent lookups started by the leader's periodic refresh, counted separately from `lookupConcurrency`. |
@@ -171,6 +171,36 @@ Existing cache entries remain available during LDAP or Kubernetes outages,
 including potentially stale grants until a refresh succeeds. There is no maximum
 stale age or eviction policy. A user's ConfigMap must fit Kubernetes object size
 limits; an oversized record fails persistence and is never partially served.
+
+### Refresh cost
+
+Refresh is not batched yet: each cached user is refreshed on their own, exactly
+as a miss would look them up, and the cost of a cycle grows with the number of
+cached users times the number of groups each holds. For every user and backend,
+a cycle currently makes:
+
+- a new connection and bind, as connections are not reused;
+- one user search per user search base;
+- for each `memberOf` group under a group search base, one search to read the
+  group and one search per group search base to check its name is unique. These
+  are repeated for every user holding the group;
+- one Kubernetes read of the user's ConfigMap, and a write when the groups
+  changed or the record is an hour old.
+
+This still needs to be batched before refreshes scale to large user
+populations. The planned improvements are:
+
+- Reuse one bound connection per backend for the whole cycle.
+- Resolve each group, and check its name is unique, once per backend per cycle
+  rather than once per user.
+- For directories whose `memberOf` holds only direct memberships, such as
+  Active Directory, offer a per-backend option to find a user's groups with one
+  `(&<groupFilter>(member=<userDN>))` search per group search base. This is not
+  a general replacement for `memberOf`: FreeIPA's `memberOf` includes nested
+  groups, which a `member` search would drop.
+
+The Kubernetes read is deliberate and should stay; see the comment in `lookup`
+for why the in-memory record cannot stand in for it.
 
 ## Deployment
 

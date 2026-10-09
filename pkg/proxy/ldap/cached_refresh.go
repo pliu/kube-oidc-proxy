@@ -45,6 +45,11 @@ func (d *UserDirectory) refreshWhileLeader(term context.Context) error {
 
 // RefreshCached snapshots only known users. Each record commits independently;
 // a failed user retains its previous entry while other users can advance.
+//
+// TODO: batch the cycle. Every user is looked up on their own, with a new
+// connection per backend and every group resolved and checked for uniqueness
+// again for each user holding it. See "Refresh cost" in
+// docs/tasks/ldap-group-augmentation.md for the planned improvements.
 func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 	start := time.Now()
 	d.mu.RLock()

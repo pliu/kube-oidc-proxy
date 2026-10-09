@@ -172,7 +172,7 @@ ldap:
     lookupConcurrency: 8
     refreshConcurrency: 4
     lookupTimeout: 1m
-    refreshInterval: 10m
+    refreshInterval: 1h
     backends:
       - name: corp
         urls: [ldaps://ldap.example.net:636]

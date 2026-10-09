@@ -100,6 +100,19 @@ func (d *UserDirectory) lookup(ctx context.Context, key string, refresh bool) (_
 	}()
 
 	// Capture the committed version BEFORE LDAP, even when watch delivery lags.
+	//
+	// A refresh could take previous from memory instead, saving this read for
+	// every cached user in every cycle. As the version to write against that
+	// would be safe: one from memory is never newer than the stored one, so a
+	// record committed since still conflicts and still wins, at the cost of a
+	// discarded lookup whenever the watch is behind. As the record to compare
+	// against it is not: if memory holds X, another replica has since stored Y
+	// and the directory answers X, the write below is skipped as unchanged and
+	// Y, which the directory no longer agrees with, is served by every replica
+	// until the next cycle. Memory would only do if the unchanged-write skip
+	// went with it, so that every refresh writes, which trades a read per user
+	// for a write per user and a watch event on every replica. Keep the read
+	// unless that trade, or the staleness, is preferred.
 	previous, err := d.store.Get(ctx, key)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
 		return cache.UserEntry{}, err

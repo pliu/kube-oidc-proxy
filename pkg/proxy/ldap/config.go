@@ -38,7 +38,7 @@ const (
 	DefaultUsernameAttribute  = "userPrincipalName"
 	DefaultGroupFilter        = "(objectClass=group)"
 	DefaultGroupNameAttribute = "cn"
-	DefaultRefreshInterval    = time.Minute * 10
+	DefaultRefreshInterval    = time.Hour
 	DefaultTimeout            = time.Minute * 5
 	DefaultLookupTimeout      = time.Minute
 	DefaultLookupConcurrency  = 8

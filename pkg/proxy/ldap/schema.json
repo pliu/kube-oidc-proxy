@@ -20,7 +20,7 @@
     "refreshInterval": {
       "description": "How often the elected leader refreshes cached users.",
       "$ref": "#/$defs/duration",
-      "default": "10m"
+      "default": "1h"
     },
     "refreshUsers": {
       "description": "Users allowed to call the stub refresh endpoint. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may call it.",
