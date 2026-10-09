@@ -2,14 +2,11 @@
 package proxy
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
-	"slices"
 
 	"k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
@@ -160,11 +157,6 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			req = req.WithContext(genericapirequest.WithUser(req.Context(), requester))
 		}
 
-		// requester stays the inbound identity. effective is who the request
-		// actually runs as: the requester, or the impersonation target if one
-		// was authorised.
-		effective := requester
-
 		if hasImpersonation(req.Header) {
 			// if impersonation headers are present, let's check to see
 			// if the user is authorized to perform the impersonation
@@ -175,78 +167,13 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 				return
 			}
 
-			if target != nil {
-				// TODO - store original context for logging
-				effective = target
-				targetForContext = target
-			}
+			targetForContext = target
 		}
 
-		// Ensure group contains allauthenticated builtin. Cloned so that the
-		// append cannot write into the backing array of the identity's groups.
-		groups := slices.Clone(effective.GetGroups())
-		if !slices.Contains(groups, user.AllAuthenticated) {
-			groups = append(groups, user.AllAuthenticated)
-		}
-
-		// Copied, so that the extras added below are not written into the
-		// identity the request context holds, which the audit log and the access
-		// log record as the requester.
-		extra := make(map[string][]string, len(effective.GetExtra()))
-		for k, vs := range effective.GetExtra() {
-			extra[k] = slices.Clone(vs)
-		}
-
-		// If client IP user extra header option set then append the remote client
-		// address.
-		if p.config.ExtraUserHeadersClientIPEnabled {
-			klog.V(6).Infof("adding impersonate extra user header %s: %s (%s)",
-				UserHeaderClientIPKey, remoteAddr, remoteAddr)
-
-			extra[UserHeaderClientIPKey] = append(extra[UserHeaderClientIPKey], remoteAddr)
-		}
-
-		// Add custom extra user headers to impersonation request.
-		for k, vs := range p.config.ExtraUserHeaders {
-			for _, v := range vs {
-				klog.V(6).Infof("adding impersonate extra user header %s: %s (%s)",
-					k, v, remoteAddr)
-
-				extra[k] = append(extra[k], v)
-			}
-		}
-
-		if targetForContext != nil {
-			// add the original user's information as extra headers
-			// so they're recorded in the API server's audit log
-			extra["originaluser.jetstack.io-user"] = []string{requester.GetName()}
-
-			if len(requester.GetGroups()) > 0 {
-				extra["originaluser.jetstack.io-groups"] = slices.Clone(requester.GetGroups())
-			}
-
-			if requester.GetUID() != "" {
-				extra["originaluser.jetstack.io-uid"] = []string{requester.GetUID()}
-			}
-
-			if len(requester.GetExtra()) > 0 {
-				jsonExtras, errJsonMarshal := json.Marshal(requester.GetExtra())
-				if errJsonMarshal != nil {
-					p.handleError(rw, req, errJsonMarshal)
-					return
-				}
-				extra["originaluser.jetstack.io-extra"] = []string{string(jsonExtras)}
-			}
-		}
-
-		conf := &reqctx.ImpersonationRequest{
-			ImpersonationConfig: &transport.ImpersonationConfig{
-				UserName: effective.GetName(),
-				Groups:   groups,
-				Extra:    extra,
-			},
-			InboundUser:      requester,
-			ImpersonatedUser: targetForContext,
+		conf, err := buildImpersonation(requester, targetForContext, remoteAddr, p.config)
+		if err != nil {
+			p.handleError(rw, req, err)
+			return
 		}
 
 		// Add the impersonation configuration to the context.
