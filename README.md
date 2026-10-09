@@ -217,6 +217,11 @@ token, with the groups of its token or, with
 directory. The headers are refused rather than ignored, so that a command such
 as `kubectl auth can-i --as=alice` fails instead of answering for the caller.
 
+Requests forwarded with the caller's own token through
+[token passthrough](./docs/tasks/token-passthrough.md) are not affected: the
+API server authenticates the token itself and applies its own impersonation
+rules to them.
+
 `kubectl auth can-i` without `--as` or `--as-group` works as usual and answers
 for the identity the request is impersonated as. To check another user's
 access, create a `SubjectAccessReview`, which needs `create` on
@@ -237,12 +242,9 @@ EOF
 ```
 
 Unlike impersonation, the review does not add groups for the user, so list the
-groups they would have, including `system:authenticated`.
-
-Requests forwarded with the caller's own token through
-[token passthrough](./docs/tasks/token-passthrough.md) are not affected: the
-API server authenticates the token itself and applies its own impersonation
-rules to them.
+groups their requests would run with: those of their token without any
+`system:` groups, or those of the directory with LDAP group augmentation, plus
+`system:authenticated`.
 
 ## Development
 *NOTE*: building kube-oidc-proxy requires Go version 1.17 or higher.
