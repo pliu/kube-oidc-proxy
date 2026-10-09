@@ -1,7 +1,6 @@
 # Copyright Jetstack Ltd. See LICENSE for details.
 BINDIR    ?= $(CURDIR)/bin
 HACK_DIR  ?= hack
-PATH      := $(BINDIR):$(PATH)
 ARTIFACTS ?= artifacts
 ARCH      ?= amd64
 
@@ -12,49 +11,7 @@ export GO111MODULE=on
 help:  ## display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-.PHONY: help build docker_build test integration depend verify all clean generate
-
-UNAME_S := $(shell uname -s)
-GOLANGCILINT_VERSION := 1.21.0
-ifeq ($(UNAME_S),Linux)
-	SHASUM := sha256sum -c
-	KUBECTL_URL := https://storage.googleapis.com/kubernetes-release/release/v1.18.0/bin/linux/amd64/kubectl
-	KUBECTL_HASH := bb16739fcad964c197752200ff89d89aad7b118cb1de5725dc53fe924c40e3f7
-	GOLANGCILINT_URL := https://github.com/golangci/golangci-lint/releases/download/v$(GOLANGCILINT_VERSION)/golangci-lint-$(GOLANGCILINT_VERSION)-linux-amd64.tar.gz
-	GOLANGCILINT_HASH := 2c861f8dc56b560474aa27cab0c075991628cc01af3451e27ac82f5d10d5106b
-endif
-ifeq ($(UNAME_S),Darwin)
-	SHASUM := shasum -a 256 -c
-	KUBECTL_URL := https://storage.googleapis.com/kubernetes-release/release/v1.18.0/bin/darwin/amd64/kubectl
-	KUBECTL_HASH := 5eda86058a3db112821761b32afce3fdd2f6963ab580b1780a638ac323864eba
-	GOLANGCILINT_URL := https://github.com/golangci/golangci-lint/releases/download/v$(GOLANGCILINT_VERSION)/golangci-lint-$(GOLANGCILINT_VERSION)-darwin-amd64.tar.gz
-	GOLANGCILINT_HASH := 2b2713ec5007e67883aa501eebb81f22abfab0cf0909134ba90f60a066db3760
-endif
-
-$(BINDIR)/mockgen:
-	mkdir -p $(BINDIR)
-	go build -o $(BINDIR)/mockgen go.uber.org/mock/mockgen
-
-$(BINDIR)/kubectl:
-	mkdir -p $(BINDIR)
-	curl --fail -sL -o $(BINDIR)/.kubectl $(KUBECTL_URL)
-	echo "$(KUBECTL_HASH)  $(BINDIR)/.kubectl" | $(SHASUM)
-	chmod +x $(BINDIR)/.kubectl
-	mv $(BINDIR)/.kubectl $(BINDIR)/kubectl
-
-.PHONY: $(BINDIR)/golangci-lint
-$(BINDIR)/golangci-lint: $(BINDIR)/golangci-lint-$(GOLANGCILINT_VERSION)
-	@ln -fs golangci-lint-$(GOLANGCILINT_VERSION) $(BINDIR)/golangci-lint
-
-$(BINDIR)/golangci-lint-$(GOLANGCILINT_VERSION):
-	mkdir -p $(BINDIR) $(BINDIR)/.golangci-lint
-	curl --fail -sL -o $(BINDIR)/.golangci-lint.tar.gz $(GOLANGCILINT_URL)
-	echo "$(GOLANGCILINT_HASH)  $(BINDIR)/.golangci-lint.tar.gz" | $(SHASUM)
-	tar xvf $(BINDIR)/.golangci-lint.tar.gz -C $(BINDIR)/.golangci-lint
-	mv $(BINDIR)/.golangci-lint/*/golangci-lint $(BINDIR)/golangci-lint-$(GOLANGCILINT_VERSION)
-	rm -rf $(BINDIR)/.golangci-lint $(BINDIR)/.golangci-lint.tar.gz
-
-depend: $(BINDIR)/mockgen $(BINDIR)/kubectl $(BINDIR)/golangci-lint
+.PHONY: help build docker_build test integration verify all clean generate
 
 verify_boilerplate:
 	$(HACK_DIR)/verify-boilerplate.sh
@@ -71,8 +28,8 @@ go_fmt:
 go_vet:
 	go vet ./cmd
 
-go_lint: $(BINDIR)/golangci-lint ## lint golang code for problems
-	$(BINDIR)/golangci-lint run --timeout 3m
+go_lint: ## lint golang code for problems, with the golangci-lint on PATH
+	golangci-lint run --timeout 3m
 
 clean: ## clean up created files
 	rm -rf \
@@ -82,9 +39,9 @@ clean: ## clean up created files
 		$(CURDIR)/test/e2e/framework/issuer/bin \
 		$(CURDIR)/test/e2e/framework/fake-apiserver/bin
 
-verify: depend verify_boilerplate go_fmt go_vet go_lint ## verify code and mod
+verify: verify_boilerplate go_fmt go_vet ## verify code and mod
 
-generate: depend ## generates mocks and assets files
+generate: ## generates mocks and assets files
 	go generate $$(go list ./pkg/... ./cmd/...)
 
 test: generate verify ## run all go tests
@@ -95,7 +52,7 @@ test: generate verify ## run all go tests
 integration: ## run in-process integration tests
 	go test -v --count=1 ./test/integration/...
 
-e2e: depend ## run end to end tests
+e2e: ## run end to end tests; needs Docker and kubectl
 	mkdir -p $(ARTIFACTS)
 	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" go test -timeout 30m -v --count=1 ./test/e2e/suite/.
 
@@ -113,11 +70,11 @@ all: test build ## runs tests, build
 
 image: all docker_build ## runs tests, build and docker build
 
-dev_cluster_create: depend ## create dev cluster for development testing
+dev_cluster_create: ## create dev cluster for development testing
 	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" go run -v ./test/environment/dev create
 
-dev_cluster_deploy: depend ## deploy into dev cluster
+dev_cluster_deploy: ## deploy into dev cluster
 	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" go run -v ./test/environment/dev deploy
 
-dev_cluster_destroy: depend ## destroy dev cluster
+dev_cluster_destroy: ## destroy dev cluster
 	KUBE_OIDC_PROXY_ROOT_PATH="$$(pwd)" go run -v ./test/environment/dev destroy

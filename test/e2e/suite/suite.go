@@ -2,8 +2,6 @@
 package suite
 
 import (
-	"path/filepath"
-
 	. "github.com/onsi/ginkgo"
 	log "github.com/sirupsen/logrus"
 
@@ -28,7 +26,7 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	}
 
 	cfg.KubeConfigPath = env.KubeConfigPath()
-	cfg.Kubectl = filepath.Join(env.RootPath(), "bin", "kubectl")
+	cfg.Kubectl = "kubectl"
 	cfg.RepoRoot = env.RootPath()
 	cfg.Environment = env
 

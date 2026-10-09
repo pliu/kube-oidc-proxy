@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -70,7 +69,7 @@ func deploy() {
 	cfg := &config.Config{
 		KubeConfigPath: kubeconfig,
 		RepoRoot:       env.RootPath(),
-		Kubectl:        filepath.Join(env.RootPath(), "bin", "kubectl"),
+		Kubectl:        "kubectl",
 	}
 
 	err = cfg.Validate()
