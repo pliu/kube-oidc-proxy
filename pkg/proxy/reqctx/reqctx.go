@@ -1,5 +1,5 @@
 // Copyright Jetstack Ltd. See LICENSE for details.
-package context
+package reqctx
 
 import (
 	"net/http"
@@ -8,8 +8,6 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/transport"
-
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
 type key int
@@ -24,14 +22,16 @@ const (
 	// bearerTokenKey is the context key for the bearer token.
 	bearerTokenKey
 
-	// bearerTokenKey is the context key for the client address.
+	// clientAddressKey is the context key for the client address.
 	clientAddressKey
 )
 
 type ImpersonationRequest struct {
 	ImpersonationConfig *transport.ImpersonationConfig
-	InboundUser         *user.Info
-	ImpersonatedUser    *user.Info
+	InboundUser         user.Info
+	// ImpersonatedUser is nil unless the request asked to impersonate somebody
+	// and was authorized to.
+	ImpersonatedUser user.Info
 }
 
 // WithNoImpersonation returns a copy of the request in which the noImpersonation context value is set.
@@ -48,8 +48,8 @@ func NoImpersonation(req *http.Request) bool {
 // WithImpersonationConfig returns a copy of parent in which contains the impersonation configuration.
 func WithImpersonationConfig(req *http.Request, conf *ImpersonationRequest) *http.Request {
 	ctxToReturn := request.WithValue(req.Context(), impersonationConfigKey, conf)
-	if *conf.ImpersonatedUser != nil {
-		ctxToReturn = genericapirequest.WithUser(ctxToReturn, *conf.ImpersonatedUser)
+	if conf.ImpersonatedUser != nil {
+		ctxToReturn = request.WithUser(ctxToReturn, conf.ImpersonatedUser)
 	}
 	return req.WithContext(ctxToReturn)
 }

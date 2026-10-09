@@ -13,8 +13,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 )
 
@@ -37,6 +37,10 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 	tokenReviewHandler := p.withTokenReview(handler)
 
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		// Kept for requests forwarded without impersonation, since a successful
+		// authentication deletes the Authorization header from the request.
+		req = reqctx.WithBearerToken(req, req.Header)
+
 		// Auth request and handle unauthed
 		info, ok, err := p.oidcRequestAuther.AuthenticateRequest(req)
 		if err != nil {
@@ -53,7 +57,7 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 		}
 
 		var remoteAddr string
-		req, remoteAddr = context.RemoteAddr(req)
+		req, remoteAddr = reqctx.RemoteAddr(req)
 
 		klog.V(4).Infof("authenticated request: %s", remoteAddr)
 
@@ -81,7 +85,7 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 		}
 
 		// Set no impersonation headers and re-add removed headers.
-		req = context.WithNoImpersonation(req)
+		req = reqctx.WithNoImpersonation(req)
 
 		handler.ServeHTTP(rw, req)
 	})
@@ -91,7 +95,7 @@ func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
 func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		// If no impersonation has already been set, return early
-		if context.NoImpersonation(req) {
+		if reqctx.NoImpersonation(req) {
 			handler.ServeHTTP(rw, req)
 			return
 		}
@@ -99,13 +103,13 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 		var targetForContext user.Info
 
 		var remoteAddr string
-		req, remoteAddr = context.RemoteAddr(req)
+		req, remoteAddr = reqctx.RemoteAddr(req)
 
 		// If we have disabled impersonation we can forward the request right away
 		if p.config.DisableImpersonation {
 			klog.V(2).Infof("passing on request with no impersonation: %s", remoteAddr)
 			// Indicate we need to not use impersonation.
-			req = context.WithNoImpersonation(req)
+			req = reqctx.WithNoImpersonation(req)
 			handler.ServeHTTP(rw, req)
 			return
 		}
@@ -185,10 +189,12 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			groups = append(groups, user.AllAuthenticated)
 		}
 
-		extra := effective.GetExtra()
-
-		if extra == nil {
-			extra = make(map[string][]string)
+		// Copied, so that the extras added below are not written into the
+		// identity the request context holds, which the audit log and the access
+		// log record as the requester.
+		extra := make(map[string][]string, len(effective.GetExtra()))
+		for k, vs := range effective.GetExtra() {
+			extra[k] = slices.Clone(vs)
 		}
 
 		// If client IP user extra header option set then append the remote client
@@ -233,18 +239,18 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			}
 		}
 
-		conf := &context.ImpersonationRequest{
+		conf := &reqctx.ImpersonationRequest{
 			ImpersonationConfig: &transport.ImpersonationConfig{
 				UserName: effective.GetName(),
 				Groups:   groups,
 				Extra:    extra,
 			},
-			InboundUser:      &requester,
-			ImpersonatedUser: &targetForContext,
+			InboundUser:      requester,
+			ImpersonatedUser: targetForContext,
 		}
 
 		// Add the impersonation configuration to the context.
-		req = context.WithImpersonationConfig(req, conf)
+		req = reqctx.WithImpersonationConfig(req, conf)
 		handler.ServeHTTP(rw, req)
 	})
 }
@@ -296,7 +302,7 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 
 			// No impersonation user found
 		case subjectaccessreview.ErrorNoImpersonationUserFound:
-			http.Error(rw, subjectaccessreview.ErrorNoImpersonationUserFound.Error(), http.StatusInternalServerError)
+			http.Error(rw, subjectaccessreview.ErrorNoImpersonationUserFound.Error(), http.StatusBadRequest)
 			return
 
 			// Server or unknown error

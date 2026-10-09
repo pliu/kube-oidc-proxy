@@ -50,6 +50,10 @@ type fakeRT struct {
 	expGroup []string
 	expExtra map[string][]string
 	expUid   string
+
+	// expAuthorization is the only Authorization header the API server may
+	// receive, or "" for none.
+	expAuthorization string
 }
 
 func (f *fakeRW) Write(b []byte) (int, error) {
@@ -79,6 +83,11 @@ func newFakeRW() *fakeRW {
 }
 
 func (f *fakeRT) RoundTrip(h *http.Request) (*http.Response, error) {
+	if act := h.Header.Values("Authorization"); len(act) > 1 || h.Header.Get("Authorization") != f.expAuthorization {
+		f.t.Errorf("client transport got unexpected Authorization header, exp=%q got=%q",
+			f.expAuthorization, act)
+	}
+
 	if h.Header.Get("Impersonate-User") != f.expUser {
 		logging.LogFailedRequest(h)
 		f.t.Errorf("client transport got unexpected user impersonation header, exp=%s got=%s",
@@ -322,6 +331,8 @@ func TestHandlers(t *testing.T) {
 		expGroup []string
 		expExtra map[string][]string
 		expUid   string
+
+		expAuthorization string
 	}{
 		"an empty request should 401": {
 			req:     new(http.Request),
@@ -661,7 +672,7 @@ func TestHandlers(t *testing.T) {
 				pass: true,
 				err:  nil,
 			},
-			expCode: http.StatusInternalServerError,
+			expCode: http.StatusBadRequest,
 			expBody: "no Impersonation-User header found for request",
 		},
 
@@ -683,7 +694,7 @@ func TestHandlers(t *testing.T) {
 				pass: true,
 				err:  nil,
 			},
-			expCode: http.StatusInternalServerError,
+			expCode: http.StatusBadRequest,
 			expBody: "no Impersonation-User header found for request",
 		},
 
@@ -705,7 +716,7 @@ func TestHandlers(t *testing.T) {
 				pass: true,
 				err:  nil,
 			},
-			expCode: http.StatusInternalServerError,
+			expCode: http.StatusBadRequest,
 			expBody: "no Impersonation-User header found for request",
 		},
 
@@ -827,11 +838,14 @@ func TestHandlers(t *testing.T) {
 			config: &Config{
 				DisableImpersonation: true,
 			},
-			expCode:  http.StatusOK,
-			expBody:  "",
-			expUser:  "",
-			expGroup: nil,
-			expExtra: nil,
+			// Forwarded as is, so the API server authenticates the caller by
+			// their own token rather than seeing an anonymous request.
+			expAuthorization: "bearer fake-token",
+			expCode:          http.StatusOK,
+			expBody:          "",
+			expUser:          "",
+			expGroup:         nil,
+			expExtra:         nil,
 		},
 	}
 
@@ -850,6 +864,7 @@ func TestHandlers(t *testing.T) {
 			p.fakeRT.expGroup = test.expGroup
 			p.fakeRT.expExtra = test.expExtra
 			p.fakeRT.expUid = test.expUid
+			p.fakeRT.expAuthorization = test.expAuthorization
 
 			if test.config != nil {
 				p.config = test.config
@@ -959,10 +974,13 @@ func TestHeadersConfig(t *testing.T) {
 				URL:        new(url.URL),
 			}
 
+			// The token carries an extra of its own, so that the extras the proxy
+			// adds have an identity of the token's to be wrongly written into.
 			authResponse := &authenticator.Response{
 				User: &user.DefaultInfo{
 					Name:   "a-user",
 					Groups: []string{user.AllAuthenticated},
+					Extra:  map[string][]string{"origin": {"token"}},
 				},
 			}
 
@@ -970,7 +988,11 @@ func TestHeadersConfig(t *testing.T) {
 
 			p.fakeRT.expUser = "a-user"
 			p.fakeRT.expGroup = []string{user.AllAuthenticated}
-			p.fakeRT.expExtra = test.expExtra
+			expExtra := map[string][]string{"Impersonate-Extra-Origin": {"token"}}
+			for k, v := range test.expExtra {
+				expExtra[k] = v
+			}
+			p.fakeRT.expExtra = expExtra
 
 			var handler http.Handler
 			handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -985,6 +1007,11 @@ func TestHeadersConfig(t *testing.T) {
 			handler.ServeHTTP(w, req)
 
 			w.Result()
+
+			// The audit and access logs record this identity as the requester.
+			if exp, act := map[string][]string{"origin": {"token"}}, authResponse.User.GetExtra(); !reflect.DeepEqual(exp, act) {
+				t.Errorf("authenticated identity was modified, exp extra=%v got=%v", exp, act)
+			}
 
 			p.ctrl.Finish()
 		})

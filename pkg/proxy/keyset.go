@@ -2,7 +2,7 @@
 package proxy
 
 import (
-	ctx "context"
+	"context"
 	"crypto"
 	"errors"
 	"fmt"
@@ -31,7 +31,7 @@ func newStaticKeySet(keys []crypto.PublicKey, signingAlgs []string) *staticKeySe
 // VerifySignature returns the payload of the token if any of the keys signed
 // it. The verifier has already checked the algorithm against the issuer's, and
 // checks the issuer, audience and expiry of the payload after.
-func (s *staticKeySet) VerifySignature(_ ctx.Context, token string) ([]byte, error) {
+func (s *staticKeySet) VerifySignature(_ context.Context, token string) ([]byte, error) {
 	jws, err := jose.ParseSignedCompact(token, s.algs)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: malformed jwt: %w", err)

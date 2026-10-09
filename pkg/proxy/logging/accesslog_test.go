@@ -66,3 +66,20 @@ func TestXForwardedFor(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteHost(t *testing.T) {
+	tests := map[string]string{
+		"1.2.3.4:5678":      "1.2.3.4",
+		"[::1]:5678":        "::1",
+		"[2001:db8::1]:443": "2001:db8::1",
+		"1.2.3.4":           "1.2.3.4",
+		"fakeAddr":          "fakeAddr",
+		"":                  "",
+	}
+
+	for addr, exp := range tests {
+		if got := remoteHost(addr); got != exp {
+			t.Errorf("remoteHost(%q) = %q, exp %q", addr, got, exp)
+		}
+	}
+}

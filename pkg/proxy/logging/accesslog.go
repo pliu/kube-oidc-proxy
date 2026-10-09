@@ -3,6 +3,7 @@ package logging
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -29,11 +30,7 @@ const (
 // The address the connection came from is not quoted: it is taken from the
 // socket rather than from anything the client sent.
 func LogSuccessfulRequest(req *http.Request, inboundUser user.Info, outboundUser user.Info) {
-	remoteAddr := req.RemoteAddr
-	indexOfColon := strings.Index(remoteAddr, ":")
-	if indexOfColon > 0 {
-		remoteAddr = remoteAddr[0:indexOfColon]
-	}
+	remoteAddr := remoteHost(req.RemoteAddr)
 
 	inboundExtras := quotedExtra(inboundUser.GetExtra())
 
@@ -60,6 +57,16 @@ func quotedExtra(extra map[string][]string) string {
 	}
 
 	return out
+}
+
+// remoteHost returns the host of a connection's remote address, without its
+// port. An address with no port is returned as it is.
+func remoteHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+
+	return remoteAddr
 }
 
 // determines if the x-forwarded-for header is present, if so remove
@@ -96,11 +103,7 @@ func findXForwardedFor(headers http.Header, remoteAddr string) string {
 
 // logs the failed request
 func LogFailedRequest(req *http.Request) {
-	remoteAddr := req.RemoteAddr
-	indexOfColon := strings.Index(remoteAddr, ":")
-	if indexOfColon > 0 {
-		remoteAddr = remoteAddr[0:indexOfColon]
-	}
+	remoteAddr := remoteHost(req.RemoteAddr)
 
 	fmt.Printf("[%s] AuFail src:[%s / %q] URI:%q\n", time.Now().Format(timestampLayout), remoteAddr, req.Header.Get("x-forwarded-for"), req.RequestURI)
 }

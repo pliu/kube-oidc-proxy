@@ -2,7 +2,7 @@
 package proxy
 
 import (
-	ctx "context"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,7 +11,7 @@ import (
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/klog/v2"
 
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 )
 
 const (
@@ -30,7 +30,7 @@ var errImpersonationNotAccepted = errors.New(
 // GroupAugmenter is the source of the groups a request is impersonated with
 // when the groups of the token are not to be trusted.
 type GroupAugmenter interface {
-	Resolve(ctx.Context, string) ([]string, error)
+	Resolve(context.Context, string) ([]string, error)
 	Run(<-chan struct{}) error
 	CanRefresh(string) bool
 }
@@ -52,7 +52,7 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 		}
 
 		var remoteAddr string
-		req, remoteAddr = context.RemoteAddr(req)
+		req, remoteAddr = reqctx.RemoteAddr(req)
 
 		// A request that authenticated by token passthrough carries no user,
 		// so there is nobody to check against the allowed users.
@@ -88,8 +88,8 @@ func (p *Proxy) withLDAPRefresh(handler http.Handler) http.Handler {
 // the whole point of augmenting, and a user who is missing because a directory
 // is misconfigured would otherwise quietly regain whatever their identity
 // provider claimed for them.
-func (p *Proxy) augmentGroups(context ctx.Context, u user.Info, remoteAddr string) (user.Info, error) {
-	groups, err := p.ldapDirectory.Resolve(context, u.GetName())
+func (p *Proxy) augmentGroups(ctx context.Context, u user.Info, remoteAddr string) (user.Info, error) {
+	groups, err := p.ldapDirectory.Resolve(ctx, u.GetName())
 	if err != nil {
 		return nil, err
 	}

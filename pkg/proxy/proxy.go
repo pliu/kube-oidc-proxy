@@ -2,7 +2,7 @@
 package proxy
 
 import (
-	ctx "context"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -23,9 +23,9 @@ import (
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
 )
@@ -125,7 +125,7 @@ func New(restConfig *rest.Config,
 			opts.KeySet = newStaticKeySet(issuer.PublicKeys, issuer.SigningAlgs)
 		}
 
-		tokenAuther, err := oidc.New(ctx.TODO(), opts)
+		tokenAuther, err := oidc.New(context.TODO(), opts)
 		if err != nil {
 			return nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
 		}
@@ -241,15 +241,17 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	// we need use impersonation or not.
 
 	// If no impersonation then we return here without setting impersonation
-	// header but re-introduce the token we removed.
-	if context.NoImpersonation(req) {
-		token := context.BearerToken(req)
-		req.Header.Add("Authorization", token)
+	// header but re-introduce the token, which authentication removes from
+	// the request once it has accepted it.
+	if reqctx.NoImpersonation(req) {
+		if token := reqctx.BearerToken(req); token != "" {
+			req.Header.Set("Authorization", token)
+		}
 		return p.noAuthClientTransport.RoundTrip(req)
 	}
 
 	// Get the impersonation headers from the context.
-	impersonationConf := context.ImpersonationConfig(req)
+	impersonationConf := reqctx.ImpersonationConfig(req)
 	if impersonationConf == nil {
 		return nil, errNoImpersonationConfig
 	}
@@ -258,7 +260,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.clientTransport)
 
 	// Log the request
-	logging.LogSuccessfulRequest(req, *impersonationConf.InboundUser, *impersonationConf.ImpersonatedUser)
+	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser, impersonationConf.ImpersonatedUser)
 
 	// Push request through round trippers to the API server.
 	return rt.RoundTrip(req)
@@ -266,7 +268,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func (p *Proxy) reviewToken(rw http.ResponseWriter, req *http.Request) bool {
 	var remoteAddr string
-	req, remoteAddr = context.RemoteAddr(req)
+	req, remoteAddr = reqctx.RemoteAddr(req)
 
 	klog.V(4).Infof("attempting to validate a token in request using TokenReview endpoint(%s)",
 		remoteAddr)

@@ -2,7 +2,7 @@
 package proxy
 
 import (
-	ctx "context"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -77,7 +77,7 @@ func TestStaticKeySet(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			payload, err := keySet.VerifySignature(ctx.Background(), test.token)
+			payload, err := keySet.VerifySignature(context.Background(), test.token)
 			if test.expErr {
 				if err == nil {
 					t.Errorf("expected an error, got payload %q", payload)

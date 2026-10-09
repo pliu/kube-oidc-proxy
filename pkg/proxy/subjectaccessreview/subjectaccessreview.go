@@ -50,12 +50,13 @@ func New(reviewer clientazv1.SubjectAccessReviewInterface) (*SubjectAccessReview
 func (s *SubjectAccessReview) CheckAuthorizedForImpersonation(req *http.Request, requester user.Info) (user.Info, error) {
 	target := &user.DefaultInfo{Groups: []string{}, Extra: map[string][]string{}}
 	var headersToRemove []string
+	hasUser := req.Header.Get("Impersonate-User") != ""
 	for key, values := range req.Header {
 		if !IsImpersonationHeader(key) {
 			continue
 		}
 		lower := strings.ToLower(key)
-		if req.Header.Get("Impersonate-User") == "" {
+		if !hasUser {
 			return nil, ErrorNoImpersonationUserFound
 		}
 		headersToRemove = append(headersToRemove, key)

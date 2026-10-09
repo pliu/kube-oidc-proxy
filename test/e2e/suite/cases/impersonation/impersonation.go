@@ -67,7 +67,7 @@ var _ = framework.CasesDescribe("Impersonation", func() {
 				"group-1",
 				"group-2",
 			},
-		}, http.StatusInternalServerError, "no Impersonation-User header found for request")
+		}, http.StatusBadRequest, "no Impersonation-User header found for request")
 
 		By("Impersonating as a extra")
 		tryImpersonationClient(f, rest.ImpersonationConfig{
@@ -79,7 +79,7 @@ var _ = framework.CasesDescribe("Impersonation", func() {
 					"k1", "k2", "k3",
 				},
 			},
-		}, http.StatusInternalServerError, "no Impersonation-User header found for request")
+		}, http.StatusBadRequest, "no Impersonation-User header found for request")
 	})
 
 	It("should return error from proxy when impersonation enabled and impersonation is not authorized by the cluster's RBAC", func() {
@@ -108,55 +108,15 @@ var _ = framework.CasesDescribe("Impersonation", func() {
 
 	})
 
-	It("should not error at proxy when impersonation is disabled and impersonation is attempted on a request", func() {
+	It("should forward the request with the caller's own token when impersonation is disabled", func() {
 		By("Enabling the disabling of impersonation")
 		f.DeployProxyWith(nil, "--disable-impersonation")
 
-		By("Creating ClusterRole for system:anonymous to impersonate")
-		roleImpersonate, err := f.Helper().KubeClient.RbacV1().ClusterRoles().Create(context.TODO(), &rbacv1.ClusterRole{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "test-user-role-impersonate-",
-			},
-			Rules: []rbacv1.PolicyRule{
-				{APIGroups: []string{""}, Resources: []string{"users"}, Verbs: []string{"impersonate"}},
-			},
-		}, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Creating Role for user foo to list Pods")
-		rolePods, err := f.Helper().KubeClient.RbacV1().Roles(f.Namespace.Name).Create(context.TODO(), &rbacv1.Role{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "test-user-role-pods-",
-			},
-			Rules: []rbacv1.PolicyRule{
-				{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list"}},
-			},
-		}, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Creating ClusterRoleBinding for user system:anonymous")
-		rolebindingImpersonate, err := f.Helper().KubeClient.RbacV1().ClusterRoleBindings().Create(context.TODO(),
-			&rbacv1.ClusterRoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "test-user-binding-system-anonymous",
-				},
-				Subjects: []rbacv1.Subject{{Name: "system:anonymous", Kind: "User"}},
-				RoleRef:  rbacv1.RoleRef{Name: roleImpersonate.Name, Kind: "ClusterRole"},
-			}, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Creating RoleBinding for user foo@example.com")
-		rolebindingPods, err := f.Helper().KubeClient.RbacV1().RoleBindings(f.Namespace.Name).Create(context.TODO(),
-			&rbacv1.RoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "test-user-binding-user-foo-example-com",
-				},
-				Subjects: []rbacv1.Subject{{Name: "foo@example.com", Kind: "User"}},
-				RoleRef:  rbacv1.RoleRef{Name: rolePods.Name, Kind: "Role"},
-			}, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		// build client with impersonation
+		// The proxy accepts the token and forwards the request as it is,
+		// impersonation headers included. The API server is not configured to
+		// trust the e2e issuer, so it rejecting that token is what shows the
+		// token reached it - a request forwarded without one would instead
+		// have been served as system:anonymous.
 		config := f.NewProxyRestConfig()
 		config.Impersonate = rest.ImpersonationConfig{
 			UserName: "foo@example.com",
@@ -164,26 +124,17 @@ var _ = framework.CasesDescribe("Impersonation", func() {
 		client, err := kubernetes.NewForConfig(config)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Should not error since we have authorized system:anonymous to
-		// impersonate and foo@example.com to list pods
 		_, err = client.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).To(HaveOccurred())
 
-		By("Deleting RoleBinding for user foo@example.com")
-		err = f.Helper().KubeClient.RbacV1().RoleBindings(f.Namespace.Name).Delete(context.TODO(), rolebindingPods.Name, metav1.DeleteOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		kErr, ok := err.(*k8sErrors.StatusError)
+		Expect(ok).To(BeTrue(), "expected a status error, got %v", err)
+		Expect(kErr.ErrStatus.Code).To(BeEquivalentTo(http.StatusUnauthorized))
 
-		By("Deleting Role for list Pods")
-		err = f.Helper().KubeClient.RbacV1().Roles(f.Namespace.Name).Delete(context.TODO(), rolePods.Name, metav1.DeleteOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Deleting ClusterRoleBinding for user system:anonymous")
-		err = f.Helper().KubeClient.RbacV1().ClusterRoleBindings().Delete(context.TODO(), rolebindingImpersonate.Name, metav1.DeleteOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Deleting ClusterRole for Impersonate")
-		err = f.Helper().KubeClient.RbacV1().ClusterRoles().Delete(context.TODO(), roleImpersonate.Name, metav1.DeleteOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		// The proxy answers a token it rejects with a plain text body, which
+		// client-go reports with a message of its own. Only the API server
+		// answers with a Status of its own.
+		Expect(kErr.ErrStatus.Message).To(Equal("Unauthorized"))
 	})
 })
 
