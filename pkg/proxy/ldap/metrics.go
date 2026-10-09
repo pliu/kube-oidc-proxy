@@ -24,7 +24,7 @@ var (
 		Namespace: metricsNamespace,
 		Name:      "full_refresh_duration_seconds",
 		Help:      "Duration of a refresh cycle that reached every cached user, including cycles in which some users failed.",
-		Buckets:   refreshBuckets,
+		Buckets:   fullRefreshBuckets,
 	})
 
 	// backendRefreshDuration covers one user's refresh against one backend.
@@ -32,7 +32,7 @@ var (
 		Namespace: metricsNamespace,
 		Name:      "backend_refresh_duration_seconds",
 		Help:      "Duration of a successful refresh of one user against one LDAP backend, by trigger: realtime for a request from a user with no cached record, async for the leader's refresh cycle.",
-		Buckets:   refreshBuckets,
+		Buckets:   backendRefreshBuckets,
 	}, []string{"backend", "trigger"})
 
 	// userRefreshFailures counts users whose refresh failed, by what failed. A
@@ -57,7 +57,14 @@ const (
 	triggerAsync    = "async"
 )
 
-var refreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
+// fullRefreshBuckets run from 100ms to about 3.4 minutes: a cycle refreshes
+// every cached user, so takes seconds to minutes.
+var fullRefreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
+
+// backendRefreshBuckets run from 1ms to about 33s. Looking one user up in one
+// backend takes milliseconds against a nearby directory, connection and bind
+// included, and seconds only when the directory is distant or struggling.
+var backendRefreshBuckets = prometheus.ExponentialBuckets(0.001, 2, 16)
 
 // registerMetrics publishes the metrics on first use, so that a proxy running
 // without LDAP augmentation configured reports no series at all rather than a
