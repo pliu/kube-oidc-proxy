@@ -147,13 +147,8 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 			},
 			{
 				APIGroups: []string{"authentication.k8s.io"},
-				Resources: []string{"userextras/scopes", "tokenreviews", "userextras/originaluser.jetstack.io-user", "userextras/originaluser.jetstack.io-groups", "userextras/originaluser.jetstack.io-extra", "userextras/oktoimpersonateextra"},
-				Verbs:     []string{"impersonate", "create"},
-			},
-			{
-				APIGroups: []string{"authorization.k8s.io"},
-				Resources: []string{"subjectaccessreviews"},
-				Verbs:     []string{"create"},
+				Resources: []string{"userextras/scopes"},
+				Verbs:     []string{"impersonate"},
 			},
 			{
 				APIGroups: []string{"coordination.k8s.io"},
@@ -166,7 +161,9 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		return nil, nil, err
 	}
 
-	// Create a role that will allow a user to impersonate another user
+	// Allow the test user to impersonate others. The proxy refuses
+	// impersonation headers regardless, which the impersonation cases check
+	// against this grant: RBAC allowing it must not get the headers honoured.
 	croleImpersonate, err := h.KubeClient.RbacV1().ClusterRoles().Create(context.TODO(), &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: kind.ProxyImageName + "-impersonate-",
@@ -206,8 +203,7 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		return nil, nil, err
 	}
 
-	// Create a ClusterRoleBinding so the user can impersonate test users
-
+	// Bind the impersonation grant to the test user.
 	_, err = h.KubeClient.RbacV1().ClusterRoleBindings().Create(context.TODO(),
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{

@@ -75,8 +75,13 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 
 	var errs []error
 
-	if err := o.OIDCAuthentication.Validate(); err != nil {
-		errs = append(errs, err)
+	// Passthrough leaves authentication to the API server, so it needs no
+	// issuers. A file given anyway is ignored rather than refused: it changes
+	// nothing about what a request may do.
+	if !o.App.TokenPassthrough.Enabled {
+		if err := o.OIDCAuthentication.Validate(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if err := o.SecureServing.Validate(); len(err) > 0 {
@@ -105,13 +110,17 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 		}
 	}
 
-	if o.App.DisableImpersonation && o.LDAP.Enabled() {
-		errs = append(errs, errors.New("cannot augment groups from LDAP when impersonation disabled"))
+	// Passthrough forwards requests as they are, so neither the groups of the
+	// directory nor extra user headers would ever reach the API server.
+	// Refused, so that a configuration asking for them is not quietly served
+	// without them.
+	if o.App.TokenPassthrough.Enabled && o.LDAP.Enabled() {
+		errs = append(errs, errors.New("--token-passthrough cannot be used with --ldap-config-file"))
 	}
 
-	if o.App.DisableImpersonation &&
+	if o.App.TokenPassthrough.Enabled &&
 		(o.App.ExtraHeaderOptions.EnableClientIPExtraUserHeader || len(o.App.ExtraHeaderOptions.ExtraUserHeaders) > 0) {
-		errs = append(errs, errors.New("cannot add extra user headers when impersonation disabled"))
+		errs = append(errs, errors.New("--token-passthrough cannot be used with extra user headers"))
 	}
 
 	if len(errs) > 0 {

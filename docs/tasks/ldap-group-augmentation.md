@@ -3,9 +3,11 @@
 With `--ldap-config-file=/etc/kube-oidc-proxy/ldap.json`, OIDC supplies the
 username and LDAP supplies group memberships. Token groups are replaced before
 impersonation and audit processing. Kubernetes' `system:authenticated` group is
-added to the forwarded identity. Token-review/passthrough requests keep their
-existing behavior and do not enter LDAP augmentation. Impersonation headers
-are rejected while augmentation is enabled.
+added to the forwarded identity. Augmentation cannot be combined with
+[token passthrough](./token-passthrough.md), which forwards requests without
+authenticating or impersonating them. Impersonation headers
+are refused, as they are without augmentation; see
+[Impersonation Headers](../../README.md#impersonation-headers).
 
 ## Configuration
 

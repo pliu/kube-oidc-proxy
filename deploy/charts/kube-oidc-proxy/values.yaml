@@ -44,11 +44,11 @@ oidc:
   # its keys. See the chart README for examples.
   issuers: []
 
-# To enable token passthrough feature
+# Forward every request to the API server as it is, with the caller's own token
+# and no impersonation. Cannot be combined with ldap or extra user headers.
 # https://github.com/jetstack/kube-oidc-proxy/blob/master/docs/tasks/token-passthrough.md
 tokenPassthrough:
   enabled: false
-  audiences: []
 
 # To add extra impersonation headers
 # https://github.com/jetstack/kube-oidc-proxy/blob/master/docs/tasks/extra-impersonation-headers.md

@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/token/union"
@@ -19,15 +21,12 @@ import (
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
-	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
 )
 
 const (
@@ -41,8 +40,9 @@ var (
 )
 
 type Config struct {
-	DisableImpersonation bool
-	TokenReview          bool
+	// TokenPassthrough forwards every request as it is, with the caller's own
+	// token and no impersonation, leaving authentication to the API server.
+	TokenPassthrough bool
 
 	FlushInterval   time.Duration
 	ExternalAddress string
@@ -54,13 +54,10 @@ type Config struct {
 type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
 
 type Proxy struct {
-	oidcRequestAuther     *bearertoken.Authenticator
-	tokenAuther           authenticator.Token
-	oidcHealthChecks      []func() error
-	tokenReviewer         *tokenreview.TokenReview
-	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview
-	secureServingInfo     *server.SecureServingInfo
-	auditor               *audit.Audit
+	oidcRequestAuther *bearertoken.Authenticator
+	oidcHealthChecks  []func() error
+	secureServingInfo *server.SecureServingInfo
+	auditor           *audit.Audit
 
 	// ldapDirectory is nil unless LDAP group augmentation is enabled.
 	ldapDirectory GroupAugmenter
@@ -87,18 +84,51 @@ func New(restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
 	ldapDirectory GroupAugmenter,
-	tokenReviewer *tokenreview.TokenReview,
-	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
 	ssinfo *server.SecureServingInfo,
 	config *Config) (*Proxy, error) {
 
-	issuers, err := oidcOptions.Issuers()
+	p := &Proxy{
+		restConfig:        restConfig,
+		hooks:             hooks.New(),
+		secureServingInfo: ssinfo,
+		config:            config,
+		// Nil unless LDAP group augmentation is configured.
+		ldapDirectory: ldapDirectory,
+	}
+
+	// Passthrough leaves authentication to the API server, so it trusts no
+	// issuers of its own and has none to wait on.
+	if !config.TokenPassthrough {
+		tokenAuther, healthChecks, err := newTokenAuthenticator(oidcOptions)
+		if err != nil {
+			return nil, err
+		}
+
+		p.oidcRequestAuther = bearertoken.New(tokenAuther)
+		p.oidcHealthChecks = healthChecks
+	}
+
+	auditor, err := audit.New(auditOptions, config.ExternalAddress, ssinfo)
 	if err != nil {
 		return nil, err
 	}
 
-	// One authenticator per trusted issuer. Each only answers for tokens whose
-	// iss is its own, so the union accepts a token from any of them.
+	p.auditor = auditor
+
+	registerMetrics()
+
+	return p, nil
+}
+
+// newTokenAuthenticator builds one authenticator per trusted issuer. Each only
+// answers for tokens whose iss is its own, so the union accepts a token from
+// any of them.
+func newTokenAuthenticator(oidcOptions *options.OIDCAuthenticationOptions) (authenticator.Token, []func() error, error) {
+	issuers, err := oidcOptions.Issuers()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var (
 		tokenAuthers []authenticator.Token
 		healthChecks []func() error
@@ -127,50 +157,20 @@ func New(restConfig *rest.Config,
 
 		tokenAuther, err := oidc.New(context.TODO(), opts)
 		if err != nil {
-			return nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
+			return nil, nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
 		}
 
 		tokenAuthers = append(tokenAuthers, tokenAuther)
 		healthChecks = append(healthChecks, tokenAuther.HealthCheck)
 	}
 
-	tokenAuther := union.New(tokenAuthers...)
-
-	auditor, err := audit.New(auditOptions, config.ExternalAddress, ssinfo)
-	if err != nil {
-		return nil, err
-	}
-
-	registerMetrics()
-
-	p := &Proxy{
-		restConfig:            restConfig,
-		hooks:                 hooks.New(),
-		tokenReviewer:         tokenReviewer,
-		subjectAccessReviewer: subjectAccessReviewer,
-		secureServingInfo:     ssinfo,
-		config:                config,
-		oidcRequestAuther:     bearertoken.New(tokenAuther),
-		tokenAuther:           tokenAuther,
-		oidcHealthChecks:      healthChecks,
-		auditor:               auditor,
-		// Nil unless LDAP group augmentation is configured.
-		ldapDirectory: ldapDirectory,
-	}
-
-	return p, nil
+	return union.New(tokenAuthers...), healthChecks, nil
 }
 
 func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
-	// standard round tripper for proxy to API Server
-	clientRT, err := p.roundTripperForRestConfig(p.restConfig)
-	if err != nil {
-		return nil, nil, err
-	}
-	p.clientTransport = clientRT
-
-	// No auth round tripper for no impersonation
-	if p.config.DisableImpersonation || p.config.TokenReview {
+	if p.config.TokenPassthrough {
+		// Carries the caller's own token and nothing of the proxy's, so the
+		// API server authenticates the caller.
 		noAuthClientRT, err := p.roundTripperForRestConfig(&rest.Config{
 			APIPath: p.restConfig.APIPath,
 			Host:    p.restConfig.Host,
@@ -185,6 +185,14 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 		}
 
 		p.noAuthClientTransport = noAuthClientRT
+	} else {
+		// Carries the proxy's own credentials, which impersonate the user.
+		clientRT, err := p.roundTripperForRestConfig(p.restConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		p.clientTransport = clientRT
 	}
 
 	// get API server url
@@ -240,13 +248,9 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Here we have successfully authenticated so now need to determine whether
 	// we need use impersonation or not.
 
-	// If no impersonation then we return here without setting impersonation
-	// header but re-introduce the token, which authentication removes from
-	// the request once it has accepted it.
+	// A passthrough request is forwarded as it arrived, with the caller's own
+	// token, which the proxy never removed since it never authenticated it.
 	if reqctx.NoImpersonation(req) {
-		if token := reqctx.BearerToken(req); token != "" {
-			req.Header.Set("Authorization", token)
-		}
 		return p.noAuthClientTransport.RoundTrip(req)
 	}
 
@@ -256,39 +260,33 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, errNoImpersonationConfig
 	}
 
+	// Forwarded with the proxy's own credentials, which may impersonate
+	// anyone, so nothing the client sent may speak for its identity.
+	// withImpersonateRequest refuses Impersonate- headers and authentication
+	// removes the token, but both transports below pass a request through
+	// untouched if it already carries one: the impersonating transport keeps
+	// any Impersonate-User it finds, with whatever groups came alongside, and
+	// the bearer transport keeps any Authorization. Removed here as well, so
+	// that the request can only ever run as the identity built for it.
+	//
+	// Matched case insensitively and deleted from the map directly: Del
+	// canonicalizes the name it is given, so would leave a key that is not
+	// canonical in place, and the API server canonicalizes it again on arrival.
+	req = utilnet.CloneRequest(req)
+	for name := range req.Header {
+		if isImpersonationHeader(name) || strings.EqualFold(name, "Authorization") {
+			delete(req.Header, name)
+		}
+	}
+
 	// Set up impersonation request.
 	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.clientTransport)
 
 	// Log the request
-	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser, impersonationConf.ImpersonatedUser)
+	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser)
 
 	// Push request through round trippers to the API server.
 	return rt.RoundTrip(req)
-}
-
-func (p *Proxy) reviewToken(rw http.ResponseWriter, req *http.Request) bool {
-	var remoteAddr string
-	req, remoteAddr = reqctx.RemoteAddr(req)
-
-	klog.V(4).Infof("attempting to validate a token in request using TokenReview endpoint(%s)",
-		remoteAddr)
-
-	ok, err := p.tokenReviewer.Review(req)
-	if err != nil {
-		klog.Errorf("unable to authenticate the request via TokenReview due to an error (%s): %s",
-			remoteAddr, err)
-		return false
-	}
-
-	if !ok {
-		klog.V(4).Infof("passing request with valid token through (%s)",
-			remoteAddr)
-
-		return false
-	}
-
-	// No error and ok so passthrough the request
-	return true
 }
 
 // maxIdleConnsPerHost is how many spare connections to the API server are kept

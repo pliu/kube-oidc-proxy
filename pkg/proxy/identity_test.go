@@ -14,62 +14,31 @@ func TestBuildImpersonationPreservesIdentity(t *testing.T) {
 		Name: "alice", UID: "alice-id", Groups: []string{"requester-group"},
 		Extra: map[string][]string{"scope": {"requester-scope"}},
 	}
-	target := &user.DefaultInfo{
-		Name: "bob", UID: "bob-id", Groups: []string{"target-group"},
-		Extra: map[string][]string{"scope": {"target-scope"}},
-	}
 	config := &Config{
 		ExtraUserHeaders:                map[string][]string{"scope": {"configured"}},
 		ExtraUserHeadersClientIPEnabled: true,
 	}
-	for _, impersonate := range []bool{false, true} {
-		t.Run(map[bool]string{false: "requester", true: "target"}[impersonate], func(t *testing.T) {
-			var selected user.Info
-			effective := requester
-			if impersonate {
-				selected, effective = target, target
-			}
-			result, err := buildImpersonation(requester, selected, "192.0.2.1", config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			forwarded := result.ImpersonationConfig
-			if forwarded.UserName != effective.Name || forwarded.UID != effective.UID ||
-				result.InboundUser != requester || result.ImpersonatedUser != selected {
-				t.Fatalf("incorrect requester or effective identity: %+v", result)
-			}
-			if !reflect.DeepEqual(forwarded.Groups, []string{effective.Groups[0], user.AllAuthenticated}) ||
-				!reflect.DeepEqual(forwarded.Extra["scope"], []string{effective.Extra["scope"][0], "configured"}) ||
-				!reflect.DeepEqual(forwarded.Extra[UserHeaderClientIPKey], []string{"192.0.2.1"}) {
-				t.Fatalf("incorrect outgoing identity: %+v", forwarded)
-			}
-			if impersonate {
-				for key, want := range map[string][]string{
-					"originaluser.jetstack.io-user":   {"alice"},
-					"originaluser.jetstack.io-uid":    {"alice-id"},
-					"originaluser.jetstack.io-groups": {"requester-group"},
-					"originaluser.jetstack.io-extra":  {`{"scope":["requester-scope"]}`},
-				} {
-					if !reflect.DeepEqual(forwarded.Extra[key], want) {
-						t.Fatalf("incorrect original requester %q: %v", key, forwarded.Extra[key])
-					}
-				}
-			} else if _, ok := forwarded.Extra["originaluser.jetstack.io-user"]; ok {
-				t.Fatal("ordinary request includes impersonation provenance")
-			}
-			// Verify the outgoing fields have independent storage, even after
-			// callers or transport code modify their contents.
-			forwarded.Groups[0] = "modified"
-			forwarded.Extra["scope"][0] = "modified"
-			forwarded.Extra["scope"][1] = "modified"
-			if !reflect.DeepEqual(requester.Groups, []string{"requester-group"}) ||
-				!reflect.DeepEqual(target.Groups, []string{"target-group"}) ||
-				!reflect.DeepEqual(requester.Extra, map[string][]string{"scope": {"requester-scope"}}) ||
-				!reflect.DeepEqual(target.Extra, map[string][]string{"scope": {"target-scope"}}) ||
-				!reflect.DeepEqual(config.ExtraUserHeaders, map[string][]string{"scope": {"configured"}}) {
-				t.Fatal("outgoing identity shares storage with an input")
-			}
-		})
+
+	result := buildImpersonation(requester, "192.0.2.1", config)
+	forwarded := result.ImpersonationConfig
+	if forwarded.UserName != "alice" || forwarded.UID != "alice-id" || result.InboundUser != requester {
+		t.Fatalf("incorrect requester identity: %+v", result)
+	}
+	if !reflect.DeepEqual(forwarded.Groups, []string{"requester-group", user.AllAuthenticated}) ||
+		!reflect.DeepEqual(forwarded.Extra["scope"], []string{"requester-scope", "configured"}) ||
+		!reflect.DeepEqual(forwarded.Extra[UserHeaderClientIPKey], []string{"192.0.2.1"}) {
+		t.Fatalf("incorrect outgoing identity: %+v", forwarded)
+	}
+
+	// Verify the outgoing fields have independent storage, even after callers
+	// or transport code modify their contents.
+	forwarded.Groups[0] = "modified"
+	forwarded.Extra["scope"][0] = "modified"
+	forwarded.Extra["scope"][1] = "modified"
+	if !reflect.DeepEqual(requester.Groups, []string{"requester-group"}) ||
+		!reflect.DeepEqual(requester.Extra, map[string][]string{"scope": {"requester-scope"}}) ||
+		!reflect.DeepEqual(config.ExtraUserHeaders, map[string][]string{"scope": {"configured"}}) {
+		t.Fatal("outgoing identity shares storage with an input")
 	}
 }
 
@@ -85,10 +54,7 @@ func TestBuildImpersonationBuiltinGroups(t *testing.T) {
 		{user.Anonymous, []string{user.AllUnauthenticated}, []string{user.AllUnauthenticated}},
 	} {
 		identity := &user.DefaultInfo{Name: test.name, Groups: test.groups}
-		result, err := buildImpersonation(identity, nil, "", &Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
+		result := buildImpersonation(identity, "", &Config{})
 		if !reflect.DeepEqual(result.ImpersonationConfig.Groups, test.want) {
 			t.Errorf("%q with groups %v: got %v, want %v", test.name, test.groups, result.ImpersonationConfig.Groups, test.want)
 		}

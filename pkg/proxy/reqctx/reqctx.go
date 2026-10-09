@@ -19,9 +19,6 @@ const (
 	// impersonationConfigKey is the context key for the impersonation config.
 	impersonationConfigKey
 
-	// bearerTokenKey is the context key for the bearer token.
-	bearerTokenKey
-
 	// clientAddressKey is the context key for the client address.
 	clientAddressKey
 )
@@ -29,9 +26,6 @@ const (
 type ImpersonationRequest struct {
 	ImpersonationConfig *transport.ImpersonationConfig
 	InboundUser         user.Info
-	// ImpersonatedUser is nil unless the request asked to impersonate somebody
-	// and was authorized to.
-	ImpersonatedUser user.Info
 }
 
 // WithNoImpersonation returns a copy of the request in which the noImpersonation context value is set.
@@ -47,28 +41,13 @@ func NoImpersonation(req *http.Request) bool {
 
 // WithImpersonationConfig returns a copy of parent in which contains the impersonation configuration.
 func WithImpersonationConfig(req *http.Request, conf *ImpersonationRequest) *http.Request {
-	ctxToReturn := request.WithValue(req.Context(), impersonationConfigKey, conf)
-	if conf.ImpersonatedUser != nil {
-		ctxToReturn = request.WithUser(ctxToReturn, conf.ImpersonatedUser)
-	}
-	return req.WithContext(ctxToReturn)
+	return req.WithContext(request.WithValue(req.Context(), impersonationConfigKey, conf))
 }
 
 // ImpersonationConfig returns the impersonation configuration held in the context if existing.
 func ImpersonationConfig(req *http.Request) *ImpersonationRequest {
 	conf, _ := req.Context().Value(impersonationConfigKey).(*ImpersonationRequest)
 	return conf
-}
-
-// WithBearerToken will add the bearer token to the request context from an http.Header to the request context.
-func WithBearerToken(req *http.Request, header http.Header) *http.Request {
-	return req.WithContext(request.WithValue(req.Context(), bearerTokenKey, header.Get("Authorization")))
-}
-
-// BearerToken will return the bearer token stored in the request context.
-func BearerToken(req *http.Request) string {
-	token, _ := req.Context().Value(bearerTokenKey).(string)
-	return token
 }
 
 // RemoteAddress will attempt to return the source client address if available

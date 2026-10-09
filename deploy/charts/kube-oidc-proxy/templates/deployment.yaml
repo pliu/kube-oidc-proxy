@@ -51,9 +51,6 @@ spec:
           {{- end }}
           {{- if .Values.tokenPassthrough.enabled }}
           - "--token-passthrough"
-          {{- if .Values.tokenPassthrough.audiences }}
-          - "--token-passthrough-audiences={{ join "," .Values.tokenPassthrough.audiences }}"
-          {{ end }}
           {{ end }}
           {{- if .Values.extraImpersonationHeaders.clientIP }}
           - "--extra-user-header-client-ip"

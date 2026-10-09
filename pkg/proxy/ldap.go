@@ -4,7 +4,6 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -19,13 +18,6 @@ const (
 	// request a refresh (currently a stub).
 	LDAPRefreshPath = "/kube-oidc-proxy/ldap/refresh"
 )
-
-// errImpersonationNotAccepted is returned for a request that carries
-// Impersonate- headers while the groups of a request are being taken from
-// the directory. See withImpersonateRequest for why the two cannot both be
-// honoured.
-var errImpersonationNotAccepted = errors.New(
-	"impersonation headers are not accepted while group augmentation is enabled")
 
 // GroupAugmenter is the source of the groups a request is impersonated with
 // when the groups of the token are not to be trusted.

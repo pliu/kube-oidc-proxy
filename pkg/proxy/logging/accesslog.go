@@ -29,20 +29,12 @@ const (
 //
 // The address the connection came from is not quoted: it is taken from the
 // socket rather than from anything the client sent.
-func LogSuccessfulRequest(req *http.Request, inboundUser user.Info, outboundUser user.Info) {
+func LogSuccessfulRequest(req *http.Request, inboundUser user.Info) {
 	remoteAddr := remoteHost(req.RemoteAddr)
-
-	inboundExtras := quotedExtra(inboundUser.GetExtra())
-
-	outboundUserLog := ""
-
-	if outboundUser != nil {
-		outboundUserLog = fmt.Sprintf(" outbound:[%q / %q / %q / %s]", outboundUser.GetName(), strings.Join(outboundUser.GetGroups(), "|"), outboundUser.GetUID(), quotedExtra(outboundUser.GetExtra()))
-	}
 
 	xFwdFor := findXForwardedFor(req.Header, remoteAddr)
 
-	fmt.Printf("[%s] AuSuccess src:[%s / %q] URI:%q inbound:[%q / %q / %s]%s\n", time.Now().Format(timestampLayout), remoteAddr, xFwdFor, req.RequestURI, inboundUser.GetName(), strings.Join(inboundUser.GetGroups(), "|"), inboundExtras, outboundUserLog)
+	fmt.Printf("[%s] AuSuccess src:[%s / %q] URI:%q inbound:[%q / %q / %s]\n", time.Now().Format(timestampLayout), remoteAddr, xFwdFor, req.RequestURI, inboundUser.GetName(), strings.Join(inboundUser.GetGroups(), "|"), quotedExtra(inboundUser.GetExtra()))
 }
 
 // quotedExtra renders the extra fields of a user as quoted key=value pairs,

@@ -10,6 +10,7 @@ import (
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/leader"
@@ -17,8 +18,6 @@ import (
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
 	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
@@ -72,15 +71,6 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				restConfig.QPS = opts.Client.KubeClientQPS
 			}
 
-			// Initialise token reviewer if enabled
-			var tokenReviewer *tokenreview.TokenReview
-			if opts.App.TokenPassthrough.Enabled {
-				tokenReviewer, err = tokenreview.New(restConfig, opts.App.TokenPassthrough.Audiences)
-				if err != nil {
-					return err
-				}
-			}
-
 			// Initialise Secure Serving Config
 			secureServingInfo := new(server.SecureServingInfo)
 			if err := opts.SecureServing.ApplyTo(&secureServingInfo); err != nil {
@@ -88,8 +78,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			}
 
 			proxyConfig := &proxy.Config{
-				TokenReview:          opts.App.TokenPassthrough.Enabled,
-				DisableImpersonation: opts.App.DisableImpersonation,
+				TokenPassthrough: opts.App.TokenPassthrough.Enabled,
 
 				FlushInterval:   opts.App.FlushInterval,
 				ExternalAddress: opts.SecureServing.BindAddress.String(),
@@ -98,14 +87,8 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				ExtraUserHeadersClientIPEnabled: opts.App.ExtraHeaderOptions.EnableClientIPExtraUserHeader,
 			}
 
-			// Setup Subject Access Review
+			// Client for leader election and the LDAP cache.
 			kubeclient, err := kubernetes.NewForConfig(restConfig)
-			if err != nil {
-				return err
-			}
-
-			subectAccessReviewer, err := subjectaccessreview.New(kubeclient.AuthorizationV1().SubjectAccessReviews())
-
 			if err != nil {
 				return err
 			}
@@ -173,9 +156,13 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				})
 			}
 
+			if opts.App.TokenPassthrough.Enabled && opts.OIDCAuthentication.ConfigFile != "" {
+				klog.Infof("ignoring --oidc-config-file: with --token-passthrough the API server authenticates every request")
+			}
+
 			// Initialise proxy with OIDC token authenticator
 			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit, ldapDirectory,
-				tokenReviewer, subectAccessReviewer, secureServingInfo, proxyConfig)
+				secureServingInfo, proxyConfig)
 			if err != nil {
 				return err
 			}

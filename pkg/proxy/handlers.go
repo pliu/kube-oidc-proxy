@@ -4,16 +4,20 @@ package proxy
 import (
 	"errors"
 	"net/http"
+	"strings"
 
-	"k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
+	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
+
+// errImpersonationNotAccepted is returned for a request that carries
+// Impersonate- headers. See withImpersonateRequest for why they are refused.
+var errImpersonationNotAccepted = errors.New("impersonation headers are not accepted")
 
 func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 	// Set up proxy handlers
@@ -31,19 +35,25 @@ func (p *Proxy) withHandlers(handler http.Handler) http.Handler {
 
 // withAuthenticateRequest adds the proxy authentication handler to a chain.
 func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
-	tokenReviewHandler := p.withTokenReview(handler)
-
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// Kept for requests forwarded without impersonation, since a successful
-		// authentication deletes the Authorization header from the request.
-		req = reqctx.WithBearerToken(req, req.Header)
+		// Passthrough leaves authentication to the API server, which the
+		// request reaches as it is, carrying the caller's own token. Only a
+		// request with no token at all is turned away here, as every path does.
+		if p.config.TokenPassthrough {
+			if _, ok := util.ParseTokenFromRequest(req); !ok {
+				p.handleError(rw, req, errUnauthorized)
+				return
+			}
+
+			handler.ServeHTTP(rw, reqctx.WithNoImpersonation(req))
+			return
+		}
 
 		// Auth request and handle unauthed
 		info, ok, err := p.oidcRequestAuther.AuthenticateRequest(req)
 		if err != nil {
 			klog.V(5).Infof("Authenticated request failed: %s", err)
-			// Since we have failed OIDC auth, we will try a token review, if enabled.
-			tokenReviewHandler.ServeHTTP(rw, req)
+			p.handleError(rw, req, errUnauthorized)
 			return
 		}
 
@@ -64,52 +74,19 @@ func (p *Proxy) withAuthenticateRequest(handler http.Handler) http.Handler {
 	})
 }
 
-// withTokenReview will attempt a token review on the incoming request, if
-// enabled.
-func (p *Proxy) withTokenReview(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// If token review is not enabled then error.
-		if !p.config.TokenReview {
-			p.handleError(rw, req, errUnauthorized)
-			return
-		}
-
-		// Attempt to passthrough request if valid token
-		if !p.reviewToken(rw, req) {
-			// Token review failed so error
-			p.handleError(rw, req, errUnauthorized)
-			return
-		}
-
-		// Set no impersonation headers and re-add removed headers.
-		req = reqctx.WithNoImpersonation(req)
-
-		handler.ServeHTTP(rw, req)
-	})
-}
-
 // withImpersonateRequest adds the impersonation request handler to the chain.
 func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// If no impersonation has already been set, return early
+		// A passthrough request is forwarded as it is, Impersonate- headers
+		// included: it carries the caller's own token, so the API server holds
+		// the caller to their own impersonation rights.
 		if reqctx.NoImpersonation(req) {
 			handler.ServeHTTP(rw, req)
 			return
 		}
 
-		var targetForContext user.Info
-
 		var remoteAddr string
 		req, remoteAddr = reqctx.RemoteAddr(req)
-
-		// If we have disabled impersonation we can forward the request right away
-		if p.config.DisableImpersonation {
-			klog.V(2).Infof("passing on request with no impersonation: %s", remoteAddr)
-			// Indicate we need to not use impersonation.
-			req = reqctx.WithNoImpersonation(req)
-			handler.ServeHTTP(rw, req)
-			return
-		}
 
 		requester, ok := genericapirequest.UserFrom(req.Context())
 		// No name available so reject request
@@ -118,27 +95,24 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			return
 		}
 
-		// A request may not both ask to be impersonated as somebody else and
-		// have its groups decided by the directory. Honouring the headers
-		// builds the target identity out of Impersonate-Group alone, so the
-		// caller - not the directory - would decide the groups the request runs
-		// with, which is the thing augmentation exists to stop. Even
-		// Impersonate-User on its own runs the target as a member of no groups
-		// rather than of the groups the directory holds for them.
+		// A request may not ask to act as somebody else. The proxy forwards with
+		// its own credentials, which may impersonate anyone, so the API server
+		// never sees who is really asking and cannot hold them to their own
+		// impersonation rights. The request runs as the identity of its token,
+		// with the groups of its token or of the directory, and nothing else.
 		//
 		// This is refused rather than ignored. A caller that asked to act as
 		// somebody else and is quietly served as themselves has been told the
-		// wrong thing about who did the work.
-		if p.ldapDirectory != nil && hasImpersonation(req.Header) {
-			klog.V(2).Infof("rejecting impersonation headers from %q while groups are taken from the directory (%s)",
+		// wrong thing about who did the work - kubectl auth can-i --as would
+		// answer for the wrong user.
+		if hasImpersonation(req.Header) {
+			klog.V(2).Infof("rejecting impersonation headers from %q (%s)",
 				requester.GetName(), remoteAddr)
 			p.handleError(rw, req, errImpersonationNotAccepted)
 			return
 		}
 
 		// Keep the name from the token but take the groups from the directory.
-		// This happens before the impersonation check below so that the
-		// authorization decision is made against the directory groups too.
 		if p.ldapDirectory != nil {
 			var err error
 			requester, err = p.augmentGroups(req.Context(), requester, remoteAddr)
@@ -157,24 +131,7 @@ func (p *Proxy) withImpersonateRequest(handler http.Handler) http.Handler {
 			req = req.WithContext(genericapirequest.WithUser(req.Context(), requester))
 		}
 
-		if hasImpersonation(req.Header) {
-			// if impersonation headers are present, let's check to see
-			// if the user is authorized to perform the impersonation
-			target, err := p.subjectAccessReviewer.CheckAuthorizedForImpersonation(req, requester)
-
-			if err != nil {
-				p.handleError(rw, req, err)
-				return
-			}
-
-			targetForContext = target
-		}
-
-		conf, err := buildImpersonation(requester, targetForContext, remoteAddr, p.config)
-		if err != nil {
-			p.handleError(rw, req, err)
-			return
-		}
+		conf := buildImpersonation(requester, remoteAddr, p.config)
 
 		// Add the impersonation configuration to the context.
 		req = reqctx.WithImpersonationConfig(req, conf)
@@ -215,8 +172,7 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 			http.Error(rw, "Username claim not available in OIDC Issuer response", http.StatusForbidden)
 			return
 
-			// Impersonation headers sent while the groups of a request are
-			// taken from the directory
+			// Impersonation headers, which are never honoured
 		case errImpersonationNotAccepted:
 			http.Error(rw, errImpersonationNotAccepted.Error(), http.StatusForbidden)
 			return
@@ -227,33 +183,27 @@ func (p *Proxy) newErrorHandler() func(rw http.ResponseWriter, r *http.Request, 
 			http.Error(rw, "", http.StatusInternalServerError)
 			return
 
-			// No impersonation user found
-		case subjectaccessreview.ErrorNoImpersonationUserFound:
-			http.Error(rw, subjectaccessreview.ErrorNoImpersonationUserFound.Error(), http.StatusBadRequest)
-			return
-
 			// Server or unknown error
 		default:
-
-			var denied *subjectaccessreview.ImpersonationDeniedError
-			if errors.As(err, &denied) {
-				klog.V(2).Infof("%s (%s)", err, r.RemoteAddr)
-				http.Error(rw, err.Error(), http.StatusForbidden)
-			} else {
-				klog.Errorf("unknown error (%s): %s", r.RemoteAddr, err)
-				http.Error(rw, "", http.StatusInternalServerError)
-			}
-
+			klog.Errorf("unknown error (%s): %s", r.RemoteAddr, err)
+			http.Error(rw, "", http.StatusInternalServerError)
 		}
 	}
 }
 
+// hasImpersonation reports whether a request carries any header of the
+// Impersonate-* family, matched case insensitively. Any one of them, known to
+// Kubernetes or not, is a request to act as somebody else.
 func hasImpersonation(header http.Header) bool {
 	for h := range header {
-		if subjectaccessreview.IsImpersonationHeader(h) {
+		if isImpersonationHeader(h) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func isImpersonationHeader(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "impersonate-")
 }
