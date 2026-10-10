@@ -38,8 +38,8 @@ OpenUnison integrates kube-oidc-proxy directly, and includes an identity provide
 
 ## Tutorial
 
-Directions on how to deploy OIDC authentication with multi-cluster can be found
-[here.](./demo/README.md) or there is a [helm chart](./deploy/charts/kube-oidc-proxy/README.md).
+There is a [helm chart](./deploy/charts/kube-oidc-proxy/README.md) for deploying
+kube-oidc-proxy.
 
 ### Quickstart
 

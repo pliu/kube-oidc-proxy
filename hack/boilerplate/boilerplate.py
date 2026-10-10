@@ -142,7 +142,6 @@ skipped_dirs = [
     "hack",
     "pkg/mocks",
     "bin",
-    "demo/infrastructure",
 ]
 
 
