@@ -46,7 +46,8 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 				Containers: []corev1.Container{
 					{
 						Name:            "echoserver",
-						Image:           "gcr.io/google_containers/echoserver:1.10",
+						Image:           "registry.k8s.io/e2e-test-images/agnhost:2.53",
+						Args:            []string{"netexec", "--http-port=8080"},
 						ImagePullPolicy: corev1.PullIfNotPresent,
 					},
 				},
@@ -111,7 +112,7 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 			VersionedParams(&corev1.PodExecOptions{
 				Container: "echoserver",
 				Command: []string{
-					"curl", "127.0.0.1:8080", "-s", "-d", "hello world",
+					"curl", "-s", "127.0.0.1:8080/echo?msg=hello%20world",
 				},
 				Stdin:  false,
 				Stdout: true,
@@ -144,8 +145,8 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 		By(fmt.Sprintf("exec output %s/%s: %s", pod.Namespace, pod.Name, execOut.String()))
 
 		// should have correct stdout output from echo server
-		if !strings.Contains(execOut.String(), "Request Body:\nhello world") {
-			err := fmt.Errorf("got unexpected echoserver response: exp=Request Body:\\nhello world got=%s",
+		if !strings.Contains(execOut.String(), "hello world") {
+			err := fmt.Errorf("got unexpected echoserver response: exp=hello world got=%s",
 				execOut.String())
 			Expect(err).NotTo(HaveOccurred())
 		}
@@ -191,8 +192,6 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 
 			By("Attempting to curl through port forward")
 
-			portInR := bytes.NewReader([]byte("hello world"))
-
 			client := &http.Client{
 				Timeout: 10 * time.Second,
 				Transport: &http.Transport{
@@ -202,7 +201,7 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 
 			// send message through port forward
 			fmt.Println("Pre-post")
-			resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%s", freePort), "", portInR)
+			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/echo?msg=hello%%20world", freePort))
 			if err != nil {
 				errCh <- err
 				return
@@ -230,7 +229,7 @@ var _ = framework.CasesDescribe("Upgrade", func() {
 			}
 			fmt.Printf("check for data %s\n", string(body))
 			// should have correct output from echo server
-			if !bytes.Contains(body, []byte("Request Body:\nhello world")) {
+			if !bytes.Contains(body, []byte("hello world")) {
 				errCh <- fmt.Errorf("execOut.String())got unexpected echoserver response: exp=...hello world got=%s",
 					body)
 				return
