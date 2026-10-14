@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"go.uber.org/mock/gomock"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 
@@ -33,7 +32,6 @@ func TestImpersonationHeadersAreRefused(t *testing.T) {
 		for name, header := range headers {
 			t.Run(map[bool]string{false: "token groups/", true: "ldap groups/"}[ldap]+name, func(t *testing.T) {
 				p := newTestProxy(t)
-				defer p.ctrl.Finish()
 
 				augmenter := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 				if ldap {
@@ -45,7 +43,7 @@ func TestImpersonationHeadersAreRefused(t *testing.T) {
 					req.Header[k] = vs
 				}
 
-				p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(
+				p.fakeToken.expect("fake-token",
 					&authenticator.Response{User: &user.DefaultInfo{Name: "alice@example.net"}}, true, nil)
 
 				var proxied bool

@@ -11,7 +11,6 @@ import (
 	"sort"
 	"testing"
 
-	"go.uber.org/mock/gomock"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
@@ -58,7 +57,7 @@ func serveWithLDAP(t *testing.T, p *fakeProxy, req *http.Request, tokenUser user
 	t.Helper()
 
 	if tokenUser != nil {
-		p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(
+		p.fakeToken.expect("fake-token",
 			&authenticator.Response{User: tokenUser}, true, nil)
 	}
 
@@ -120,7 +119,6 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			p := newTestProxy(t)
-			defer p.ctrl.Finish()
 
 			p.ldapDirectory = &fakeAugmenter{mapping: test.mapping}
 
@@ -140,7 +138,6 @@ func TestAugmentedGroupsAreImpersonated(t *testing.T) {
 // With no directory configured the groups of the token must be used as before.
 func TestGroupsUnchangedWhenLDAPDisabled(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	p.fakeRT.expUser = "alice@example.net"
 	p.fakeRT.expGroup = []string{"from-token", user.AllAuthenticated}
@@ -165,7 +162,6 @@ func TestLDAPRefreshEndpointIsAStub(t *testing.T) {
 	for name, query := range tests {
 		t.Run(name, func(t *testing.T) {
 			p := newTestProxy(t)
-			defer p.ctrl.Finish()
 
 			directory := &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 			p.ldapDirectory = directory
@@ -218,7 +214,6 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			p := newTestProxy(t)
-			defer p.ctrl.Finish()
 
 			directory := &fakeAugmenter{refreshUsers: test.refreshUsers}
 			p.ldapDirectory = directory
@@ -242,7 +237,6 @@ func TestLDAPRefreshEndpointAllowedUsers(t *testing.T) {
 // not be able to trigger a refresh.
 func TestLDAPRefreshEndpointRequiresAuthentication(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	directory := &fakeAugmenter{}
 	p.ldapDirectory = directory
@@ -264,7 +258,6 @@ func TestLDAPRefreshEndpointRequiresAuthentication(t *testing.T) {
 
 func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	directory := &fakeAugmenter{}
 	p.ldapDirectory = directory
@@ -286,7 +279,6 @@ func TestLDAPRefreshEndpointRejectsGET(t *testing.T) {
 // that merely looks like it must still be proxied.
 func TestLDAPRefreshPathIsNotProxied(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 
@@ -305,7 +297,6 @@ func TestLDAPRefreshPathIsNotProxied(t *testing.T) {
 // Guard the assumption the fakeRT comparison relies on.
 func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	p.ldapDirectory = &fakeAugmenter{mapping: map[string][]string{"alice@example.net": {"admins"}}}
 
@@ -342,7 +333,6 @@ func TestAugmentGroupsPreservesIdentity(t *testing.T) {
 // directory is asked about it.
 func TestReservedUsernameIsRefusedBeforeLookup(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 
 	augmenter := &fakeAugmenter{mapping: map[string][]string{"system:admin": {"admins"}}}
 	p.ldapDirectory = augmenter
@@ -360,7 +350,6 @@ func TestReservedUsernameIsRefusedBeforeLookup(t *testing.T) {
 
 func TestLDAPResolutionFailureReturnsServiceUnavailable(t *testing.T) {
 	p := newTestProxy(t)
-	defer p.ctrl.Finish()
 	p.ldapDirectory = &fakeAugmenter{resolveErr: errors.New("persistence failed")}
 	response := serveWithLDAP(t, p, newLDAPRequest("/api/v1/pods", http.MethodGet), &user.DefaultInfo{Name: "alice", Groups: []string{"from-token"}})
 	if response.StatusCode != http.StatusServiceUnavailable {

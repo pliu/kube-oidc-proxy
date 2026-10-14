@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -16,7 +17,6 @@ import (
 	"strings"
 	"testing"
 
-	"go.uber.org/mock/gomock"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -24,17 +24,52 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
-	"github.com/jetstack/kube-oidc-proxy/pkg/mocks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
 )
 
 type fakeProxy struct {
-	ctrl *gomock.Controller
-
-	fakeToken *mocks.MockToken
+	fakeToken *fakeToken
 	fakeRT    *fakeRT
 	*Proxy
+}
+
+// fakeToken authenticates a single expected token with a canned response. A
+// call it does not expect, or an expected call that never comes, fails the test.
+type fakeToken struct {
+	t *testing.T
+
+	expected bool
+	token    string
+	resp     *authenticator.Response
+	pass     bool
+	err      error
+
+	calls int
+}
+
+func (f *fakeToken) expect(token string, resp *authenticator.Response, pass bool, err error) {
+	f.expected = true
+	f.token, f.resp, f.pass, f.err = token, resp, pass, err
+}
+
+func (f *fakeToken) AuthenticateToken(_ context.Context, token string) (*authenticator.Response, bool, error) {
+	f.calls++
+	switch {
+	case !f.expected:
+		f.t.Errorf("unexpected call to authenticate token %q", token)
+	case f.calls > 1:
+		f.t.Errorf("token authenticated %d times, expected once", f.calls)
+	case token != f.token:
+		f.t.Errorf("authenticated unexpected token, exp=%q got=%q", f.token, token)
+	}
+	return f.resp, f.pass, f.err
+}
+
+func (f *fakeToken) verify() {
+	if f.expected && f.calls == 0 {
+		f.t.Errorf("expected token %q to be authenticated, but it was not", f.token)
+	}
 }
 
 type fakeRW struct {
@@ -278,12 +313,11 @@ func TestHasImpersonation(t *testing.T) {
 }
 
 func newTestProxy(t *testing.T) *fakeProxy {
-	ctrl := gomock.NewController(t)
-	fakeToken := mocks.NewMockToken(ctrl)
+	fakeToken := &fakeToken{t: t}
+	t.Cleanup(fakeToken.verify)
 	fakeRT := &fakeRT{t: t}
 
 	p := &fakeProxy{
-		ctrl:      ctrl,
 		fakeToken: fakeToken,
 		fakeRT:    fakeRT,
 		Proxy: &Proxy{
@@ -530,8 +564,8 @@ func TestHandlers(t *testing.T) {
 		},
 
 		// Passthrough cases set no authResponse: the proxy must not try to
-		// authenticate the token, which gomock would report as an unexpected
-		// call.
+		// authenticate the token, which the fake token would report as an
+		// unexpected call.
 		"a passthrough request is forwarded as it is, with the caller's own token": {
 			req: &http.Request{
 				Header: http.Header{
@@ -577,7 +611,7 @@ func TestHandlers(t *testing.T) {
 			w := httptest.NewRecorder()
 
 			if test.authResponse != nil {
-				p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), test.expAuthToken).Return(
+				p.fakeToken.expect(test.expAuthToken,
 					test.authResponse.resp, test.authResponse.pass, test.authResponse.err)
 			}
 
@@ -623,7 +657,6 @@ func TestHandlers(t *testing.T) {
 					test.expCode, resp.StatusCode)
 			}
 
-			p.ctrl.Finish()
 		})
 	}
 }
@@ -705,7 +738,7 @@ func TestHeadersConfig(t *testing.T) {
 				},
 			}
 
-			p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(authResponse, true, nil)
+			p.fakeToken.expect("fake-token", authResponse, true, nil)
 
 			p.fakeRT.expUser = "a-user"
 			p.fakeRT.expGroup = []string{user.AllAuthenticated}
@@ -734,7 +767,6 @@ func TestHeadersConfig(t *testing.T) {
 				t.Errorf("authenticated identity was modified, exp extra=%v got=%v", exp, act)
 			}
 
-			p.ctrl.Finish()
 		})
 	}
 }
