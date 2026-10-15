@@ -4,6 +4,7 @@ package ldap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -150,7 +151,7 @@ func TestFailureOnPooledConnectionIsRetriedOnAFreshOne(t *testing.T) {
 
 func TestFailureOnFreshConnectionIsNotRetriedOrPooled(t *testing.T) {
 	first, second := newPoolConn(), newPoolConn()
-	first.searchErr = errors.New("insufficient access")
+	first.searchErr = goldap.NewError(goldap.ErrorNetwork, errors.New("connection reset by peer"))
 	p := newPooledBackend(t, 2, first, second)
 
 	if _, err := p.searchUser(context.Background(), "alice", false); err == nil {
@@ -166,6 +167,68 @@ func TestFailureOnFreshConnectionIsNotRetriedOrPooled(t *testing.T) {
 	p.lookup(t)
 	if p.dials.Load() != 2 {
 		t.Errorf("expected the failed connection not to be reused, got %d dials", p.dials.Load())
+	}
+}
+
+func TestLookupFailingOnSoundConnectionKeepsItPooled(t *testing.T) {
+	tests := map[string]func(c *poolConn) (undo func()){
+		"directory result code": func(c *poolConn) func() {
+			c.searchErr = goldap.NewError(goldap.LDAPResultInsufficientAccessRights, errors.New("insufficient access"))
+			return func() { c.searchErr = nil }
+		},
+		"lookup rejects what it found": func(c *poolConn) func() {
+			// A second entry holding alice's name makes her identity ambiguous.
+			users := c.entries["OU=Users,DC=example,DC=net"]
+			c.entries["OU=Users,DC=example,DC=net"] = append(users,
+				entry("CN=alice2,OU=Users,DC=example,DC=net", map[string][]string{"userPrincipalName": {"alice"}}))
+			return func() { c.entries["OU=Users,DC=example,DC=net"] = users }
+		},
+	}
+
+	for name, fail := range tests {
+		t.Run(name, func(t *testing.T) {
+			c, next := newPoolConn(), newPoolConn()
+			p := newPooledBackend(t, 2, c, next)
+			p.lookup(t)
+
+			undo := fail(c)
+			if _, err := p.searchUser(context.Background(), "alice", false); err == nil {
+				t.Fatal("expected the lookup to fail")
+			}
+			if p.dials.Load() != 1 {
+				t.Errorf("a failure on a sound connection was retried: %d dials", p.dials.Load())
+			}
+			if c.closes.Load() != 0 {
+				t.Errorf("sound connection was closed %d times", c.closes.Load())
+			}
+
+			undo()
+			p.lookup(t)
+			if p.dials.Load() != 1 {
+				t.Errorf("expected the sound connection to be reused, got %d dials", p.dials.Load())
+			}
+		})
+	}
+}
+
+func TestLeavesConnInDoubt(t *testing.T) {
+	tests := map[string]struct {
+		err error
+		exp bool
+	}{
+		"network error":        {goldap.NewError(goldap.ErrorNetwork, errors.New("ldap: connection closed")), true},
+		"unexpected response":  {goldap.NewError(goldap.ErrorUnexpectedResponse, errors.New("bad packet")), true},
+		"error from elsewhere": {errors.New("connection reset by peer"), true},
+		"wrapped result code":  {fmt.Errorf("search: %w", goldap.NewError(goldap.LDAPResultTimeLimitExceeded, errors.New("time limit"))), false},
+		"filter compile":       {goldap.NewError(goldap.ErrorFilterCompile, errors.New("bad filter")), false},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := leavesConnInDoubt(test.err); got != test.exp {
+				t.Errorf("expected %t, got %t", test.exp, got)
+			}
+		})
 	}
 }
 
@@ -391,7 +454,7 @@ func TestPoolCountsClosedConnectionsByReason(t *testing.T) {
 			return c
 		},
 		closedFailed: func(t *testing.T, p *pooledBackend, c *poolConn) *poolConn {
-			c.searchErr = errors.New("insufficient access")
+			c.searchErr = goldap.NewError(goldap.ErrorNetwork, errors.New("connection reset by peer"))
 			p.lookup(t) // retried on a fresh connection
 			return c
 		},

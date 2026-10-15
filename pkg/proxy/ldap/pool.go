@@ -81,7 +81,7 @@ func (p *connPool) get() *pooledConn {
 	return c
 }
 
-// put returns a connection that has just completed a lookup cleanly. It is
+// put returns a connection that a lookup has finished with and left sound. It is
 // closed instead when the pool is full or closed.
 func (p *connPool) put(c *pooledConn) {
 	p.mu.Lock()

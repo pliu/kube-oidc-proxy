@@ -65,9 +65,21 @@ them are kept idle per backend. Idle connections are checked every ten seconds
 and closed after a minute unused, which is below the idle timeouts of Active
 Directory and most load balancers, and after ten minutes open, so that a backend
 that failed over to a later URL returns to the first. The pool unbinds the
-connections it retires before closing them. A connection on which an operation
-failed or was canceled is closed outright rather than reused, and a lookup that
-fails on a pooled connection is retried once on a fresh one.
+connections it retires before closing them. A connection that failed during a
+lookup, or whose lookup was canceled, is closed outright rather than reused,
+and a lookup that a pooled connection failed under is retried once on a fresh
+one. A lookup that fails while its connection holds up, such as on a result
+code the directory answered with or a user found twice, is not retried, and its
+connection stays pooled.
+
+The bind DN is only checked when a connection is opened. Directories,
+including Active Directory and OpenLDAP, keep an established connection bound
+after its account is disabled or its password changed, so lookups keep working
+on pooled connections for up to ten minutes after the proxy's bind account is
+revoked, and fail only as those connections are replaced. Restart the proxy to
+cut off access at once. The bind password is likewise read once at startup, so
+a password rotated in `bindPasswordFile` takes effect only on restart; until
+then, new connections bind with the old one.
 
 LDAP must expose `memberOf`; Active Directory ranged attributes are followed.
 The proxy resolves direct memberships, without recursively expanding nested
@@ -264,7 +276,7 @@ Existing metrics now describe per-user work:
 | `kube_oidc_proxy_ldap_full_refresh_duration_seconds` | Duration of a refresh cycle that reached every cached user, including cycles in which some users failed. Cycles cut short by leadership loss or shutdown are not recorded. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend,trigger}` | Duration of a successful refresh of one user against one backend. `trigger` is `realtime` when a request from a user with no cached record waits on it, and `async` for the leader's refresh cycle. |
 | `kube_oidc_proxy_ldap_backend_connections_total{backend}` | Connections opened and bound to a backend. With connections pooled, it rises with lookups only when none is idle. |
-| `kube_oidc_proxy_ldap_backend_connections_closed_total{backend,reason}` | Connections to a backend closed. `reason` is `idle` or `lifetime` when the pool retired it, `closed_by_server` when the directory or something between had already closed it, `failed` when an operation on it failed, `canceled` when a lookup using it was canceled or timed out, `pool_full` when no idle slot was free, and `shutdown` when the proxy stopped. Subtracted from `backend_connections_total`, it gives the connections open. |
+| `kube_oidc_proxy_ldap_backend_connections_closed_total{backend,reason}` | Connections to a backend closed. `reason` is `idle` or `lifetime` when the pool retired it, `closed_by_server` when the directory or something between had already closed it, `failed` when the connection failed during a lookup, `canceled` when a lookup using it was canceled or timed out, `pool_full` when no idle slot was free, and `shutdown` when the proxy stopped. Subtracted from `backend_connections_total`, it gives the connections open. |
 | `kube_oidc_proxy_ldap_user_refresh_failures_total{source}` | Failed refreshes of one user. `source` is `ldap` when a backend failed or returned groups that cannot be cached, and `kubernetes` when reading or writing the cache ConfigMap failed. Lookups refused for lack of capacity and lookups cut short by shutdown are not counted. |
 
 Unit and race tests cover persistence-before-publication, empty/absent records,

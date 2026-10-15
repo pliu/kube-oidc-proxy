@@ -310,7 +310,7 @@ func TestHandshakeFailureClosesBeforeFailover(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			if err := d.backends[0].withConn(ctx, func(c conn) error {
-				if c != second {
+				if w, ok := c.(*watchedConn); !ok || w.conn != second {
 					t.Error("wrong failover connection")
 				}
 				return nil

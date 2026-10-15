@@ -48,7 +48,7 @@ var (
 	backendConnectionsClosed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "backend_connections_closed_total",
-		Help:      "Number of connections to an LDAP backend closed, by reason: idle or lifetime when the pool retired it, closed_by_server when the directory had already closed it, failed when an operation on it failed, canceled when a lookup was canceled or timed out while using it, pool_full when no idle slot was free, shutdown when the proxy stopped.",
+		Help:      "Number of connections to an LDAP backend closed, by reason: idle or lifetime when the pool retired it, closed_by_server when the directory had already closed it, failed when the connection failed during a lookup, canceled when a lookup was canceled or timed out while using it, pool_full when no idle slot was free, shutdown when the proxy stopped.",
 	}, []string{"backend", "reason"})
 
 	// userRefreshFailures counts users whose refresh failed, by what failed. A

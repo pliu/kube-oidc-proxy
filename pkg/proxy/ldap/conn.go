@@ -86,42 +86,79 @@ func (b *backend) timeLimit() int {
 // cancellation unblocks LDAP operations that have no context API.
 //
 // The directory may have dropped a pooled connection since it was last used,
-// so a failure on one is retried once on a fresh connection. fn only reads the
-// directory, so running it again is safe.
+// so a lookup the connection failed under is retried once on a fresh one. fn
+// only reads the directory, so running it again is safe. A lookup that failed
+// for any other reason, such as a result code the directory answered with, is
+// not retried: it would fail the same way again.
 func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
 	ctx, cancel := context.WithTimeout(ctx, b.config.Timeout.Duration())
 	defer cancel()
 
 	if c := b.pool.get(); c != nil {
-		err := b.use(ctx, c, fn)
-		if err == nil || ctx.Err() != nil {
+		broken, err := b.use(ctx, c, fn)
+		if !broken || ctx.Err() != nil {
 			return contextErr(ctx, err)
 		}
 	}
 
 	c, err := b.connect(ctx)
 	if err == nil {
-		err = b.use(ctx, c, fn)
+		_, err = b.use(ctx, c, fn)
 	}
 	return contextErr(ctx, err)
 }
 
-// use runs fn on c and returns c to the pool if fn succeeded. A connection
-// closed by cancellation, or one an operation failed on, is left closed: what
-// state an interrupted exchange left it in is unknown.
-func (b *backend) use(ctx context.Context, c *pooledConn, fn func(conn) error) error {
+// use runs fn on c, reporting whether c broke, and otherwise returns c to the
+// pool, whether fn succeeded or not. A connection closed by cancellation, or
+// one an operation failed on without an answer from the directory, is left
+// closed: what state an interrupted exchange left it in is unknown.
+func (b *backend) use(ctx context.Context, c *pooledConn, fn func(conn) error) (bool, error) {
+	watched := &watchedConn{conn: c.conn}
 	stop := context.AfterFunc(ctx, func() { b.pool.retire(c, closedCanceled) })
-	err := fn(c.conn)
+	err := fn(watched)
 	if !stop() {
 		// Cancellation has closed the connection.
-		return err
+		return true, err
 	}
-	if err != nil {
+	if watched.broken {
 		b.pool.retire(c, closedFailed)
-		return err
+		return true, err
 	}
 	b.pool.put(c)
-	return nil
+	return false, err
+}
+
+// watchedConn records whether a search on the connection failed in a way that
+// leaves the connection in doubt. A lookup can fail on a sound connection,
+// when the directory answers with a result code or the lookup rejects what it
+// found, and that connection is still fit to reuse.
+type watchedConn struct {
+	conn
+	broken bool
+}
+
+func (c *watchedConn) Search(req *goldap.SearchRequest) (*goldap.SearchResult, error) {
+	res, err := c.conn.Search(req)
+	if err != nil && leavesConnInDoubt(err) {
+		c.broken = true
+	}
+	return res, err
+}
+
+// leavesConnInDoubt reports whether err is a connection that failed, closed,
+// or carried a message go-ldap could not make sense of. Any other LDAP error
+// is a result code the directory answered with, or one of go-ldap's own, such
+// as a filter that does not compile, raised before anything was sent.
+func leavesConnInDoubt(err error) bool {
+	var ldapErr *goldap.Error
+	if !errors.As(err, &ldapErr) {
+		return true
+	}
+	switch ldapErr.ResultCode {
+	case goldap.ErrorNetwork, goldap.ErrorUnexpectedMessage, goldap.ErrorUnexpectedResponse:
+		return true
+	}
+	return false
 }
 
 // contextErr reports a canceled or expired context in place of the error it
