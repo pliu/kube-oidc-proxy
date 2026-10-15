@@ -58,6 +58,17 @@ are stripped from the file. Passwords and CA files are loaded at startup.
 | `caFile` | System roots | PEM certificate bundle. |
 | `insecureSkipTLSVerify` | `false` | Disable TLS verification for testing. |
 
+Bound connections are pooled per backend and reused across lookups and refresh
+cycles, so most lookups skip the dial, TLS handshake and bind. A connection
+serves one lookup at a time; up to `lookupConcurrency` + `refreshConcurrency` of
+them are kept idle per backend. Idle connections are checked every ten seconds
+and closed after a minute unused, which is below the idle timeouts of Active
+Directory and most load balancers, and after ten minutes open, so that a backend
+that failed over to a later URL returns to the first. The pool unbinds the
+connections it retires before closing them. A connection on which an operation
+failed or was canceled is closed outright rather than reused, and a lookup that
+fails on a pooled connection is retried once on a fresh one.
+
 LDAP must expose `memberOf`; Active Directory ranged attributes are followed.
 The proxy resolves direct memberships, without recursively expanding nested
 groups. Only groups under configured search bases and matching the group filter
@@ -179,7 +190,7 @@ as a miss would look them up, and the cost of a cycle grows with the number of
 cached users times the number of groups each holds. For every user and backend,
 a cycle currently makes:
 
-- a new connection and bind, as connections are not reused;
+- a pooled connection, so a new connection and bind only when none is idle;
 - one user search per user search base;
 - for each `memberOf` group under a group search base, one search to read the
   group and one search per group search base to check its name is unique. These
@@ -190,7 +201,6 @@ a cycle currently makes:
 This still needs to be batched before refreshes scale to large user
 populations. The planned improvements are:
 
-- Reuse one bound connection per backend for the whole cycle.
 - Resolve each group, and check its name is unique, once per backend per cycle
   rather than once per user.
 - For directories whose `memberOf` holds only direct memberships, such as
@@ -253,6 +263,8 @@ Existing metrics now describe per-user work:
 | `kube_oidc_proxy_ldap_last_refresh_success` | Last cached-user cycle succeeded for all users. |
 | `kube_oidc_proxy_ldap_full_refresh_duration_seconds` | Duration of a refresh cycle that reached every cached user, including cycles in which some users failed. Cycles cut short by leadership loss or shutdown are not recorded. |
 | `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend,trigger}` | Duration of a successful refresh of one user against one backend. `trigger` is `realtime` when a request from a user with no cached record waits on it, and `async` for the leader's refresh cycle. |
+| `kube_oidc_proxy_ldap_backend_connections_total{backend}` | Connections opened and bound to a backend. With connections pooled, it rises with lookups only when none is idle. |
+| `kube_oidc_proxy_ldap_backend_connections_closed_total{backend,reason}` | Connections to a backend closed. `reason` is `idle` or `lifetime` when the pool retired it, `closed_by_server` when the directory or something between had already closed it, `failed` when an operation on it failed, `canceled` when a lookup using it was canceled or timed out, `pool_full` when no idle slot was free, and `shutdown` when the proxy stopped. Subtracted from `backend_connections_total`, it gives the connections open. |
 | `kube_oidc_proxy_ldap_user_refresh_failures_total{source}` | Failed refreshes of one user. `source` is `ldap` when a backend failed or returned groups that cannot be cached, and `kubernetes` when reading or writing the cache ConfigMap failed. Lookups refused for lack of capacity and lookups cut short by shutdown are not counted. |
 
 Unit and race tests cover persistence-before-publication, empty/absent records,

@@ -35,6 +35,22 @@ var (
 		Buckets:   backendRefreshBuckets,
 	}, []string{"backend", "trigger"})
 
+	// backendConnections counts the connections bound to each backend. With
+	// connections pooled, it rises with lookups only when they cannot reuse one.
+	backendConnections = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "backend_connections_total",
+		Help:      "Number of connections opened and bound to an LDAP backend.",
+	}, []string{"backend"})
+
+	// backendConnectionsClosed counts the connections counted by
+	// backendConnections as they close, so the difference is how many are open.
+	backendConnectionsClosed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "backend_connections_closed_total",
+		Help:      "Number of connections to an LDAP backend closed, by reason: idle or lifetime when the pool retired it, closed_by_server when the directory had already closed it, failed when an operation on it failed, canceled when a lookup was canceled or timed out while using it, pool_full when no idle slot was free, shutdown when the proxy stopped.",
+	}, []string{"backend", "reason"})
+
 	// userRefreshFailures counts users whose refresh failed, by what failed. A
 	// lookup refused for lack of capacity never started, and one cut short by
 	// the replica shutting down did not fail, so neither is counted.
@@ -51,6 +67,17 @@ const (
 	failureKubernetes = "kubernetes"
 )
 
+// Values of the reason label of backendConnectionsClosed.
+const (
+	closedIdle     = "idle"
+	closedLifetime = "lifetime"
+	closedByServer = "closed_by_server"
+	closedFailed   = "failed"
+	closedCanceled = "canceled"
+	closedPoolFull = "pool_full"
+	closedShutdown = "shutdown"
+)
+
 // Values of the trigger label of backendRefreshDuration.
 const (
 	triggerRealtime = "realtime"
@@ -63,7 +90,7 @@ var fullRefreshBuckets = prometheus.ExponentialBuckets(0.1, 2, 12)
 
 // backendRefreshBuckets run from 1ms to about 33s. Looking one user up in one
 // backend takes milliseconds against a nearby directory, connection and bind
-// included, and seconds only when the directory is distant or struggling.
+// included when no pooled connection is free, and seconds only when the directory is distant or struggling.
 var backendRefreshBuckets = prometheus.ExponentialBuckets(0.001, 2, 16)
 
 // registerMetrics publishes the metrics on first use, so that a proxy running
@@ -72,5 +99,5 @@ var backendRefreshBuckets = prometheus.ExponentialBuckets(0.001, 2, 16)
 // constructing multiple resolvers in one process from panicking.
 var registerMetrics = sync.OnceFunc(func() {
 	prometheus.MustRegister(lastRefreshSuccess, fullRefreshDuration,
-		backendRefreshDuration, userRefreshFailures)
+		backendRefreshDuration, backendConnections, backendConnectionsClosed, userRefreshFailures)
 })

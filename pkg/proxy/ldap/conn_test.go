@@ -4,14 +4,154 @@ package ldap
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	ber "github.com/go-asn1-ber/asn1-ber"
 	goldap "github.com/go-ldap/ldap/v3"
 )
+
+func TestCancellationClosesBlockedLDAPWrite(t *testing.T) {
+	for _, stage := range []string{"bind", "search", "starttls"} {
+		for _, cause := range []string{"cancel", "timeout"} {
+			t.Run(stage+"/"+cause, func(t *testing.T) {
+				client, server := net.Pipe()
+				defer server.Close()
+				ldapConn := goldap.NewConn(client, false)
+				ldapConn.Start()
+				c := &socketConn{Conn: ldapConn, socket: client}
+				defer c.Close()
+				config := testConfig()
+				config.Backends[0].URLs = []string{"ldap://ldap.example.net:389"}
+				config.Backends[0].StartTLS = stage == "starttls"
+				if stage == "search" {
+					config.Backends[0].BindDN = ""
+					config.Backends[0].BindPassword = ""
+				}
+				config.Backends[0].Timeout = NewDuration(time.Second)
+				d := newTestResolver(t, config, c)
+				ctx, cancel := context.WithCancel(context.Background())
+				expected := context.Canceled
+				if cause == "timeout" {
+					ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+					expected = context.DeadlineExceeded
+				}
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { _, err := d.searchUser(ctx, "alice", false); done <- err }()
+				// Read one byte so a real request is being written, then stop
+				// reading to model a peer with a full receive window.
+				server.SetReadDeadline(time.Now().Add(time.Second))
+				if _, err := server.Read(make([]byte, 1)); err != nil {
+					t.Fatal(err)
+				}
+				if cause == "cancel" {
+					cancel()
+				}
+				select {
+				case err := <-done:
+					if !errors.Is(err, expected) {
+						t.Fatalf("expected %v, got %v", expected, err)
+					}
+				case <-time.After(time.Second):
+					// Release the write before cleanup if the regression returns.
+					server.Close()
+					t.Fatal("cancellation did not interrupt blocked write")
+				}
+			})
+		}
+	}
+}
+
+func newPipeConn(t *testing.T) (*socketConn, net.Conn) {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() { server.Close() })
+	ldapConn := goldap.NewConn(client, false)
+	ldapConn.Start()
+	c := &socketConn{Conn: ldapConn, socket: client}
+	t.Cleanup(func() { c.Close() })
+	return c, server
+}
+
+func TestRetireUnbindsBeforeClosing(t *testing.T) {
+	c, server := newPipeConn(t)
+	done := make(chan struct{})
+	go func() { c.retire(); close(done) }()
+
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	packet, err := ber.ReadPacket(server)
+	if err != nil {
+		t.Fatalf("expected an unbind request, got %v", err)
+	}
+	if len(packet.Children) < 2 || packet.Children[1].Tag != goldap.ApplicationUnbindRequest {
+		t.Fatalf("expected an unbind request, got %s", goldap.ApplicationMap[uint8(packet.Children[1].Tag)])
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retire did not return after unbinding")
+	}
+	if _, err := server.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("expected the connection to be closed after the unbind, got %v", err)
+	}
+	if !c.IsClosing() {
+		t.Error("expected the retired connection to be closing")
+	}
+}
+
+func TestRetireGivesUpOnPeerThatStoppedReading(t *testing.T) {
+	defer func(timeout time.Duration) { retireTimeout = timeout }(retireTimeout)
+	retireTimeout = 50 * time.Millisecond
+
+	c, _ := newPipeConn(t)
+	done := make(chan struct{})
+	go func() { c.retire(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retire blocked on a peer that is not reading")
+	}
+}
+
+func TestDialLDAPSVerifiesCertificates(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	for _, tc := range []struct {
+		name    string
+		config  *tls.Config
+		wantErr bool
+	}{
+		{"trusted", &tls.Config{RootCAs: roots}, false},
+		{"untrusted", &tls.Config{}, true},
+		{"wrong hostname", &tls.Config{RootCAs: roots, ServerName: "wrong.example.net"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &backend{config: testConfig().Backends[0], tlsConfig: tc.config}
+			b.config.Timeout = NewDuration(time.Second)
+			c, err := b.dialLDAP(strings.Replace(server.URL, "https://", "ldaps://", 1))
+			if c != nil {
+				defer c.Close()
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected dial result: %v", err)
+			}
+		})
+	}
+}
 
 // stalledConn models LDAP calls that only unblock when their connection closes.
 type stalledConn struct {

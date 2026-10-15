@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +14,14 @@ import (
 
 	goldap "github.com/go-ldap/ldap/v3"
 )
+
+// TestMain turns connection pooling off, since most tests stand in for a
+// lookup by replacing a backend's dial. The pool's own tests give their
+// backends a pool to use.
+func TestMain(m *testing.M) {
+	poolConnections = false
+	os.Exit(m.Run())
+}
 
 type fakeConn struct {
 	// entries maps a search base to the entries returned for it.
@@ -326,12 +335,12 @@ func TestConnectFailsOverBetweenURLs(t *testing.T) {
 		return c, nil
 	}
 
-	got, cleanup, err := d.backends[0].connect(context.Background())
+	got, err := d.backends[0].connect(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
-	defer cleanup()
-	if got != conn(c) {
+	defer got.Close()
+	if got.conn != conn(c) {
 		t.Error("expected the second URL to be used")
 	}
 	if !reflect.DeepEqual(dialled, config.Backends[0].URLs) {
@@ -347,11 +356,11 @@ func TestConnectSetsTheStartTLSServerName(t *testing.T) {
 	c := &fakeConn{}
 	d := newTestResolver(t, config, c)
 
-	_, cleanup, err := d.backends[0].connect(context.Background())
+	got, err := d.backends[0].connect(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error connecting: %s", err)
 	}
-	defer cleanup()
+	defer got.Close()
 
 	if c.startTLSConfig == nil {
 		t.Fatal("expected StartTLS to be called")

@@ -26,16 +26,46 @@ type conn interface {
 	Close() error
 }
 
-// closeOnCancel keeps connection cleanup active through bind and search. The
-// returned cleanup stops cancellation handling and closes the connection once,
-// even if cancellation and normal completion race.
-func closeOnCancel(ctx context.Context, c conn) func() {
-	closeConn := sync.OnceFunc(func() { _ = c.Close() })
-	stop := context.AfterFunc(ctx, closeConn)
-	return func() {
-		stop()
-		closeConn()
-	}
+// retireTimeout bounds unbinding a connection the pool retires. A variable
+// so that tests need not wait it out.
+var retireTimeout = 5 * time.Second
+
+// socketConn interrupts network I/O before asking go-ldap to stop its message
+// processor. go-ldap's Close waits for that processor, which can itself be
+// blocked writing to the socket.
+type socketConn struct {
+	*goldap.Conn
+	socket net.Conn
+	once   sync.Once
+	err    error
+}
+
+func (c *socketConn) Close() error {
+	c.once.Do(func() {
+		c.err = c.socket.Close()
+		_ = c.Conn.Close()
+	})
+	return c.err
+}
+
+// retire ends a healthy idle connection as a client should: an LDAP unbind,
+// then TLS close_notify on an LDAPS or StartTLS connection. The deadline
+// bounds both, in case the directory has stopped reading. Close is the way to
+// end a connection something may be blocked on. It returns within about twice
+// retireTimeout, and runs in the background.
+func (c *socketConn) retire() {
+	c.once.Do(func() {
+		_ = c.socket.SetDeadline(time.Now().Add(retireTimeout))
+		// go-ldap never finishes an unbind request, so when writing one fails
+		// its message processor waits on a reader that is not there, and Close
+		// waits on the processor. A request timeout bounds both waits.
+		c.Conn.SetTimeout(retireTimeout)
+		// Unbind closes the connection once it has sent the request, and
+		// leaves it open if it could not.
+		_ = c.Conn.Unbind()
+		_ = c.Conn.Close()
+		c.err = c.socket.Close()
+	})
 }
 
 // timeLimit is the timeout as the seconds a search request carries, so that a
@@ -51,16 +81,52 @@ func (b *backend) timeLimit() int {
 	return seconds
 }
 
-// withConn applies one deadline to dialing, binding, and searching. Closing the
-// connection on cancellation unblocks LDAP operations that have no context API.
+// withConn applies one deadline to dialing, binding, and searching, running fn
+// on a pooled connection when there is one. Closing the connection on
+// cancellation unblocks LDAP operations that have no context API.
+//
+// The directory may have dropped a pooled connection since it was last used,
+// so a failure on one is retried once on a fresh connection. fn only reads the
+// directory, so running it again is safe.
 func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
 	ctx, cancel := context.WithTimeout(ctx, b.config.Timeout.Duration())
 	defer cancel()
-	c, cleanup, err := b.connect(ctx)
-	if err == nil {
-		defer cleanup()
-		err = fn(c)
+
+	if c := b.pool.get(); c != nil {
+		err := b.use(ctx, c, fn)
+		if err == nil || ctx.Err() != nil {
+			return contextErr(ctx, err)
+		}
 	}
+
+	c, err := b.connect(ctx)
+	if err == nil {
+		err = b.use(ctx, c, fn)
+	}
+	return contextErr(ctx, err)
+}
+
+// use runs fn on c and returns c to the pool if fn succeeded. A connection
+// closed by cancellation, or one an operation failed on, is left closed: what
+// state an interrupted exchange left it in is unknown.
+func (b *backend) use(ctx context.Context, c *pooledConn, fn func(conn) error) error {
+	stop := context.AfterFunc(ctx, func() { b.pool.retire(c, closedCanceled) })
+	err := fn(c.conn)
+	if !stop() {
+		// Cancellation has closed the connection.
+		return err
+	}
+	if err != nil {
+		b.pool.retire(c, closedFailed)
+		return err
+	}
+	b.pool.put(c)
+	return nil
+}
+
+// contextErr reports a canceled or expired context in place of the error it
+// caused, such as that of an operation on the connection it closed.
+func contextErr(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -72,13 +138,15 @@ func (b *backend) withConn(ctx context.Context, fn func(conn) error) error {
 //
 // Each connection is closed on cancellation as soon as it exists, since a
 // directory that accepts the connection and then never answers the bind hangs
-// just as thoroughly as one that never answers a search.
-func (b *backend) connect(ctx context.Context) (conn, func(), error) {
+// just as thoroughly as one that never answers a search. The connection
+// returned is no longer tied to ctx, so that it can outlive this lookup in the
+// pool.
+func (b *backend) connect(ctx context.Context) (*pooledConn, error) {
 	var errs []string
 
 	for _, rawURL := range b.config.URLs {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		c, err := b.dialURL(ctx, rawURL)
 		if err != nil {
@@ -86,22 +154,23 @@ func (b *backend) connect(ctx context.Context) (conn, func(), error) {
 			continue
 		}
 
-		cleanup := closeOnCancel(ctx, c)
-		if err := ctx.Err(); err != nil {
-			cleanup()
-			return nil, nil, err
+		closeConn := sync.OnceFunc(func() { _ = c.Close() })
+		stop := context.AfterFunc(ctx, closeConn)
+		fail := func() {
+			stop()
+			closeConn()
 		}
 
 		if b.config.StartTLS {
 			tlsConfig, err := tlsConfigForURL(b.tlsConfig, rawURL)
 			if err != nil {
-				cleanup()
+				fail()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS setup failed: %s", rawURL, err))
 				continue
 			}
 
 			if err := c.StartTLS(tlsConfig); err != nil {
-				cleanup()
+				fail()
 				errs = append(errs, fmt.Sprintf("%s: StartTLS failed: %s", rawURL, err))
 				continue
 			}
@@ -110,18 +179,24 @@ func (b *backend) connect(ctx context.Context) (conn, func(), error) {
 		// An empty bind DN leaves the connection anonymous.
 		if b.config.BindDN != "" {
 			if err := c.Bind(b.config.BindDN, b.bindPassword); err != nil {
-				cleanup()
+				fail()
 				errs = append(errs, fmt.Sprintf("%s: bind failed: %s", rawURL, err))
 				continue
 			}
 		}
 
-		return c, cleanup, nil
+		if !stop() {
+			// Cancellation has closed the connection.
+			return nil, ctx.Err()
+		}
+		backendConnections.WithLabelValues(b.config.Name).Inc()
+		now := b.pool.now()
+		return &pooledConn{conn: c, opened: now, used: now}, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return nil, nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
+	return nil, fmt.Errorf("unable to connect to any server [%s]", strings.Join(errs, ", "))
 }
 
 // tlsConfigForURL gives a StartTLS handshake the server name it cannot infer
@@ -150,7 +225,54 @@ func (b *backend) dialLDAP(rawURL string) (conn, error) {
 	// default of 60s, which no configuration can move.
 	dialer := &net.Dialer{Timeout: b.config.Timeout.Duration()}
 
-	return goldap.DialURL(rawURL, goldap.DialWithTLSConfig(b.tlsConfig), goldap.DialWithDialer(dialer))
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, goldap.NewError(goldap.ErrorNetwork, err)
+	}
+	network, address := "tcp", ""
+	port := u.Port()
+	switch u.Scheme {
+	case "ldap", "ldaps", "cldap":
+		if port == "" {
+			port = goldap.DefaultLdapPort
+			if u.Scheme == "ldaps" {
+				port = goldap.DefaultLdapsPort
+			}
+		}
+		address = net.JoinHostPort(u.Hostname(), port)
+		if u.Scheme == "cldap" {
+			network = "udp"
+		}
+	case "ldapi":
+		network, address = "unix", u.Path
+		if address == "" || address == "/" {
+			address = "/var/run/slapd/ldapi"
+		}
+	default:
+		return nil, goldap.NewError(goldap.ErrorNetwork, fmt.Errorf("unknown scheme %q", u.Scheme))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.config.Timeout.Duration())
+	defer cancel()
+	socket, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, goldap.NewError(goldap.ErrorNetwork, err)
+	}
+	var transport net.Conn = socket
+	if u.Scheme == "ldaps" {
+		config := b.tlsConfig.Clone()
+		if config.ServerName == "" {
+			config.ServerName = u.Hostname()
+		}
+		tlsConn := tls.Client(socket, config)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = socket.Close()
+			return nil, goldap.NewError(goldap.ErrorNetwork, err)
+		}
+		transport = tlsConn
+	}
+	c := goldap.NewConn(transport, u.Scheme == "ldaps")
+	c.Start()
+	return &socketConn{Conn: c, socket: socket}, nil
 }
 
 func tlsConfigFor(config *BackendConfig) (*tls.Config, error) {

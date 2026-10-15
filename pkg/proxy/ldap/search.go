@@ -134,6 +134,10 @@ func (b *backend) searchUser(ctx context.Context, username string) ([]string, er
 	var claimedBy string
 
 	err := b.withConn(ctx, func(c conn) error {
+		// withConn runs this again on a fresh connection when a pooled one
+		// fails, so nothing found on the first attempt may carry over.
+		groups, claimedBy = nil, ""
+
 		// The username is a value from an authenticated request, so it reaches the
 		// filter escaped: a name carrying parentheses or an asterisk must not be
 		// able to widen the search it appears in.

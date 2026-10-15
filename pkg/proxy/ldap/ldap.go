@@ -38,6 +38,9 @@ type backend struct {
 	// before querying LDAP for their emitted names.
 	groupBaseKeys []string
 
+	// pool holds the bound connections idle between lookups.
+	pool *connPool
+
 	dial func(url string) (conn, error)
 }
 
@@ -57,7 +60,13 @@ func newResolver(config *Config) (*resolver, error) {
 
 	backends := make([]*backend, 0, len(config.Backends))
 	for _, backendConfig := range config.Backends {
-		b, err := newBackend(backendConfig)
+		// Every lookup and refresh in flight can hold a connection to each
+		// backend, and each can return it to be reused.
+		poolSize := config.LookupConcurrency + config.RefreshConcurrency
+		if !poolConnections {
+			poolSize = 0
+		}
+		b, err := newBackend(backendConfig, poolSize)
 		if err != nil {
 			return nil, err
 		}
@@ -83,7 +92,7 @@ func newResolver(config *Config) (*resolver, error) {
 // newBackend prepares a backend to be searched. The configuration has already
 // been validated by newResolver, so all that is left is the work that can fail against
 // the filesystem: the trust bundle and the bind password.
-func newBackend(config *BackendConfig) (*backend, error) {
+func newBackend(config *BackendConfig, poolSize int) (*backend, error) {
 	tlsConfig, err := tlsConfigFor(config)
 	if err != nil {
 		return nil, err
@@ -98,6 +107,7 @@ func newBackend(config *BackendConfig) (*backend, error) {
 		config:       config,
 		tlsConfig:    tlsConfig,
 		bindPassword: bindPassword,
+		pool:         newConnPool(config.Name, poolSize),
 	}
 	b.dial = b.dialLDAP
 
@@ -115,6 +125,13 @@ func newBackend(config *BackendConfig) (*backend, error) {
 	}
 
 	return b, nil
+}
+
+// close closes the connections idle in every backend's pool.
+func (d *resolver) close() {
+	for _, b := range d.backends {
+		b.pool.close()
+	}
 }
 
 // CanRefresh reports whether the given user is allowed to trigger a refresh.

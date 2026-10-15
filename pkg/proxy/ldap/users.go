@@ -53,6 +53,9 @@ func NewUserDirectory(config *Config, store cache.UserStore, leadership func() c
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// Lookups still running return their connections to a closed pool, which
+	// closes them.
+	context.AfterFunc(ctx, resolver.close)
 	return &UserDirectory{leadership: leadership, resolver: resolver, store: store, users: make(map[string]userCell), calls: make(map[string]*userCall), ctx: ctx, cancel: cancel}, nil
 }
 

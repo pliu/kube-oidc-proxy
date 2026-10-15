@@ -47,6 +47,7 @@ type options struct {
 	namespace                    string
 	tokenConcurrency             int
 	coldConcurrency              int
+	coldQPS                      float64
 	warmConcurrency              int
 	warmRequests                 int
 	refreshTimeout               time.Duration
@@ -59,6 +60,8 @@ const (
 	userRefreshMetric = "kube_oidc_proxy_ldap_backend_refresh_duration_seconds"
 	fullRefreshMetric = "kube_oidc_proxy_ldap_full_refresh_duration_seconds"
 	failuresMetric    = "kube_oidc_proxy_ldap_user_refresh_failures_total"
+	connectionsMetric = "kube_oidc_proxy_ldap_backend_connections_total"
+	closedMetric      = "kube_oidc_proxy_ldap_backend_connections_closed_total"
 	requestsMetric    = "kube_oidc_proxy_requests_total"
 )
 
@@ -78,7 +81,8 @@ func main() {
 	flag.StringVar(&o.metricsURL, "metrics-url", "", "kube-oidc-proxy metrics URL")
 	flag.StringVar(&o.namespace, "namespace", "", "namespace whose pods are listed")
 	flag.IntVar(&o.tokenConcurrency, "token-concurrency", 8, "concurrent Keycloak logins")
-	flag.IntVar(&o.coldConcurrency, "cold-concurrency", 4, "concurrent first requests; keep at or below the proxy's lookupConcurrency")
+	flag.IntVar(&o.coldConcurrency, "cold-concurrency", 8, "most first requests in flight; keep at or below the proxy's lookupConcurrency")
+	flag.Float64Var(&o.coldQPS, "cold-qps", 20, "most first requests started per second; they start at least 1/qps apart")
 	flag.IntVar(&o.warmConcurrency, "warm-concurrency", 8, "concurrent cached and direct requests")
 	flag.IntVar(&o.warmRequests, "warm-requests", 5000, "cached and direct requests sent")
 	flag.DurationVar(&o.refreshTimeout, "refresh-timeout", 20*time.Minute, "how long to wait for the leader's refresh")
@@ -130,8 +134,8 @@ func run(ctx context.Context, o options) error {
 		return err
 	}
 
-	logf("sending each user's first request, %d at a time", o.coldConcurrency)
-	cold, err := load(ctx, client, o.proxyURL+podsPath, o.coldConcurrency, len(users), func(i int) string { return tokens[users[i]] })
+	logf("sending each user's first request, at most %g a second and %d at a time", o.coldQPS, o.coldConcurrency)
+	cold, err := load(ctx, client, o.proxyURL+podsPath, o.coldConcurrency, o.coldQPS, len(users), func(i int) string { return tokens[users[i]] })
 	if err != nil {
 		return fmt.Errorf("first requests: %w", err)
 	}
@@ -162,7 +166,7 @@ func run(ctx context.Context, o options) error {
 		return err
 	}
 	logf("sending %d requests from cached users, %d at a time", o.warmRequests, o.warmConcurrency)
-	warm, err := load(ctx, client, o.proxyURL+podsPath, o.warmConcurrency, len(picks), func(i int) string { return tokens[picks[i]] })
+	warm, err := load(ctx, client, o.proxyURL+podsPath, o.warmConcurrency, 0, len(picks), func(i int) string { return tokens[picks[i]] })
 	if err != nil {
 		return fmt.Errorf("cached requests: %w", err)
 	}
@@ -185,6 +189,13 @@ func run(ctx context.Context, o options) error {
 		"kubernetes": warmAfter.counter(failuresMetric, map[string]string{"source": "kubernetes"}),
 	}
 	r.codes = warmAfter.counters(requestsMetric, "code")
+	connections := func(m *metrics) float64 { return m.counter(connectionsMetric, nil) }
+	r.connections = [3]float64{
+		connections(afterCold) - connections(before),
+		connections(warmBefore) - connections(afterCold),
+		connections(warmAfter),
+	}
+	r.closed = warmAfter.counters(closedMetric, "reason")
 
 	r.print(os.Stdout)
 
@@ -200,7 +211,7 @@ func login(ctx context.Context, client *http.Client, o options, users []string) 
 	times := make([]time.Duration, len(users))
 	var mu sync.Mutex
 
-	err := parallel(o.tokenConcurrency, len(users), func(i int) error {
+	err := parallel(o.tokenConcurrency, 0, len(users), func(i int) error {
 		form := url.Values{
 			"grant_type": {"password"},
 			"client_id":  {o.clientID},
@@ -248,11 +259,16 @@ func login(ctx context.Context, client *http.Client, o options, users []string) 
 	return tokens, times, err
 }
 
-// load sends n GETs of target, concurrency at a time, with the token of each,
-// and requires every one to succeed.
-func load(ctx context.Context, client *http.Client, target string, concurrency, n int, token func(int) string) ([]time.Duration, error) {
+// load sends n GETs of target, concurrency at a time and, when qps is
+// positive, starting them at least 1/qps apart, with the token of each, and
+// requires every one to succeed.
+func load(ctx context.Context, client *http.Client, target string, concurrency int, qps float64, n int, token func(int) string) ([]time.Duration, error) {
+	var interval time.Duration
+	if qps > 0 {
+		interval = time.Duration(float64(time.Second) / qps)
+	}
 	times := make([]time.Duration, n)
-	err := parallel(concurrency, n, func(i int) error {
+	err := parallel(concurrency, interval, n, func(i int) error {
 		code, took, err := get(ctx, client, target, token(i))
 		if err != nil {
 			return err
@@ -278,7 +294,7 @@ func loadDirect(ctx context.Context, path string, concurrency, n int) ([]time.Du
 		return nil, err
 	}
 	client := &http.Client{Transport: rt, Timeout: time.Minute}
-	return load(ctx, client, config.Host+path, concurrency, n, func(int) string { return "" })
+	return load(ctx, client, config.Host+path, concurrency, 0, n, func(int) string { return "" })
 }
 
 func get(ctx context.Context, client *http.Client, target, token string) (int, time.Duration, error) {
@@ -299,7 +315,9 @@ func get(ctx context.Context, client *http.Client, target, token string) (int, t
 	return resp.StatusCode, time.Since(start), nil
 }
 
-func parallel(concurrency, n int, fn func(int) error) error {
+// parallel runs fn for 0 to n-1, concurrency at a time, starting each at least
+// interval after the one before.
+func parallel(concurrency int, interval time.Duration, n int, fn func(int) error) error {
 	jobs := make(chan int)
 	errs := make(chan error, n)
 	var wg sync.WaitGroup
@@ -312,8 +330,11 @@ func parallel(concurrency, n int, fn func(int) error) error {
 			}
 		})
 	}
+	var next time.Time
 	for i := range n {
+		time.Sleep(time.Until(next))
 		jobs <- i
+		next = time.Now().Add(interval)
 	}
 	close(jobs)
 	wg.Wait()
@@ -503,6 +524,11 @@ type report struct {
 	rows     []row
 	failures map[string]float64
 	codes    map[string]float64
+	// connections are the LDAP connections the proxy opened during the first
+	// requests, then until the refresh was measured, and in all.
+	connections [3]float64
+	// closed are the LDAP connections the proxy closed, by reason.
+	closed map[string]float64
 }
 
 func (r *report) add(phase, source string, samples []time.Duration) {
@@ -542,8 +568,8 @@ func (r *report) print(out io.Writer) {
 	fmt.Fprintf(out, "%d directory users, %d groups, %d groups per user; one proxy replica, one OpenLDAP backend over LDAPS\n",
 		r.users, r.groups, r.groupsPerUser)
 	fmt.Fprintf(out, "proxy Kubernetes client: %s\n", r.proxyKubeClient)
-	fmt.Fprintf(out, "first requests %d at a time; cached and direct requests: %d, %d at a time\n\n",
-		r.coldConcurrency, r.warmRequests, r.warmConcurrency)
+	fmt.Fprintf(out, "first requests at most %g a second, %d at a time; cached and direct requests: %d, %d at a time\n\n",
+		r.coldQPS, r.coldConcurrency, r.warmRequests, r.warmConcurrency)
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, "phase\tmeasured\tn\tmean\tp50\tp90\tp99\tmax\t")
@@ -563,6 +589,14 @@ func (r *report) print(out io.Writer) {
 	fmt.Fprintln(out, "\n* from the proxy's histograms: percentiles are interpolated within buckets, so are estimates")
 	fmt.Fprintln(out, "  proxy overhead is the time from a request reaching the proxy to its being forwarded")
 	fmt.Fprintf(out, "user refresh failures: ldap=%v kubernetes=%v\n", r.failures["ldap"], r.failures["kubernetes"])
+	fmt.Fprintf(out, "LDAP connections opened: first requests=%v, through the refresh=%v, in all=%v\n",
+		r.connections[0], r.connections[1], r.connections[2])
+	closed := make([]string, 0, len(r.closed))
+	for reason, n := range r.closed {
+		closed = append(closed, fmt.Sprintf("%s=%v", reason, n))
+	}
+	sort.Strings(closed)
+	fmt.Fprintf(out, "LDAP connections closed: %s\n", strings.Join(closed, " "))
 	codes := make([]string, 0, len(r.codes))
 	for code, n := range r.codes {
 		codes = append(codes, fmt.Sprintf("%s=%v", code, n))
