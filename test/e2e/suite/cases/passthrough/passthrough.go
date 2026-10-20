@@ -113,14 +113,9 @@ var _ = framework.CasesDescribe("Passthrough", func() {
 		}
 	})
 
-	It("should not error on a valid OIDC token nor a valid ServiceAccount token with passthrough enabled", func() {
-		By("Enabling passthrough with Audience of the API Server")
+	It("should leave authentication to the API server with passthrough enabled", func() {
+		By("Enabling passthrough")
 		f.DeployProxyWith(nil, "--token-passthrough")
-
-		By("A valid OIDC token should respond without error")
-		proxyClient := f.NewProxyClient()
-		_, err := proxyClient.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
-		Expect(err).NotTo(HaveOccurred())
 
 		By("Using a ServiceAccount token should not error")
 
@@ -132,5 +127,22 @@ var _ = framework.CasesDescribe("Passthrough", func() {
 
 		_, err = kubeProxyClient.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
 		Expect(err).NotTo(HaveOccurred())
+
+		// The proxy no longer authenticates anything, so the OIDC token goes
+		// to the API server as it is - and the API server, which does not
+		// trust the e2e issuer, rejects it.
+		By("A valid OIDC token should be rejected by the API server")
+		proxyClient := f.NewProxyClient()
+		_, err = proxyClient.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
+		Expect(err).To(HaveOccurred())
+
+		kErr, ok := err.(*k8sErrors.StatusError)
+		Expect(ok).To(BeTrue(), "expected a status error, got %v", err)
+		Expect(kErr.ErrStatus.Code).To(BeEquivalentTo(http.StatusUnauthorized))
+
+		// The proxy answers with a plain text body, which client-go reports
+		// with a message of its own. Only the API server answers with a Status
+		// of its own.
+		Expect(kErr.ErrStatus.Message).To(Equal("Unauthorized"))
 	})
 })

@@ -2,18 +2,23 @@
 package app
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
+	"github.com/jetstack/kube-oidc-proxy/pkg/leader"
 	"github.com/jetstack/kube-oidc-proxy/pkg/probe"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"github.com/jetstack/kube-oidc-proxy/pkg/util"
 )
 
@@ -67,15 +72,6 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				restConfig.QPS = opts.Client.KubeClientQPS
 			}
 
-			// Initialise token reviewer if enabled
-			var tokenReviewer *tokenreview.TokenReview
-			if opts.App.TokenPassthrough.Enabled {
-				tokenReviewer, err = tokenreview.New(restConfig, opts.App.TokenPassthrough.Audiences)
-				if err != nil {
-					return err
-				}
-			}
-
 			// Initialise Secure Serving Config
 			secureServingInfo := new(server.SecureServingInfo)
 			if err := opts.SecureServing.ApplyTo(&secureServingInfo); err != nil {
@@ -83,8 +79,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			}
 
 			proxyConfig := &proxy.Config{
-				TokenReview:          opts.App.TokenPassthrough.Enabled,
-				DisableImpersonation: opts.App.DisableImpersonation,
+				TokenPassthrough: opts.App.TokenPassthrough.Enabled,
 
 				FlushInterval:   opts.App.FlushInterval,
 				ExternalAddress: opts.SecureServing.BindAddress.String(),
@@ -93,36 +88,89 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				ExtraUserHeadersClientIPEnabled: opts.App.ExtraHeaderOptions.EnableClientIPExtraUserHeader,
 			}
 
-			// Setup Subject Access Review
+			// Client for leader election and the LDAP cache.
 			kubeclient, err := kubernetes.NewForConfig(restConfig)
 			if err != nil {
 				return err
 			}
 
-			subectAccessReviewer, err := subjectaccessreview.New(kubeclient.AuthorizationV1().SubjectAccessReviews())
+			// Elect one replica leader. Every replica serves requests
+			// whether or not it leads.
+			namespace, err := util.NamespaceOrInCluster(opts.LeaderElection.ResourceNamespace)
+			if err != nil {
+				return fmt.Errorf("no --leader-elect-resource-namespace set: %w", err)
+			}
 
+			elector, err := leader.New(kubeclient, leader.Config{
+				Namespace:     namespace,
+				Name:          opts.LeaderElection.ResourceName,
+				LeaseDuration: opts.LeaderElection.LeaseDuration.Duration,
+				RenewDeadline: opts.LeaderElection.RenewDeadline.Duration,
+				RetryPeriod:   opts.LeaderElection.RetryPeriod.Duration,
+			})
 			if err != nil {
 				return err
+			}
+
+			// Set up the LDAP backends that the groups of a request are
+			// augmented from, if configured. Left nil when they are not, so
+			// that the proxy keeps taking groups from the token.
+			var ldapDirectory proxy.GroupAugmenter
+			var ldapReadiness []probe.NamedCheck
+			if opts.LDAP.Enabled() {
+				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
+				if err != nil {
+					return err
+				}
+
+				ldapConfig, err := opts.LDAP.Config(usernamePrefix)
+				if err != nil {
+					return err
+				}
+
+				cacheNamespace, err := util.NamespaceOrInCluster(ldapConfig.Cache.Namespace)
+				if err != nil {
+					return err
+				}
+				ldapCache, err := cache.NewConfigMaps(kubeclient, cacheNamespace, ldapConfig.UserRecordFingerprint())
+				if err != nil {
+					return err
+				}
+				// Only the leader refreshes cached users periodically.
+				directory, err := ldap.NewUserDirectory(ldapConfig, ldapCache, elector.LeadershipContext)
+				if err != nil {
+					return err
+				}
+
+				ldapDirectory = directory
+
+				// Readiness requires initial ConfigMap synchronization, even when empty.
+				ldapReadiness = append(ldapReadiness, probe.NamedCheck{
+					Name: "ldap cache synchronization",
+					Check: func() error {
+						if !directory.HasSynced() {
+							return errors.New("LDAP cache initial synchronization is incomplete")
+						}
+
+						return nil
+					},
+				})
+			}
+
+			if opts.App.TokenPassthrough.Enabled && opts.OIDCAuthentication.ConfigFile != "" {
+				klog.Infof("ignoring --oidc-config-file: with --token-passthrough the API server authenticates every request")
 			}
 
 			// Initialise proxy with OIDC token authenticator
-			p, err := proxy.New(restConfig, opts.OIDCAuthentication, opts.Audit,
-				tokenReviewer, subectAccessReviewer, secureServingInfo, proxyConfig)
+			p, err := proxy.New(wait.ContextForChannel(stopCh), restConfig, opts.OIDCAuthentication,
+				opts.Audit, ldapDirectory, secureServingInfo, proxyConfig)
 			if err != nil {
 				return err
 			}
 
-			// Create a fake JWT to set up readiness probe
-			fakeJWT, err := util.FakeJWT(opts.OIDCAuthentication.IssuerURL)
-			if err != nil {
-				return err
-			}
-
-			// Start readiness probe
-			if err := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
-				fakeJWT, p.OIDCTokenAuthenticator()); err != nil {
-				return err
-			}
+			// Stay unready until the secure listener is accepting.
+			ready := probe.Run(strconv.Itoa(opts.App.ReadinessProbePort),
+				p.OIDCHealthCheck, ldapReadiness...)
 
 			// Run proxy
 			waitCh, listenerStoppedCh, err := p.Run(stopCh)
@@ -130,12 +178,21 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 				return err
 			}
 
+			// Serve has started accepting requests; allow Service traffic.
+			ready.MarkServing()
+
+			// Contended for only once serving, so that a replica that fails
+			// to start never holds the Lease.
+			electionDone := elector.Run(stopCh)
+
 			<-waitCh
 			<-listenerStoppedCh
 
-			if err := p.RunPreShutdownHooks(); err != nil {
-				return err
-			}
+			// Waited on so that the Lease is released before the process
+			// exits, and the next leader can take over at once.
+			<-electionDone
+
+			p.Shutdown()
 
 			return nil
 		},

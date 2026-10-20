@@ -23,6 +23,8 @@ type Options struct {
 	Audit              *AuditOptions
 	Client             *ClientOptions
 	Misc               *MiscOptions
+	LDAP               *LDAPOptions
+	LeaderElection     *LeaderElectionOptions
 
 	nfs *cliflag.NamedFlagSets
 }
@@ -38,6 +40,8 @@ func New() *Options {
 		Audit:              NewAuditOptions(nfs),
 		Client:             NewClientOptions(nfs),
 		Misc:               NewMiscOptions(nfs),
+		LDAP:               NewLDAPOptions(nfs),
+		LeaderElection:     NewLeaderElectionOptions(nfs),
 
 		nfs: nfs,
 	}
@@ -71,8 +75,13 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 
 	var errs []error
 
-	if err := o.OIDCAuthentication.Validate(); err != nil {
-		errs = append(errs, err)
+	// Passthrough leaves authentication to the API server, so it needs no
+	// issuers. A file given anyway is ignored rather than refused: it changes
+	// nothing about what a request may do.
+	if !o.App.TokenPassthrough.Enabled {
+		if err := o.OIDCAuthentication.Validate(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if err := o.SecureServing.Validate(); len(err) > 0 {
@@ -80,16 +89,38 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 	}
 
 	if o.SecureServing.BindPort == o.App.ReadinessProbePort {
-		errs = append(errs, errors.New("unable to securely serve on port 8080 (used by readiness probe)"))
+		errs = append(errs, fmt.Errorf("unable to securely serve on port %d (used by readiness probe)", o.App.ReadinessProbePort))
 	}
 
 	if err := o.Audit.Validate(); len(err) > 0 {
 		errs = append(errs, err...)
 	}
 
-	if o.App.DisableImpersonation &&
+	if err := o.LDAP.Validate(); len(err) > 0 {
+		errs = append(errs, err...)
+	}
+
+	if err := o.LeaderElection.Validate(); len(err) > 0 {
+		errs = append(errs, err...)
+	}
+
+	if o.LDAP.Enabled() {
+		if _, err := o.OIDCAuthentication.SharedUsernamePrefix(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Passthrough forwards requests as they are, so neither the groups of the
+	// directory nor extra user headers would ever reach the API server.
+	// Refused, so that a configuration asking for them is not quietly served
+	// without them.
+	if o.App.TokenPassthrough.Enabled && o.LDAP.Enabled() {
+		errs = append(errs, errors.New("--token-passthrough cannot be used with --ldap-config-file"))
+	}
+
+	if o.App.TokenPassthrough.Enabled &&
 		(o.App.ExtraHeaderOptions.EnableClientIPExtraUserHeader || len(o.App.ExtraHeaderOptions.ExtraUserHeaders) > 0) {
-		errs = append(errs, errors.New("cannot add extra user headers when impersonation disabled"))
+		errs = append(errs, errors.New("--token-passthrough cannot be used with extra user headers"))
 	}
 
 	if len(errs) > 0 {

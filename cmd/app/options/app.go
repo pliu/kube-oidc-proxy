@@ -11,8 +11,7 @@ import (
 )
 
 type KubeOIDCProxyOptions struct {
-	DisableImpersonation bool
-	ReadinessProbePort   int
+	ReadinessProbePort int
 
 	FlushInterval time.Duration
 
@@ -21,8 +20,7 @@ type KubeOIDCProxyOptions struct {
 }
 
 type TokenPassthroughOptions struct {
-	Audiences []string
-	Enabled   bool
+	Enabled bool
 }
 
 type ExtraHeaderOptions struct {
@@ -36,10 +34,6 @@ func NewKubeOIDCProxyOptions(nfs *cliflag.NamedFlagSets) *KubeOIDCProxyOptions {
 }
 
 func (k *KubeOIDCProxyOptions) AddFlags(fs *pflag.FlagSet) *KubeOIDCProxyOptions {
-	fs.BoolVar(&k.DisableImpersonation, "disable-impersonation", k.DisableImpersonation,
-		"(Alpha) Disable the impersonation of authenticated requests. All "+
-			"authenticated requests will be forwarded as is.")
-
 	fs.IntVarP(&k.ReadinessProbePort, "readiness-probe-port", "P", 8080,
 		"Port to expose readiness probe.")
 
@@ -56,17 +50,12 @@ func (k *KubeOIDCProxyOptions) AddFlags(fs *pflag.FlagSet) *KubeOIDCProxyOptions
 }
 
 func (t *TokenPassthroughOptions) AddFlags(fs *pflag.FlagSet) {
-	fs.StringSliceVar(&t.Audiences, "token-passthrough-audiences", t.Audiences, ""+
-		"(Alpha) List of the identifiers that the resource server presented with the token "+
-		"identifies as. The resource server will verify that non OIDC tokens are intended "+
-		"for at least one of the audiences in this list. If no audiences are "+
-		"provided, the audience will default to the audience of the Kubernetes "+
-		"apiserver. Only used when --token-passthrough is also enabled.")
-
 	fs.BoolVar(&t.Enabled, "token-passthrough", t.Enabled, ""+
-		"(Alpha) Requests with Bearer tokens that fail OIDC validation are tried against "+
-		"the API server using the Token Review endpoint. If successful, the request "+
-		"is sent on as is, with no impersonation.")
+		"(Alpha) Forward every request to the API server as it is, with the "+
+		"caller's own bearer token and without impersonation, so that the API "+
+		"server authenticates and authorizes it. The proxy does not authenticate "+
+		"the token itself, and cannot be combined with --ldap-config-file or extra "+
+		"user headers. Requests without a bearer token are refused.")
 }
 
 func (e *ExtraHeaderOptions) AddFlags(fs *pflag.FlagSet) {

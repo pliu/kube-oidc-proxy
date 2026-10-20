@@ -20,6 +20,12 @@ const (
 	IssuerImageName        = "oidc-issuer-e2e"
 	FakeAPIServerImageName = "fake-apiserver-e2e"
 	AuditWebhookImageName  = "audit-webhook-e2e"
+	OpenLDAPImageName      = "openldap-e2e"
+	LDAPLoadgenImageName   = "ldap-loadgen-e2e"
+
+	// KeycloakImage is pulled by the host and loaded into the nodes, so that a
+	// run does not depend on the nodes reaching the registry.
+	KeycloakImage = "quay.io/keycloak/keycloak:26.3.5"
 )
 
 func (k *Kind) LoadAllImages() error {
@@ -39,11 +45,29 @@ func (k *Kind) LoadAllImages() error {
 		return err
 	}
 
+	if err := k.LoadOpenLDAP(); err != nil {
+		return err
+	}
+
+	if err := k.LoadLDAPLoadgen(); err != nil {
+		return err
+	}
+
+	if err := k.LoadKeycloak(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (k *Kind) LoadKubeOIDCProxy() error {
-	binPath := filepath.Join(k.rootPath, "./bin/kube-oidc-proxy")
+	arch, err := k.nodeArch()
+	if err != nil {
+		return err
+	}
+
+	// The Dockerfile copies the binary of the architecture it is built for.
+	binPath := filepath.Join(k.rootPath, "./bin", arch, "kube-oidc-proxy")
 	mainPath := filepath.Join(k.rootPath, "./cmd/.")
 
 	return k.loadImage(binPath, mainPath, ProxyImageName, k.rootPath)
@@ -73,6 +97,36 @@ func (k *Kind) LoadAuditWebhook() error {
 	return k.loadImage(binPath, mainPath, AuditWebhookImageName, dockerfilePath)
 }
 
+func (k *Kind) LoadOpenLDAP() error {
+	if err := k.runCmd("docker", "build", "-t", OpenLDAPImageName,
+		filepath.Join(k.rootPath, "./test/tools/openldap")); err != nil {
+		return err
+	}
+
+	return k.loadDockerImage(OpenLDAPImageName)
+}
+
+func (k *Kind) LoadLDAPLoadgen() error {
+	binPath := filepath.Join(k.rootPath, "./test/tools/ldap-loadgen/bin/ldap-loadgen")
+	dockerfilePath := filepath.Join(k.rootPath, "./test/tools/ldap-loadgen")
+	mainPath := filepath.Join(dockerfilePath, "cmd")
+
+	return k.loadImage(binPath, mainPath, LDAPLoadgenImageName, dockerfilePath)
+}
+
+func (k *Kind) LoadKeycloak() error {
+	arch, err := k.nodeArch()
+	if err != nil {
+		return err
+	}
+
+	if err := k.runCmd("docker", "pull", "--platform=linux/"+arch, KeycloakImage); err != nil {
+		return err
+	}
+
+	return k.loadDockerImage(KeycloakImage)
+}
+
 func (k *Kind) loadImage(binPath, mainPath, image, dockerfilePath string) error {
 	log.Infof("kind: building %q", mainPath)
 
@@ -90,16 +144,28 @@ func (k *Kind) loadImage(binPath, mainPath, image, dockerfilePath string) error 
 		return err
 	}
 
+	return k.loadDockerImage(image)
+}
+
+// loadDockerImage copies an image from the host's Docker into every node.
+func (k *Kind) loadDockerImage(image string) error {
 	tmpDir, err := ioutil.TempDir(os.TempDir(), "kube-oidc-proxy-e2e")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	imageArchive := filepath.Join(tmpDir, fmt.Sprintf("%s-e2e.tar", image))
-	log.Infof("kind: saving image to archive %q", imageArchive)
+	imageArchive := filepath.Join(tmpDir, "image.tar")
+	log.Infof("kind: saving image %q to archive %q", image, imageArchive)
 
-	err = k.runCmd("docker", "save", "--output="+imageArchive, image)
+	arch, err := k.nodeArch()
+	if err != nil {
+		return err
+	}
+
+	// Only the nodes' platform: a pulled multi-platform image is not held
+	// locally for the others.
+	err = k.runCmd("docker", "save", "--platform=linux/"+arch, "--output="+imageArchive, image)
 	if err != nil {
 		return err
 	}
@@ -131,20 +197,41 @@ func (k *Kind) loadImage(binPath, mainPath, image, dockerfilePath string) error 
 	return nil
 }
 
+// nodeArch returns the architecture of the Docker daemon, which runs the kind
+// nodes, so that binaries are built for the nodes rather than for the host
+// the tests happen to run on.
+func (k *Kind) nodeArch() (string, error) {
+	if k.arch != "" {
+		return k.arch, nil
+	}
+
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Arch}}").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the docker server architecture: %s", err)
+	}
+
+	k.arch = strings.TrimSpace(string(out))
+	return k.arch, nil
+}
+
 func (k *Kind) runCmd(command string, args ...string) error {
 	return k.runCmdWithOut(os.Stdout, command, args...)
 }
 
 func (k *Kind) runCmdWithOut(w io.Writer, command string, args ...string) error {
+	arch, err := k.nodeArch()
+	if err != nil {
+		return err
+	}
+
 	log.Infof("kind: running command '%s %s'", command, strings.Join(args, " "))
 	cmd := exec.Command(command, args...)
 
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = w
-	cmd.Env = append(cmd.Env,
-		"GO111MODULE=on", "CGO_ENABLED=0", "HOME="+os.Getenv("HOME"),
-		"PATH="+os.Getenv("PATH"),
-		"GOARCH=amd64", "GOOS=linux")
+	cmd.Env = append(os.Environ(),
+		"GO111MODULE=on", "CGO_ENABLED=0",
+		"GOARCH="+arch, "GOOS=linux")
 
 	if err := cmd.Start(); err != nil {
 		return err

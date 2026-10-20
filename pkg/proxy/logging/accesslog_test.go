@@ -66,3 +66,31 @@ func TestXForwardedFor(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteHost(t *testing.T) {
+	tests := map[string]string{
+		"1.2.3.4:5678":      "1.2.3.4",
+		"[::1]:5678":        "::1",
+		"[2001:db8::1]:443": "2001:db8::1",
+		"1.2.3.4":           "1.2.3.4",
+		"fakeAddr":          "fakeAddr",
+		"":                  "",
+	}
+
+	for addr, exp := range tests {
+		if got := remoteHost(addr); got != exp {
+			t.Errorf("remoteHost(%q) = %q, exp %q", addr, got, exp)
+		}
+	}
+}
+
+func TestQuotedExtraIsInKeyOrder(t *testing.T) {
+	extra := map[string][]string{"scopes": {"a", "b"}, "acr": {"1"}, "org": {"x"}}
+	exp := `"acr"="1" "org"="x" "scopes"="a|b" `
+
+	for i := 0; i < 20; i++ {
+		if got := quotedExtra(extra); got != exp {
+			t.Fatalf("got %s, exp %s", got, exp)
+		}
+	}
+}

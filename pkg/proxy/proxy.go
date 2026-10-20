@@ -2,47 +2,46 @@
 package proxy
 
 import (
-	ctx "context"
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
-	"k8s.io/apiserver/pkg/apis/apiserver"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
+	"k8s.io/apiserver/pkg/authentication/token/union"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
-	"k8s.io/klog/v2"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/tokenreview"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/reqctx"
 )
 
 const (
 	UserHeaderClientIPKey = "Remote-Client-IP"
-	timestampLayout       = "2006-01-02T15:04:05-0700"
 )
 
 var (
-	errUnauthorized          = errors.New("Unauthorized")
-	errNoName                = errors.New("No name in OIDC info")
-	errNoImpersonationConfig = errors.New("No impersonation configuration in context")
+	errUnauthorized          = errors.New("unauthorized")
+	errNoName                = errors.New("no name in OIDC info")
+	errNoImpersonationConfig = errors.New("no impersonation configuration in context")
 )
 
 type Config struct {
-	DisableImpersonation bool
-	TokenReview          bool
+	// TokenPassthrough forwards every request as it is, with the caller's own
+	// token and no impersonation, leaving authentication to the API server.
+	TokenPassthrough bool
 
 	FlushInterval   time.Duration
 	ExternalAddress string
@@ -54,76 +53,59 @@ type Config struct {
 type errorHandlerFn func(http.ResponseWriter, *http.Request, error)
 
 type Proxy struct {
-	oidcRequestAuther     *bearertoken.Authenticator
-	tokenAuther           authenticator.Token
-	tokenReviewer         *tokenreview.TokenReview
-	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview
-	secureServingInfo     *server.SecureServingInfo
-	auditor               *audit.Audit
+	oidcRequestAuther *bearertoken.Authenticator
+	oidcHealthChecks  []func() error
+	secureServingInfo *server.SecureServingInfo
+	auditor           *audit.Audit
 
-	restConfig            *rest.Config
-	clientTransport       http.RoundTripper
-	noAuthClientTransport http.RoundTripper
+	// ldapDirectory is nil unless LDAP group augmentation is enabled.
+	ldapDirectory GroupAugmenter
+
+	restConfig *rest.Config
+	// transport carries requests to the API server: with the proxy's own
+	// credentials, or with none under token passthrough.
+	transport http.RoundTripper
 
 	config *Config
 
-	hooks       *hooks.Hooks
 	handleError errorHandlerFn
 }
 
-// implement oidc.CAContentProvider to load
-// the ca file from the options
-type CAFromFile struct {
-	CAFile string
+// caBundle implements oidc.CAContentProvider over the CA bundle an issuer is
+// configured with.
+type caBundle []byte
+
+func (c caBundle) CurrentCABundleContent() []byte {
+	return c
 }
 
-func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
-	res, _ := ioutil.ReadFile(caFromFile.CAFile)
-	return res
-}
-
-func New(restConfig *rest.Config,
+// New builds a proxy. ctx bounds the work the OIDC authenticators do in the
+// background, such as fetching issuer keys, and should end when the proxy stops.
+func New(ctx context.Context,
+	restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
-	tokenReviewer *tokenreview.TokenReview,
-	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
+	ldapDirectory GroupAugmenter,
 	ssinfo *server.SecureServingInfo,
 	config *Config) (*Proxy, error) {
 
-	// load the CA from the file listed in the options
-	caFromFile := CAFromFile{
-		CAFile: oidcOptions.CAFile,
+	p := &Proxy{
+		restConfig:        restConfig,
+		secureServingInfo: ssinfo,
+		config:            config,
+		ldapDirectory:     ldapDirectory,
 	}
 
-	// setup static JWT Auhenticator
-	jwtConfig := apiserver.JWTAuthenticator{
-		Issuer: apiserver.Issuer{
-			URL:                  oidcOptions.IssuerURL,
-			Audiences:            []string{oidcOptions.ClientID},
-			CertificateAuthority: string(caFromFile.CurrentCABundleContent()),
-		},
+	// Passthrough leaves authentication to the API server, so it trusts no
+	// issuers of its own and has none to wait on.
+	if !config.TokenPassthrough {
+		tokenAuther, healthChecks, err := newTokenAuthenticator(ctx, oidcOptions)
+		if err != nil {
+			return nil, err
+		}
 
-		ClaimMappings: apiserver.ClaimMappings{
-			Username: apiserver.PrefixedClaimOrExpression{
-				Claim:  oidcOptions.UsernameClaim,
-				Prefix: &oidcOptions.UsernamePrefix,
-			},
-			Groups: apiserver.PrefixedClaimOrExpression{
-				Claim:  oidcOptions.GroupsClaim,
-				Prefix: &oidcOptions.GroupsPrefix,
-			},
-		},
-	}
-
-	// generate tokenAuther from oidc config
-	tokenAuther, err := oidc.New(ctx.TODO(), oidc.Options{
-		CAContentProvider: caFromFile,
-		//RequiredClaims:       oidcOptions.RequiredClaims,
-		SupportedSigningAlgs: oidcOptions.SigningAlgs,
-		JWTAuthenticator:     jwtConfig,
-	})
-	if err != nil {
-		return nil, err
+		p.oidcRequestAuther = bearertoken.New(tokenAuther)
+		p.oidcHealthChecks = healthChecks
 	}
 
 	auditor, err := audit.New(auditOptions, config.ExternalAddress, ssinfo)
@@ -131,44 +113,85 @@ func New(restConfig *rest.Config,
 		return nil, err
 	}
 
-	return &Proxy{
-		restConfig:            restConfig,
-		hooks:                 hooks.New(),
-		tokenReviewer:         tokenReviewer,
-		subjectAccessReviewer: subjectAccessReviewer,
-		secureServingInfo:     ssinfo,
-		config:                config,
-		oidcRequestAuther:     bearertoken.New(tokenAuther),
-		tokenAuther:           tokenAuther,
-		auditor:               auditor,
-	}, nil
+	p.auditor = auditor
+
+	registerMetrics()
+
+	return p, nil
 }
 
-func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
-	// standard round tripper for proxy to API Server
-	clientRT, err := p.roundTripperForRestConfig(p.restConfig)
+// newTokenAuthenticator builds one authenticator per trusted issuer. Each only
+// answers for tokens whose iss is its own, so the union accepts a token from
+// any of them.
+func newTokenAuthenticator(ctx context.Context, oidcOptions *options.OIDCAuthenticationOptions) (authenticator.Token, []func() error, error) {
+	issuers, err := oidcOptions.Issuers()
 	if err != nil {
 		return nil, nil, err
 	}
-	p.clientTransport = clientRT
 
-	// No auth round tripper for no impersonation
-	if p.config.DisableImpersonation || p.config.TokenReview {
-		noAuthClientRT, err := p.roundTripperForRestConfig(&rest.Config{
+	var (
+		tokenAuthers []authenticator.Token
+		healthChecks []func() error
+	)
+	for _, issuer := range issuers {
+		jwtAuthenticator := issuer.JWTAuthenticator
+
+		// Without a CA of its own, the issuer is verified against the host's
+		// root CA set.
+		var caProvider oidc.CAContentProvider
+		if len(jwtAuthenticator.Issuer.CertificateAuthority) > 0 {
+			caProvider = caBundle(jwtAuthenticator.Issuer.CertificateAuthority)
+		}
+
+		opts := oidc.Options{
+			CAContentProvider:    caProvider,
+			SupportedSigningAlgs: issuer.SigningAlgs,
+			JWTAuthenticator:     jwtAuthenticator,
+		}
+
+		// An issuer with its keys configured is never asked for them, so it
+		// is ready at once and need not be reachable.
+		if len(issuer.PublicKeys) > 0 {
+			opts.KeySet = newStaticKeySet(issuer.PublicKeys, issuer.SigningAlgs)
+		}
+
+		tokenAuther, err := oidc.New(ctx, opts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("issuer %q: %w", jwtAuthenticator.Issuer.URL, err)
+		}
+
+		tokenAuthers = append(tokenAuthers, tokenAuther)
+		healthChecks = append(healthChecks, tokenAuther.HealthCheck)
+	}
+
+	return union.New(tokenAuthers...), healthChecks, nil
+}
+
+func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
+	// Carries the proxy's own credentials, which impersonate the user.
+	transportConfig := p.restConfig
+	if p.config.TokenPassthrough {
+		// Carries the caller's own token and nothing of the proxy's, so the
+		// API server authenticates the caller.
+		transportConfig = &rest.Config{
 			APIPath: p.restConfig.APIPath,
 			Host:    p.restConfig.Host,
 			Timeout: p.restConfig.Timeout,
 			TLSClientConfig: rest.TLSClientConfig{
-				CAFile: p.restConfig.CAFile,
-				CAData: p.restConfig.CAData,
+				Insecure:   p.restConfig.Insecure,
+				ServerName: p.restConfig.ServerName,
+				CAFile:     p.restConfig.CAFile,
+				CAData:     p.restConfig.CAData,
 			},
-		})
-		if err != nil {
-			return nil, nil, err
 		}
-
-		p.noAuthClientTransport = noAuthClientRT
 	}
+
+	rt, err := roundTripperForRestConfig(transportConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	p.transport = rt
 
 	// get API server url
 	url, err := url.Parse(p.restConfig.Host)
@@ -201,6 +224,14 @@ func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan stru
 		return nil, nil, err
 	}
 
+	// Restore and watch persisted user records before serving requests.
+	// An empty cache is valid; LDAP lookups happen on authenticated misses.
+	if p.ldapDirectory != nil {
+		if err := p.ldapDirectory.Run(stopCh); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// securely serve using serving config
 	waitCh, listenerStoppedCh, err := p.secureServingInfo.Serve(handler, time.Second*60, stopCh)
 	if err != nil {
@@ -215,56 +246,71 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Here we have successfully authenticated so now need to determine whether
 	// we need use impersonation or not.
 
-	// If no impersonation then we return here without setting impersonation
-	// header but re-introduce the token we removed.
-	if context.NoImpersonation(req) {
-		token := context.BearerToken(req)
-		req.Header.Add("Authorization", token)
-		return p.noAuthClientTransport.RoundTrip(req)
+	// A passthrough request is forwarded as it arrived, with the caller's own
+	// token, which the proxy never removed since it never authenticated it.
+	if p.config.TokenPassthrough {
+		observeOverhead(req)
+		return p.transport.RoundTrip(req)
 	}
 
 	// Get the impersonation headers from the context.
-	impersonationConf := context.ImpersonationConfig(req)
+	impersonationConf := reqctx.ImpersonationConfig(req)
 	if impersonationConf == nil {
 		return nil, errNoImpersonationConfig
 	}
 
+	// Forwarded with the proxy's own credentials, which may impersonate
+	// anyone, so nothing the client sent may speak for its identity.
+	// withImpersonateRequest refuses Impersonate- headers and authentication
+	// removes the token, but both transports below pass a request through
+	// untouched if it already carries one: the impersonating transport keeps
+	// any Impersonate-User it finds, with whatever groups came alongside, and
+	// the bearer transport keeps any Authorization. Removed here as well, so
+	// that the request can only ever run as the identity built for it.
+	//
+	// Matched case insensitively and deleted from the map directly: Del
+	// canonicalizes the name it is given, so would leave a key that is not
+	// canonical in place, and the API server canonicalizes it again on arrival.
+	req = utilnet.CloneRequest(req)
+	for name := range req.Header {
+		if isImpersonationHeader(name) || strings.EqualFold(name, "Authorization") {
+			delete(req.Header, name)
+		}
+	}
+
 	// Set up impersonation request.
-	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.clientTransport)
+	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.transport)
 
 	// Log the request
-	logging.LogSuccessfulRequest(req, *impersonationConf.InboundUser, *impersonationConf.ImpersonatedUser)
+	logging.LogSuccessfulRequest(req, impersonationConf.InboundUser)
 
 	// Push request through round trippers to the API server.
+	observeOverhead(req)
 	return rt.RoundTrip(req)
 }
 
-func (p *Proxy) reviewToken(rw http.ResponseWriter, req *http.Request) bool {
-	var remoteAddr string
-	req, remoteAddr = context.RemoteAddr(req)
+// maxIdleConnsPerHost is how many spare connections to the API server are kept
+// warm. Every request this proxy forwards goes to the one host, so the whole
+// process shares a single pool and the per-host limit is the only one that
+// really applies. Go's default of two would mean all but two connections being
+// closed the moment they go idle and dialled again, TLS handshake and all, for
+// the next request that needs one.
+const maxIdleConnsPerHost = 100
 
-	klog.V(4).Infof("attempting to validate a token in request using TokenReview endpoint(%s)",
-		remoteAddr)
-
-	ok, err := p.tokenReviewer.Review(req)
-	if err != nil {
-		klog.Errorf("unable to authenticate the request via TokenReview due to an error (%s): %s",
-			remoteAddr, err)
-		return false
-	}
-
-	if !ok {
-		klog.V(4).Infof("passing request with valid token through (%s)",
-			remoteAddr)
-
-		return false
-	}
-
-	// No error and ok so passthrough the request
-	return true
-}
-
-func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
+// transportForRestConfig builds the transport that carries proxied requests to
+// the API server.
+//
+// HTTP/2 must stay off. Exec, attach and port forward are HTTP/1.1 protocol
+// upgrades, and Go's HTTP/2 transport cannot carry an upgrade, so negotiating
+// h2 with the API server would break them outright. This is said explicitly,
+// with an empty TLSNextProto, rather than left to fall out of the transport
+// having its own TLSClientConfig: rest.TLSConfigFor returns nil for a rest
+// config that asked for no TLS settings at all, and a nil TLSClientConfig is
+// one of the things that has Go turn HTTP/2 on by itself.
+//
+// It is also worth knowing before reaching for utilnet.SetTransportDefaults,
+// which fills in sensible timeouts and then turns HTTP/2 on.
+func transportForRestConfig(config *rest.Config) (*http.Transport, error) {
 	// get golang tls config to the API server
 	tlsConfig, err := rest.TLSConfigFor(config)
 	if err != nil {
@@ -272,9 +318,32 @@ func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTrippe
 	}
 
 	// create tls transport to request
-	tlsTransport := &http.Transport{
+	return &http.Transport{
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: tlsConfig,
+
+		// Empty rather than nil, which is what keeps HTTP/2 off.
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
+
+		MaxIdleConns:        maxIdleConnsPerHost,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+
+		// A pooled connection the API server has since forgotten about is only
+		// discovered by trying to use it, so idle ones are given up rather than
+		// held for the life of the process.
+		IdleConnTimeout: 90 * time.Second,
+
+		// Bounds connecting, not the request that follows it, so a request that
+		// then streams for hours is unaffected.
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}, nil
+}
+
+func roundTripperForRestConfig(config *rest.Config) (http.RoundTripper, error) {
+	tlsTransport, err := transportForRestConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	// get kube transport config form rest client config
@@ -292,11 +361,20 @@ func (p *Proxy) roundTripperForRestConfig(config *rest.Config) (http.RoundTrippe
 	return clientRT, nil
 }
 
-// Return the proxy OIDC token authenticator
-func (p *Proxy) OIDCTokenAuthenticator() authenticator.Token {
-	return p.tokenAuther
+// OIDCHealthCheck returns an error until the authenticator of every trusted
+// issuer has fetched its keys.
+func (p *Proxy) OIDCHealthCheck() error {
+	var errs []error
+	for _, check := range p.oidcHealthChecks {
+		if err := check(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return utilerrors.NewAggregate(errs)
 }
 
-func (p *Proxy) RunPreShutdownHooks() error {
-	return p.hooks.RunPreShutdownHooks()
+// Shutdown flushes and stops the audit backend.
+func (p *Proxy) Shutdown() {
+	p.auditor.Shutdown()
 }

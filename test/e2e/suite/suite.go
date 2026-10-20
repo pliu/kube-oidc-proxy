@@ -2,8 +2,6 @@
 package suite
 
 import (
-	"path/filepath"
-
 	. "github.com/onsi/ginkgo"
 	log "github.com/sirupsen/logrus"
 
@@ -24,11 +22,16 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	}
 
 	if err := env.Create(); err != nil {
+		// Fatalf exits without running the suite's teardown, so the cluster
+		// would otherwise outlive the run and block the next one.
+		if derr := env.Destory(); derr != nil {
+			log.Errorf("Failed to destroy environment: %s", derr)
+		}
 		log.Fatalf("Error creating environment: %s", err)
 	}
 
 	cfg.KubeConfigPath = env.KubeConfigPath()
-	cfg.Kubectl = filepath.Join(env.RootPath(), "bin", "kubectl")
+	cfg.Kubectl = "kubectl"
 	cfg.RepoRoot = env.RootPath()
 	cfg.Environment = env
 

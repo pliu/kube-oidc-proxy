@@ -3,8 +3,11 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"encoding/pem"
 	"errors"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,27 +17,59 @@ import (
 	"strings"
 	"testing"
 
-	"go.uber.org/mock/gomock"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/client-go/rest"
 
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
-	"github.com/jetstack/kube-oidc-proxy/pkg/mocks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/hooks"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/logging"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview"
-	fakesubjectaccessreview "github.com/jetstack/kube-oidc-proxy/pkg/proxy/subjectaccessreview/fake"
 )
 
 type fakeProxy struct {
-	ctrl *gomock.Controller
-
-	fakeToken *mocks.MockToken
+	fakeToken *fakeToken
 	fakeRT    *fakeRT
 	*Proxy
+}
+
+// fakeToken authenticates a single expected token with a canned response. A
+// call it does not expect, or an expected call that never comes, fails the test.
+type fakeToken struct {
+	t *testing.T
+
+	expected bool
+	token    string
+	resp     *authenticator.Response
+	pass     bool
+	err      error
+
+	calls int
+}
+
+func (f *fakeToken) expect(token string, resp *authenticator.Response, pass bool, err error) {
+	f.expected = true
+	f.token, f.resp, f.pass, f.err = token, resp, pass, err
+}
+
+func (f *fakeToken) AuthenticateToken(_ context.Context, token string) (*authenticator.Response, bool, error) {
+	f.calls++
+	switch {
+	case !f.expected:
+		f.t.Errorf("unexpected call to authenticate token %q", token)
+	case f.calls > 1:
+		f.t.Errorf("token authenticated %d times, expected once", f.calls)
+	case token != f.token:
+		f.t.Errorf("authenticated unexpected token, exp=%q got=%q", f.token, token)
+	}
+	return f.resp, f.pass, f.err
+}
+
+func (f *fakeToken) verify() {
+	if f.expected && f.calls == 0 {
+		f.t.Errorf("expected token %q to be authenticated, but it was not", f.token)
+	}
 }
 
 type fakeRW struct {
@@ -49,6 +84,10 @@ type fakeRT struct {
 	expGroup []string
 	expExtra map[string][]string
 	expUid   string
+
+	// expAuthorization is the only Authorization header the API server may
+	// receive, or "" for none.
+	expAuthorization string
 }
 
 func (f *fakeRW) Write(b []byte) (int, error) {
@@ -67,6 +106,7 @@ func (f *fakeRW) Header() http.Header {
 func newFakeR() *http.Request {
 	return &http.Request{
 		RemoteAddr: "fakeAddr",
+		URL:        new(url.URL),
 	}
 }
 
@@ -78,6 +118,11 @@ func newFakeRW() *fakeRW {
 }
 
 func (f *fakeRT) RoundTrip(h *http.Request) (*http.Response, error) {
+	if act := h.Header.Values("Authorization"); len(act) > 1 || h.Header.Get("Authorization") != f.expAuthorization {
+		f.t.Errorf("client transport got unexpected Authorization header, exp=%q got=%q",
+			f.expAuthorization, act)
+	}
+
 	if h.Header.Get("Impersonate-User") != f.expUser {
 		logging.LogFailedRequest(h)
 		f.t.Errorf("client transport got unexpected user impersonation header, exp=%s got=%s",
@@ -129,14 +174,13 @@ func (f *fakeRT) RoundTrip(h *http.Request) (*http.Response, error) {
 		}
 	}
 
-	logging.LogSuccessfulRequest(h, &user.DefaultInfo{}, &user.DefaultInfo{})
+	logging.LogSuccessfulRequest(h, &user.DefaultInfo{})
 
 	return nil, nil
 }
 
 func tryError(t *testing.T, expCode int, err error) *fakeRW {
-	p := new(Proxy)
-	p.handleError = p.newErrorHandler()
+	p := newTestProxy(t).Proxy
 
 	frw := newFakeRW()
 	fr := newFakeR()
@@ -182,8 +226,6 @@ func TestError(t *testing.T) {
 }
 
 func TestHasImpersonation(t *testing.T) {
-	p := new(Proxy)
-
 	// no impersonation headers
 	noImpersonation := []http.Header{
 		{},
@@ -209,7 +251,7 @@ func TestHasImpersonation(t *testing.T) {
 	}
 
 	// impersonation headers
-	hasImpersonation := []http.Header{
+	withImpersonation := []http.Header{
 		{
 			"Impersonate-User": []string{"bar", "foo"},
 		},
@@ -258,36 +300,30 @@ func TestHasImpersonation(t *testing.T) {
 	}
 
 	for _, h := range noImpersonation {
-		if p.hasImpersonation(h) {
+		if hasImpersonation(h) {
 			t.Errorf("expected no impersonation but got true, '%s'", h)
 		}
 	}
 
-	for _, h := range hasImpersonation {
-		if !p.hasImpersonation(h) {
+	for _, h := range withImpersonation {
+		if !hasImpersonation(h) {
 			t.Errorf("expected impersonation but got false, '%s'", h)
 		}
 	}
 }
 
 func newTestProxy(t *testing.T) *fakeProxy {
-	ctrl := gomock.NewController(t)
-	fakeToken := mocks.NewMockToken(ctrl)
+	fakeToken := &fakeToken{t: t}
+	t.Cleanup(fakeToken.verify)
 	fakeRT := &fakeRT{t: t}
-	fakeSubjectAccessReviewer := fakesubjectaccessreview.New(nil)
-	subjectAccessReview, _ := subjectaccessreview.New(fakeSubjectAccessReviewer)
 
 	p := &fakeProxy{
-		ctrl:      ctrl,
 		fakeToken: fakeToken,
 		fakeRT:    fakeRT,
 		Proxy: &Proxy{
-			oidcRequestAuther:     bearertoken.New(fakeToken),
-			subjectAccessReviewer: subjectAccessReview,
-			clientTransport:       fakeRT,
-			noAuthClientTransport: fakeRT,
-			config:                new(Config),
-			hooks:                 hooks.New(),
+			oidcRequestAuther: bearertoken.New(fakeToken),
+			transport:         fakeRT,
+			config:            new(Config),
 		},
 	}
 
@@ -323,11 +359,13 @@ func TestHandlers(t *testing.T) {
 		expGroup []string
 		expExtra map[string][]string
 		expUid   string
+
+		expAuthorization string
 	}{
 		"an empty request should 401": {
 			req:     new(http.Request),
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with a badly formed token should 401": {
 			req: &http.Request{
@@ -336,7 +374,7 @@ func TestHandlers(t *testing.T) {
 				},
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with a unauthed token should 401": {
 			req: &http.Request{
@@ -351,7 +389,7 @@ func TestHandlers(t *testing.T) {
 				err:  nil,
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with an error during token auth should 401": {
 			req: &http.Request{
@@ -366,7 +404,7 @@ func TestHandlers(t *testing.T) {
 				err:  errors.New("some error"),
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with an error but passes during token auth should still 401": {
 			req: &http.Request{
@@ -381,7 +419,7 @@ func TestHandlers(t *testing.T) {
 				err:  errors.New("some error"),
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
 		"a request with unauth with impersonation should 401": {
 			req: &http.Request{
@@ -397,343 +435,8 @@ func TestHandlers(t *testing.T) {
 				err:  nil,
 			},
 			expCode: http.StatusUnauthorized,
-			expBody: errUnauthorized.Error(),
+			expBody: "Unauthorized",
 		},
-
-		// BEGIN IMPERSONATION TESTS
-
-		"an authed request with authorized impersonation user should succeed": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":    []string{"bearer fake-token"},
-					"Impersonate-User": []string{"jjackson"},
-				},
-			},
-			expUser:      "jjackson",
-			expGroup:     []string{"system:authenticated"},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusOK,
-			expExtra: map[string][]string{
-				"Impersonate-Extra-Originaluser.jetstack.io-User":   {"mmosley"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Groups": {"group1"},
-			},
-			expBody: "",
-		},
-		"an authed request with authorized impersonation group should succeed": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":     []string{"bearer fake-token"},
-					"Impersonate-User":  []string{"jjackson"},
-					"Impersonate-Group": []string{"group3"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expUser:  "jjackson",
-			expGroup: []string{"group3", "system:authenticated"},
-			expExtra: map[string][]string{
-				"Impersonate-Extra-Originaluser.jetstack.io-User":   {"mmosley"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Groups": {"group1"},
-			},
-			expCode: http.StatusOK,
-			expBody: "",
-		},
-		"an authed request with authorized impersonation extra should succeed": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":                []string{"bearer fake-token"},
-					"Impersonate-User":             []string{"jjackson"},
-					"Impersonate-Group":            []string{"group3"},
-					"Impersonate-Extra-remoteaddr": []string{"1.2.3.4"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-						Extra:  map[string][]string{"someextra": {"someval1", "someval2"}, "someextra2": {"foo", "bar"}},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode:  http.StatusOK,
-			expUser:  "jjackson",
-			expGroup: []string{"group3", "system:authenticated"},
-			expExtra: map[string][]string{
-				"Impersonate-Extra-Remoteaddr":                      {"1.2.3.4"},
-				"Impersonate-Extra-Originaluser.jetstack.io-User":   {"mmosley"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Groups": {"group1"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Extra":  {"{\"someextra\":[\"someval1\",\"someval2\"],\"someextra2\":[\"foo\",\"bar\"]}"},
-			},
-			expBody: "",
-		},
-
-		"an authed request with authorized impersonation extra should succeed, with an empty X-Forwarded-For header": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":                []string{"bearer fake-token"},
-					"Impersonate-User":             []string{"jjackson"},
-					"Impersonate-Group":            []string{"group3"},
-					"Impersonate-Extra-remoteaddr": []string{"1.2.3.4"},
-					"X-Forwarded-For":              []string{""},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-						Extra:  map[string][]string{"someextra": {"someval1", "someval2"}, "someextra2": {"foo", "bar"}},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode:  http.StatusOK,
-			expUser:  "jjackson",
-			expGroup: []string{"group3", "system:authenticated"},
-			expExtra: map[string][]string{
-				"Impersonate-Extra-Remoteaddr":                      {"1.2.3.4"},
-				"Impersonate-Extra-Originaluser.jetstack.io-User":   {"mmosley"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Groups": {"group1"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Extra":  {"{\"someextra\":[\"someval1\",\"someval2\"],\"someextra2\":[\"foo\",\"bar\"]}"},
-			},
-			expBody: "",
-		},
-
-		/* Commenting due to https://github.com/TremoloSecurity/kube-oidc-proxy/issues/7
-		"an authed request with authorized impersonation uid should succeed": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":     []string{"bearer fake-token"},
-					"Impersonate-Uid":   []string{"1-2-3-4"},
-					"Impersonate-User":  []string{"jjackson"},
-					"Impersonate-Group": []string{"group3"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode:  http.StatusOK,
-			expUser:  "jjackson",
-			expUid:   "1-2-3-4",
-			expGroup: []string{"group3", "system:authenticated"},
-			expExtra: map[string][]string{
-				"Impersonate-Extra-Originaluser.jetstack.io-User":   {"mmosley"},
-				"Impersonate-Extra-Originaluser.jetstack.io-Groups": {"group1"},
-			},
-			expBody: "",
-		},*/
-
-		"an authed request with unauthorized impersonation user should error unauthorized": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":    []string{"bearer fake-token"},
-					"Impersonate-User": []string{"a-user"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusForbidden,
-			expBody: "mmosley is not allowed to impersonate user 'a-user'",
-		},
-		"an authed request with unauthorized impersonation group should error unauthorized": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":     []string{"bearer fake-token"},
-					"Impersonate-User":  []string{"jjackson"},
-					"Impersonate-Group": []string{"a-group"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusForbidden,
-			expBody: "mmosley is not allowed to impersonate group 'a-group'",
-		},
-		"an authed request with unauthorized impersonation extra should error unauthorized": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":         []string{"bearer fake-token"},
-					"Impersonate-User":      []string{"jjackson"},
-					"Impersonate-Extra-foo": []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusForbidden,
-			expBody: "mmosley is not allowed to impersonate extra info 'foo'='bar'",
-		},
-		"an authed request with unauthorized impersonation uid should error unauthorized": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":    []string{"bearer fake-token"},
-					"Impersonate-User": []string{"jjackson"},
-					"Impersonate-Uid":  []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusForbidden,
-			expBody: "mmosley is not allowed to impersonate uid 'bar'",
-		},
-
-		"an authed request with impersonation groups missing user should fail": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":      []string{"bearer fake-token"},
-					"Impersonate-Groups": []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusInternalServerError,
-			expBody: "no Impersonation-User header found for request",
-		},
-
-		"an authed request with impersonation extra missing user should fail": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":         []string{"bearer fake-token"},
-					"Impersonate-Extra-foo": []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusInternalServerError,
-			expBody: "no Impersonation-User header found for request",
-		},
-
-		"an authed request with impersonation uid missing user should fail": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":   []string{"bearer fake-token"},
-					"Impersonate-Uid": []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusInternalServerError,
-			expBody: "no Impersonation-User header found for request",
-		},
-
-		"an authed request with an invalid impersonation header should fail": {
-			req: &http.Request{
-				Header: http.Header{
-					"Authorization":        []string{"bearer fake-token"},
-					"Impersonate-User":     []string{"jjackson"},
-					"Impersonate-Not-Real": []string{"bar"},
-				},
-			},
-			expAuthToken: "fake-token",
-			authResponse: &authResponse{
-				resp: &authenticator.Response{
-					User: &user.DefaultInfo{
-						Name:   "mmosley",
-						Groups: []string{"group1"},
-					},
-				},
-				pass: true,
-				err:  nil,
-			},
-			expCode: http.StatusInternalServerError,
-			expBody: "",
-		},
-
-		// END IMPERSONATION TESTS
 
 		"an authed request with no username is token should 403": {
 			req: &http.Request{
@@ -803,7 +506,41 @@ func TestHandlers(t *testing.T) {
 				"Impersonate-Extra-Foo-Bar": []string{"e", "f"},
 			},
 		},
-		"an authed request with user, group, extra but disabled impersonation should return no impersonation and should 200": {
+		"a token naming a service account is refused rather than impersonated": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer fake-token"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{Name: "system:serviceaccount:kube-system:clusterrole-aggregation-controller"},
+				},
+				pass: true,
+			},
+			expCode: http.StatusForbidden,
+			expBody: errReservedUsername.Error(),
+		},
+
+		"a token naming the anonymous user is refused": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer fake-token"},
+				},
+			},
+			expAuthToken: "fake-token",
+			authResponse: &authResponse{
+				resp: &authenticator.Response{
+					User: &user.DefaultInfo{Name: user.Anonymous},
+				},
+				pass: true,
+			},
+			expCode: http.StatusForbidden,
+			expBody: errReservedUsername.Error(),
+		},
+
+		"an authed request does not run with the reserved groups its token claims": {
 			req: &http.Request{
 				Header: http.Header{
 					"Authorization": []string{"bearer fake-token"},
@@ -814,25 +551,56 @@ func TestHandlers(t *testing.T) {
 				resp: &authenticator.Response{
 					User: &user.DefaultInfo{
 						Name:   "a-user",
-						Groups: []string{"my-group"},
-						Extra: map[string][]string{
-							"foo":     []string{"a", "b"},
-							"bar":     []string{"c", "d"},
-							"foo-bar": []string{"e", "f"},
-						},
+						Groups: []string{"system:masters", "my-group", "system:unauthenticated"},
 					},
 				},
 				pass: true,
 				err:  nil,
 			},
-			config: &Config{
-				DisableImpersonation: true,
-			},
 			expCode:  http.StatusOK,
 			expBody:  "",
-			expUser:  "",
-			expGroup: nil,
-			expExtra: nil,
+			expUser:  "a-user",
+			expGroup: []string{"my-group", "system:authenticated"},
+		},
+
+		// Passthrough cases set no authResponse: the proxy must not try to
+		// authenticate the token, which the fake token would report as an
+		// unexpected call.
+		"a passthrough request is forwarded as it is, with the caller's own token": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"bearer service-account-token"},
+				},
+			},
+			config:           &Config{TokenPassthrough: true},
+			expAuthorization: "bearer service-account-token",
+			expCode:          http.StatusOK,
+		},
+
+		"a passthrough request keeps its impersonation headers for the API server to authorize": {
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization":     []string{"bearer service-account-token"},
+					"Impersonate-User":  []string{"jjackson"},
+					"Impersonate-Group": []string{"group3"},
+				},
+			},
+			config:           &Config{TokenPassthrough: true},
+			expAuthorization: "bearer service-account-token",
+			expCode:          http.StatusOK,
+			expUser:          "jjackson",
+			expGroup:         []string{"group3"},
+		},
+
+		"a passthrough request without a token should 401": {
+			req: &http.Request{
+				Header: http.Header{
+					"Impersonate-User": []string{"jjackson"},
+				},
+			},
+			config:  &Config{TokenPassthrough: true},
+			expCode: http.StatusUnauthorized,
+			expBody: "Unauthorized",
 		},
 	}
 
@@ -843,7 +611,7 @@ func TestHandlers(t *testing.T) {
 			w := httptest.NewRecorder()
 
 			if test.authResponse != nil {
-				p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), test.expAuthToken).Return(
+				p.fakeToken.expect(test.expAuthToken,
 					test.authResponse.resp, test.authResponse.pass, test.authResponse.err)
 			}
 
@@ -851,6 +619,7 @@ func TestHandlers(t *testing.T) {
 			p.fakeRT.expGroup = test.expGroup
 			p.fakeRT.expExtra = test.expExtra
 			p.fakeRT.expUid = test.expUid
+			p.fakeRT.expAuthorization = test.expAuthorization
 
 			if test.config != nil {
 				p.config = test.config
@@ -872,7 +641,7 @@ func TestHandlers(t *testing.T) {
 
 			resp := w.Result()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Errorf("unexpected error: %s", err)
 				t.FailNow()
@@ -888,7 +657,6 @@ func TestHandlers(t *testing.T) {
 					test.expCode, resp.StatusCode)
 			}
 
-			p.ctrl.Finish()
 		})
 	}
 }
@@ -960,18 +728,25 @@ func TestHeadersConfig(t *testing.T) {
 				URL:        new(url.URL),
 			}
 
+			// The token carries an extra of its own, so that the extras the proxy
+			// adds have an identity of the token's to be wrongly written into.
 			authResponse := &authenticator.Response{
 				User: &user.DefaultInfo{
 					Name:   "a-user",
 					Groups: []string{user.AllAuthenticated},
+					Extra:  map[string][]string{"origin": {"token"}},
 				},
 			}
 
-			p.fakeToken.EXPECT().AuthenticateToken(gomock.Any(), "fake-token").Return(authResponse, true, nil)
+			p.fakeToken.expect("fake-token", authResponse, true, nil)
 
 			p.fakeRT.expUser = "a-user"
 			p.fakeRT.expGroup = []string{user.AllAuthenticated}
-			p.fakeRT.expExtra = test.expExtra
+			expExtra := map[string][]string{"Impersonate-Extra-Origin": {"token"}}
+			for k, v := range test.expExtra {
+				expExtra[k] = v
+			}
+			p.fakeRT.expExtra = expExtra
 
 			var handler http.Handler
 			handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -987,7 +762,140 @@ func TestHeadersConfig(t *testing.T) {
 
 			w.Result()
 
-			p.ctrl.Finish()
+			// The audit and access logs record this identity as the requester.
+			if exp, act := map[string][]string{"origin": {"token"}}, authResponse.User.GetExtra(); !reflect.DeepEqual(exp, act) {
+				t.Errorf("authenticated identity was modified, exp extra=%v got=%v", exp, act)
+			}
+
+		})
+	}
+}
+
+// Exec, attach and port forward reach the API server as HTTP/1.1 protocol
+// upgrades, which Go's HTTP/2 transport cannot carry. A transport that has
+// quietly gained HTTP/2 takes those away, and takes them away only in a real
+// cluster, so it is worth holding down here. The rest config with nothing in it
+// is the awkward case: it leaves TLSClientConfig nil, which on its own has Go
+// negotiate h2.
+func TestUpstreamTransportNeverNegotiatesHTTP2(t *testing.T) {
+	for name, config := range map[string]*rest.Config{
+		"no TLS settings at all": {Host: "https://127.0.0.1:6443"},
+		"TLS settings of its own": {
+			Host:            "https://127.0.0.1:6443",
+			TLSClientConfig: rest.TLSClientConfig{Insecure: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			transport, err := transportForRestConfig(config)
+			if err != nil {
+				t.Fatalf("unexpected error building the transport: %s", err)
+			}
+
+			if transport.ForceAttemptHTTP2 {
+				t.Error("expected the transport to not force HTTP/2")
+			}
+
+			// Nil here, rather than empty, is what has Go register its own
+			// HTTP/2 handler the first time the transport is used.
+			if transport.TLSNextProto == nil {
+				t.Error("expected the transport to have HTTP/2 held off with an empty TLSNextProto")
+			}
+
+			if len(transport.TLSNextProto) > 0 {
+				t.Errorf("expected no next protocol handlers, got %d", len(transport.TLSNextProto))
+			}
+
+			if transport.TLSClientConfig != nil {
+				for _, proto := range transport.TLSClientConfig.NextProtos {
+					if proto == "h2" {
+						t.Error("expected the transport to not offer h2 in ALPN")
+					}
+				}
+			}
+		})
+	}
+}
+
+// All proxied traffic goes to the one API server, so the per-host pool is the
+// pool. Go's default of two would have almost every connection closed as soon
+// as it goes idle and dialled again for the next request.
+func TestUpstreamTransportKeepsConnectionsToTheAPIServerWarm(t *testing.T) {
+	transport, err := transportForRestConfig(&rest.Config{Host: "https://127.0.0.1:6443"})
+	if err != nil {
+		t.Fatalf("unexpected error building the transport: %s", err)
+	}
+
+	if transport.MaxIdleConnsPerHost <= http.DefaultMaxIdleConnsPerHost {
+		t.Errorf("expected more than the default of %d idle connections per host, got %d",
+			http.DefaultMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+
+	// Zero is unlimited, so an idle connection the API server has since
+	// forgotten about would be held for the life of the process.
+	if transport.IdleConnTimeout == 0 {
+		t.Error("expected idle connections to be given up eventually")
+	}
+
+	if transport.TLSHandshakeTimeout == 0 {
+		t.Error("expected the TLS handshake to be bounded")
+	}
+}
+
+func TestPassthroughPreservesUpstreamTLSSettings(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Header.Get("Authorization"))
+	}))
+	defer upstream.Close()
+	cert := upstream.Certificate()
+	if len(cert.DNSNames) == 0 {
+		t.Fatal("test certificate must have a DNS name")
+	}
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	// localhost is absent from this certificate, so verification requires
+	// the configured server name even though the endpoint is reachable.
+	upstreamURL := strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)
+	for name, tlsConfig := range map[string]rest.TLSClientConfig{
+		"server name override": {CAData: ca, ServerName: cert.DNSNames[0]},
+		"skip verification":    {Insecure: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProxy(t)
+			p.config.TokenPassthrough = true
+			// Client credentials must still be removed while TLS connection
+			// settings are preserved.
+			tlsConfig.CertData = []byte("invalid proxy client certificate")
+			tlsConfig.KeyData = []byte("invalid proxy client key")
+			p.restConfig = &rest.Config{Host: upstreamURL, TLSClientConfig: tlsConfig, BearerToken: "proxy-token"}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			p.secureServingInfo = &server.SecureServingInfo{Listener: listener}
+			stop := make(chan struct{})
+			wait, _, err := p.Run(stop)
+			if err != nil {
+				close(stop)
+				t.Fatal(err)
+			}
+			defer func() { close(stop); <-wait }()
+			req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer caller-token")
+			resp, err := p.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("passthrough TLS request failed: %s", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != "Bearer caller-token" {
+				t.Fatalf("unexpected upstream authorization: %q", body)
+			}
 		})
 	}
 }

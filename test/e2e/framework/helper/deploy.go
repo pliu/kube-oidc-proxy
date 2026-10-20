@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -31,12 +31,7 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 			"--secure-port=6443",
 			"--tls-cert-file=/tls/cert.pem",
 			"--tls-private-key-file=/tls/key.pem",
-			fmt.Sprintf("--oidc-client-id=%s", clientID),
-			fmt.Sprintf("--oidc-issuer-url=%s", issuerURL),
-			"--oidc-username-claim=email",
-			"--oidc-groups-claim=groups",
-			"--oidc-ca-file=/oidc/ca.pem",
-			"--oidc-ca-file=/oidc/ca.pem",
+			"--oidc-config-file=/oidc/authn.yaml",
 			"--v=10",
 		}, extraArgs...),
 		VolumeMounts: []corev1.VolumeMount{
@@ -83,18 +78,36 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		Name: "oidc",
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
-				SecretName: "oidc-ca",
+				SecretName: "oidc-config",
 			},
 		},
 	})
 
+	// The issuer serves over TLS with its signing key's certificate, so that
+	// is also the CA its connections are verified against.
+	authnConfig := fmt.Sprintf(`issuers:
+- issuer:
+    url: %s
+    audiences: [%s]
+    certificateAuthority: |
+      %s
+  claimMappings:
+    username:
+      claim: email
+      prefix: ""
+    groups:
+      claim: groups
+      prefix: ""
+`, issuerURL, clientID,
+		strings.ReplaceAll(strings.TrimSpace(string(oidcKeyBundle.CertBytes)), "\n", "\n      "))
+
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "oidc-ca",
+			Name:      "oidc-config",
 			Namespace: ns.Name,
 		},
 		Data: map[string][]byte{
-			"ca.pem": oidcKeyBundle.CertBytes,
+			"authn.yaml": []byte(authnConfig),
 		},
 	}
 
@@ -133,13 +146,13 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 			},
 			{
 				APIGroups: []string{"authentication.k8s.io"},
-				Resources: []string{"userextras/scopes", "tokenreviews", "userextras/originaluser.jetstack.io-user", "userextras/originaluser.jetstack.io-groups", "userextras/originaluser.jetstack.io-extra", "userextras/oktoimpersonateextra"},
-				Verbs:     []string{"impersonate", "create"},
+				Resources: []string{"userextras/scopes"},
+				Verbs:     []string{"impersonate"},
 			},
 			{
-				APIGroups: []string{"authorization.k8s.io"},
-				Resources: []string{"subjectaccessreviews"},
-				Verbs:     []string{"create"},
+				APIGroups: []string{"coordination.k8s.io"},
+				Resources: []string{"leases"},
+				Verbs:     []string{"create", "get", "update"},
 			},
 		},
 	}, metav1.CreateOptions{})
@@ -147,7 +160,9 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		return nil, nil, err
 	}
 
-	// Create a role that will allow a user to impersonate another user
+	// Allow the test user to impersonate others. The proxy refuses
+	// impersonation headers regardless, which the impersonation cases check
+	// against this grant: RBAC allowing it must not get the headers honoured.
 	croleImpersonate, err := h.KubeClient.RbacV1().ClusterRoles().Create(context.TODO(), &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: kind.ProxyImageName + "-impersonate-",
@@ -187,8 +202,7 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
 		return nil, nil, err
 	}
 
-	// Create a ClusterRoleBinding so the user can impersonate test users
-
+	// Bind the impersonation grant to the test user.
 	_, err = h.KubeClient.RbacV1().ClusterRoleBindings().Create(context.TODO(),
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{
@@ -392,22 +406,20 @@ func (h *Helper) DeployAuditWebhook(ns, logPath string) (corev1.Volume, *url.URL
 }
 
 func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, container corev1.Container, volumes ...corev1.Volume) (*util.KeyBundle, *url.URL, error) {
+	return h.deployAppWithTimeout(ns, name, serviceType, time.Second*20, container, volumes...)
+}
+
+// deployAppWithTimeout deploys an app serving TLS on 6443 behind a Service of
+// its own name, and waits up to readyTimeout for it to become ready.
+func (h *Helper) deployAppWithTimeout(ns, name string, serviceType corev1.ServiceType, readyTimeout time.Duration,
+	container corev1.Container, volumes ...corev1.Volume) (*util.KeyBundle, *url.URL, error) {
 	host, appURL := h.appURL(ns, name, "6443")
 
+	// A NodePort app is reached through the port kind publishes on the host's
+	// loopback address.
 	var netIPs []net.IP
 	if serviceType == corev1.ServiceTypeNodePort {
-		nodes, err := h.KubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			return nil, nil, err
-		}
-
-		for _, n := range nodes.Items {
-			for _, addr := range n.Status.Addresses {
-				if addr.Type == corev1.NodeInternalIP {
-					netIPs = append(netIPs, net.ParseIP(addr.Address))
-				}
-			}
-		}
+		netIPs = append(netIPs, net.IPv4(127, 0, 0, 1))
 	}
 
 	keyBundle, err := util.NewTLSSelfSignedCertKey(host, netIPs, nil)
@@ -426,6 +438,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 					Port:       6443,
 					Protocol:   "TCP",
 					TargetPort: intstr.FromInt(6443),
+					NodePort:   nodePort(serviceType),
 				},
 			},
 			Type: serviceType,
@@ -497,9 +510,8 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 		return nil, nil, err
 	}
 
-	if len(netIPs) > 0 {
-		appURL = fmt.Sprintf("https://%s:%s", netIPs[0],
-			strconv.FormatUint(uint64(svc.Spec.Ports[0].NodePort), 10))
+	if serviceType == corev1.ServiceTypeNodePort {
+		appURL = fmt.Sprintf("https://127.0.0.1:%d", svc.Spec.Ports[0].NodePort)
 	}
 
 	_, err = h.KubeClient.CoreV1().Secrets(ns).Create(context.TODO(), sec, metav1.CreateOptions{})
@@ -517,7 +529,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 		return nil, nil, err
 	}
 
-	if err := h.WaitForDeploymentReady(ns, name, time.Second*20); err != nil {
+	if err := h.WaitForDeploymentReady(ns, name, readyTimeout); err != nil {
 		return nil, nil, err
 	}
 
@@ -534,7 +546,7 @@ func (h *Helper) deployApp(ns, name string, serviceType corev1.ServiceType, cont
 }
 
 func (h *Helper) DeleteProxy(ns string) error {
-	return h.deleteApp(ns, kind.ProxyImageName, "oidc-ca")
+	return h.deleteApp(ns, kind.ProxyImageName, "oidc-ca", "oidc-config")
 }
 func (h *Helper) DeleteIssuer(ns string) error {
 	return h.deleteApp(ns, kind.IssuerImageName)
@@ -567,6 +579,15 @@ func (h *Helper) deleteApp(ns, name string, extraSecrets ...string) error {
 	}
 
 	return nil
+}
+
+// nodePort returns the NodePort for a Service of the given type: the one kind
+// publishes on the host, as only one app at a time is exposed that way.
+func nodePort(serviceType corev1.ServiceType) int32 {
+	if serviceType == corev1.ServiceTypeNodePort {
+		return kind.ProxyNodePort
+	}
+	return 0
 }
 
 func (h *Helper) appURL(ns, serviceName, port string) (string, string) {

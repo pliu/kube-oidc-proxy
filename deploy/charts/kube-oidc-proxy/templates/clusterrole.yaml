@@ -18,12 +18,8 @@ rules:
   resources:
   - "userextras/scopes"
   - "userextras/remote-client-ip"
-  - "tokenreviews"
-  # to support end user impersonation
+  # the credential ID the OIDC authenticator records from a token's jti claim,
+  # forwarded with the rest of the token's extras
   - "userextras/authentication.kubernetes.io/credential-id"
-  - "userextras/originaluser.jetstack.io-user"
-  - "userextras/originaluser.jetstack.io-groups"
-  - "userextras/originaluser.jetstack.io-extra"
   verbs:
-  - "create"
   - "impersonate"

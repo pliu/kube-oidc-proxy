@@ -23,11 +23,18 @@ import (
 
 const (
 	clusterName = "kube-oidc-proxy-e2e"
+
+	// ProxyNodePort is the NodePort the proxy under test is exposed on, which
+	// the first node publishes on the host's loopback address. Docker Desktop
+	// does not route from the host to the nodes' own addresses, so this is the
+	// one way to reach the proxy from tests on macOS as well as on Linux.
+	ProxyNodePort = 30443
 )
 
 type Kind struct {
 	rootPath  string
 	nodeImage string
+	arch      string
 	conf      *configv1alpha4.Cluster
 
 	provider   *cluster.Provider
@@ -68,6 +75,12 @@ func New(rootPath, nodeImage string, masterNodes, workerNodes int) *Kind {
 	}
 
 	conf.Networking.ServiceSubnet = "10.0.0.0/16"
+
+	conf.Nodes[0].ExtraPortMappings = []configv1alpha4.PortMapping{{
+		ContainerPort: ProxyNodePort,
+		HostPort:      ProxyNodePort,
+		ListenAddress: "127.0.0.1",
+	}}
 
 	return &Kind{
 		rootPath:  rootPath,

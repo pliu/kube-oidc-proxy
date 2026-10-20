@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jetstack/kube-oidc-proxy/schemas/ldap-config.v1.json",
+  "title": "kube-oidc-proxy LDAP configuration",
+  "description": "LDAP membership lookup and per-user ConfigMap cache configuration.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "backends"
+  ],
+  "properties": {
+    "backends": {
+      "description": "Query every backend for each uncached identity and union complete successful results.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/backend"
+      }
+    },
+    "refreshInterval": {
+      "description": "How often the elected leader refreshes cached users.",
+      "$ref": "#/$defs/duration",
+      "default": "1h"
+    },
+    "refreshUsers": {
+      "description": "Users allowed to call the stub refresh endpoint. Matched case insensitively, with or without the OIDC username prefix. If unset, any authenticated user may call it.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "cache": {
+      "description": "Where per-user ConfigMaps are stored.",
+      "$ref": "#/$defs/cache"
+    },
+    "lookupTimeout": {
+      "$ref": "#/$defs/duration",
+      "default": "1m",
+      "description": "Total time for one admitted lookup, including Kubernetes reads, LDAP and persistence."
+    },
+    "lookupConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 8,
+      "description": "Maximum concurrent distinct-user lookups started by requests per replica, including Kubernetes reads, LDAP and persistence. New identities are rejected when full; existing calls can still be joined. Each LDAP lookup queries all backends."
+    },
+    "refreshConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4,
+      "description": "Maximum concurrent lookups started by the leader's periodic refresh, counted separately from lookupConcurrency so a refresh cycle never exhausts request capacity."
+    }
+  },
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))*$",
+      "examples": [
+        "30s",
+        "10m",
+        "1h30m"
+      ]
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "urls",
+        "userSearchBases",
+        "groupSearchBases"
+      ],
+      "properties": {
+        "name": {
+          "description": "Name of the backend. Used in logs, statistics and errors, and must be unique.",
+          "type": "string",
+          "minLength": 1
+        },
+        "urls": {
+          "description": "URL(s) of this directory. Tried in order until one can be connected to and bound.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^ldaps?://"
+          }
+        },
+        "bindDN": {
+          "description": "DN to bind to the directory as. If unset, an anonymous bind is used.",
+          "type": "string",
+          "minLength": 1
+        },
+        "bindPassword": {
+          "description": "Password to bind with. Prefer bindPasswordFile to keep the password out of the config file.",
+          "type": "string"
+        },
+        "bindPasswordFile": {
+          "description": "File holding the password to bind with.",
+          "type": "string",
+          "minLength": 1
+        },
+        "caFile": {
+          "description": "PEM encoded certificate authority bundle used to verify the serving certificate of this directory. Defaults to the host trust store.",
+          "type": "string",
+          "minLength": 1
+        },
+        "insecureSkipTLSVerify": {
+          "description": "Do not verify the serving certificate of this directory. Insecure, and intended for testing only.",
+          "type": "boolean",
+          "default": false
+        },
+        "startTLS": {
+          "description": "Issue a StartTLS request after connecting. Used with an 'ldap://' URL to upgrade the connection to TLS.",
+          "type": "boolean",
+          "default": false
+        },
+        "timeout": {
+          "description": "Bound connecting, binding and searching this backend for one user.",
+          "$ref": "#/$defs/duration",
+          "default": "5m"
+        },
+        "userSearchBases": {
+          "description": "Base DN(s) to search for users under.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "userFilter": {
+          "description": "LDAP filter selecting user entries.",
+          "type": "string",
+          "minLength": 1,
+          "default": "(objectClass=user)"
+        },
+        "usernameAttribute": {
+          "description": "Attribute of a user entry holding the name that matches the username of the token. Matched case insensitively.",
+          "type": "string",
+          "minLength": 1,
+          "default": "userPrincipalName"
+        },
+        "groupSearchBases": {
+          "description": "Base DN(s) to search for groups under. Only groups under these bases contribute memberships.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "groupFilter": {
+          "description": "LDAP filter selecting group entries.",
+          "type": "string",
+          "minLength": 1,
+          "default": "(objectClass=group)"
+        },
+        "groupNameAttribute": {
+          "description": "Full emitted group name attribute; must be unique within the backend.",
+          "type": "string",
+          "minLength": 1,
+          "default": "cn"
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "description": "Defaults to the pod namespace."
+        }
+      }
+    }
+  }
+}

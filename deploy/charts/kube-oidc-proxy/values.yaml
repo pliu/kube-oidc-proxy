@@ -38,29 +38,17 @@ tls:
 # These values needs to be set in overrides in order to get kube-oidc-proxy
 # working.
 oidc:
-  # A minimal configuration requires setting clientId, issuerUrl and usernameClaim
-  # values.
-  clientId: ""
-  issuerUrl: ""
-  usernameClaim: ""
+  # Every issuer to trust. Each takes the fields of a jwt entry of
+  # kube-apiserver's --authentication-config, signingAlgs (default [RS256]),
+  # and optionally publicKeys to verify its tokens with instead of fetching
+  # its keys. See the chart README for examples.
+  issuers: []
 
-  # PEM encoded value of CA cert that will verify TLS connection to
-  # OIDC issuer URL. If not provided, default hosts root CA's will be used.
-  caPEM:
-
-  usernamePrefix:
-  groupsClaim:
-  groupsPrefix:
-
-  signingAlgs:
-    - RS256
-  requiredClaims: {}
-
-# To enable token passthrough feature
+# Forward every request to the API server as it is, with the caller's own token
+# and no impersonation. Cannot be combined with ldap or extra user headers.
 # https://github.com/jetstack/kube-oidc-proxy/blob/master/docs/tasks/token-passthrough.md
 tokenPassthrough:
   enabled: false
-  audiences: []
 
 # To add extra impersonation headers
 # https://github.com/jetstack/kube-oidc-proxy/blob/master/docs/tasks/extra-impersonation-headers.md
@@ -131,3 +119,18 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+# Optional LDAP augmentation with readable per-user ConfigMap persistence.
+ldap:
+  enabled: false
+  # Defaults to the release namespace. Prefer a dedicated namespace: the proxy
+  # trusts the per-user ConfigMaps there, unsigned, as group memberships, so
+  # anyone who can create or update ConfigMaps in it can grant any user any
+  # non-system: group - equivalent to cluster-admin. Allow only the proxy to
+  # write ConfigMaps in this namespace.
+  cacheNamespace: ""
+  # LDAP JSON settings, including backends, refreshInterval, lookupTimeout,
+  # lookupConcurrency and refreshConcurrency. The chart supplies cache.namespace.
+  # Mount bindPasswordFile/caFile with extraVolumes and extraVolumeMounts.
+  config:
+    backends: []

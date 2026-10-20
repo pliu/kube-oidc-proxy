@@ -1,0 +1,200 @@
+// Copyright Jetstack Ltd. See LICENSE for details.
+
+// Package ldap augments the groups of an authenticated user with the groups
+// they are a member of in one or more LDAP v3 directories - Active Directory,
+// or anything else that exposes a memberOf attribute.
+//
+// Authenticated users are resolved on demand and persisted per identity.
+// Only cached users are refreshed, and replicas synchronize through ConfigMaps.
+package ldap
+
+import (
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+)
+
+// resolver queries configured LDAP backends for one identity.
+type resolver struct {
+	config       *Config
+	backends     []*backend
+	refreshUsers map[string]struct{}
+	// fingerprint is the UserRecordFingerprint of config, fixed at startup.
+	fingerprint string
+}
+
+// backend is one configured LDAP directory.
+type backend struct {
+	config    *BackendConfig
+	tlsConfig *tls.Config
+
+	// bindPassword is resolved up front, so that a lookup does not depend on
+	// a file that may have gone away since startup.
+	bindPassword string
+
+	// groupBaseKeys restrict membership DNs to normalized configured bases
+	// before querying LDAP for their emitted names.
+	groupBaseKeys []string
+
+	// pool holds the bound connections idle between lookups.
+	pool *connPool
+
+	dial func(url string) (conn, error)
+}
+
+// newResolver prepares LDAP backends without contacting the directories.
+func newResolver(config *Config) (*resolver, error) {
+	if config == nil {
+		return nil, errors.New("no LDAP configuration")
+	}
+
+	// Defaulting here as well as when a config file is read holds a config
+	// built in code to the same shape as one read from disk.
+	config.SetDefaults()
+
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+
+	backends := make([]*backend, 0, len(config.Backends))
+	for _, backendConfig := range config.Backends {
+		// Every lookup and refresh in flight can hold a connection to each
+		// backend, and each can return it to be reused.
+		poolSize := config.LookupConcurrency + config.RefreshConcurrency
+		if !poolConnections {
+			poolSize = 0
+		}
+		b, err := newBackend(backendConfig, poolSize)
+		if err != nil {
+			return nil, err
+		}
+
+		backends = append(backends, b)
+	}
+
+	refreshUsers := make(map[string]struct{}, len(config.RefreshUsers))
+	for _, username := range config.RefreshUsers {
+		refreshUsers[usernameKey(username, config.UsernamePrefix)] = struct{}{}
+	}
+
+	d := &resolver{config: config, backends: backends, refreshUsers: refreshUsers,
+		fingerprint: config.UserRecordFingerprint()}
+
+	// Published from here rather than at init, so that a proxy running without
+	// augmentation configured reports no series at all.
+	registerMetrics()
+
+	return d, nil
+}
+
+// newBackend prepares a backend to be searched. The configuration has already
+// been validated by newResolver, so all that is left is the work that can fail against
+// the filesystem: the trust bundle and the bind password.
+func newBackend(config *BackendConfig, poolSize int) (*backend, error) {
+	tlsConfig, err := tlsConfigFor(config)
+	if err != nil {
+		return nil, err
+	}
+
+	bindPassword, err := config.bindPasswordFor()
+	if err != nil {
+		return nil, err
+	}
+
+	b := &backend{
+		config:       config,
+		tlsConfig:    tlsConfig,
+		bindPassword: bindPassword,
+		pool:         newConnPool(config.Name, poolSize),
+	}
+	b.dial = b.dialLDAP
+
+	// Parsed here rather than on the path that uses them, so that a search base
+	// which is not a DN at all is reported where somebody is watching instead
+	// of once per lookup of a user.
+	for _, base := range config.GroupSearchBases {
+		key, err := normaliseDN(base)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: groupSearchBase %q is not a valid DN: %s",
+				config.Name, base, err)
+		}
+
+		b.groupBaseKeys = append(b.groupBaseKeys, key)
+	}
+
+	return b, nil
+}
+
+// close closes the connections idle in every backend's pool.
+func (d *resolver) close() {
+	for _, b := range d.backends {
+		b.pool.close()
+	}
+}
+
+// CanRefresh reports whether the given user is allowed to trigger a refresh.
+// With no allowed users configured, any user may - the endpoint already sits
+// behind authentication.
+func (d *resolver) CanRefresh(username string) bool {
+	if len(d.refreshUsers) == 0 {
+		return true
+	}
+
+	_, ok := d.refreshUsers[usernameKey(username, d.config.UsernamePrefix)]
+	return ok
+}
+
+// usernameKey returns the one directory identity represented by a username.
+// Authenticated requests carry the configured OIDC prefix, while LDAP entries
+// carry the raw claim value. Strip the prefix before looking in either map so a
+// prefixed request can never first capture a different LDAP entry whose raw
+// username happens to begin with the same prefix.
+func usernameKey(username, prefix string) string {
+	if prefix != "" && strings.HasPrefix(username, prefix) {
+		username = strings.TrimPrefix(username, prefix)
+	}
+
+	return strings.ToLower(username)
+}
+
+// eachBackend searches every backend in parallel and returns the results in
+// configuration order. A lookup takes roughly as long as the slowest backend
+// rather than the sum of all of them. The first error in configuration order
+// is returned, so errors and results stay deterministic.
+func eachBackend[T any](backends []*backend, fn func(*backend) (T, error)) ([]T, error) {
+	type result struct {
+		value T
+		err   error
+	}
+
+	results := make([]result, len(backends))
+	var wg sync.WaitGroup
+	for i, b := range backends {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			value, err := fn(b)
+			if err != nil {
+				results[i].err = fmt.Errorf("backend %q: %w", b.config.Name, err)
+				return
+			}
+
+			results[i].value = value
+		}()
+	}
+	wg.Wait()
+
+	values := make([]T, 0, len(results))
+	for _, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+
+		values = append(values, result.value)
+	}
+
+	return values, nil
+}
