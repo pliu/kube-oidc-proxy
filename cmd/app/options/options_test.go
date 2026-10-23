@@ -15,7 +15,6 @@ const oneIssuer = `issuers:
   claimMappings:
     username:
       claim: email
-      prefix: ""
 `
 
 const oneBackend = `{"backends": [{

@@ -78,7 +78,7 @@ this project found [here](https://github.com/jetstack/cert-manager).
 Next, populate the OIDC authenticator Secret in `./deploy/yaml/secrets.yaml`
 with the details given to you by your OIDC provider. Its `authn.yaml` lists every
 issuer the proxy trusts under `issuers`; add an entry for each further issuer,
-with a username prefix of its own. Each issuer takes the fields of a `jwt` entry
+and set a shared top-level `usernamePrefix` (default `""`). Each issuer takes the other fields of a `jwt` entry
 of kube-apiserver's `--authentication-config`, and may also set `signingAlgs`, the JOSE algorithms its tokens may be signed with (default
 `[RS256]`). The `certificateAuthority` of an issuer is only needed when its
 serving certificate is not trusted by the host's root CAs. To verify an issuer's

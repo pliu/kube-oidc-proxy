@@ -172,7 +172,6 @@ func (h *Helper) DeployLDAPProxy(ns *corev1.Namespace, config LDAPProxyConfig) (
   claimMappings:
     username:
       claim: preferred_username
-      prefix: ""
 `, config.IssuerURL, config.ClientID,
 		strings.ReplaceAll(strings.TrimSpace(string(config.IssuerCA)), "\n", "\n      "))
 

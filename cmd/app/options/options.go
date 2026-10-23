@@ -104,12 +104,6 @@ func (o *Options) Validate(cmd *cobra.Command) error {
 		errs = append(errs, err...)
 	}
 
-	if o.LDAP.Enabled() {
-		if _, err := o.OIDCAuthentication.SharedUsernamePrefix(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
 	// Passthrough forwards requests as they are, so neither the groups of the
 	// directory nor extra user headers would ever reach the API server.
 	// Refused, so that a configuration asking for them is not quietly served

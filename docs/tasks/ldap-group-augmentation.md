@@ -9,6 +9,11 @@ authenticating or impersonating them. Impersonation headers
 are refused, as they are without augmentation; see
 [Impersonation Headers](../../README.md#impersonation-headers).
 
+The OIDC configuration's top-level `usernamePrefix` (default `""`) is added to
+every issuer's mapped username and stripped before LDAP lookups. Configure it
+once alongside `issuers`.
+The username forwarded to Kubernetes keeps the prefix.
+
 ## Configuration
 
 The JSON configuration is validated against [the embedded schema](../../pkg/proxy/ldap/schema.json).

@@ -94,7 +94,6 @@ func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID 
   claimMappings:
     username:
       claim: email
-      prefix: ""
     groups:
       claim: groups
       prefix: ""

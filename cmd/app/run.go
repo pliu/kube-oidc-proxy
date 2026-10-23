@@ -118,7 +118,7 @@ func buildRunCommand(stopCh <-chan struct{}, opts *options.Options) *cobra.Comma
 			var ldapDirectory proxy.GroupAugmenter
 			var ldapReadiness []probe.NamedCheck
 			if opts.LDAP.Enabled() {
-				usernamePrefix, err := opts.OIDCAuthentication.SharedUsernamePrefix()
+				usernamePrefix, err := opts.OIDCAuthentication.UsernamePrefix()
 				if err != nil {
 					return err
 				}

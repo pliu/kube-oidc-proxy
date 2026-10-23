@@ -12,10 +12,13 @@ every issuer whose tokens the proxy accepts. The chart renders it into the file
 the proxy's `--oidc-config-file` names. Each issuer takes the fields of a `jwt`
 entry of kube-apiserver's
 [`--authentication-config`](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#using-authentication-configuration),
-validated by the same rules.
+validated by the same rules, except username prefixes are configured once at
+`oidc.usernamePrefix` (default `""`) and applied to every issuer. The shared prefix also applies
+to usernames produced by CEL expressions; group prefixes remain per issuer.
 
 ```yaml
 oidc:
+  usernamePrefix: "oidc:"
   issuers:
   - issuer:
       url: https://accounts.google.com
@@ -23,7 +26,6 @@ oidc:
     claimMappings:
       username:
         claim: email
-        prefix: ""
 ```
 
 Each issuer may also set `signingAlgs`, the JOSE algorithms its tokens may be
@@ -31,6 +33,7 @@ signed with. It defaults to `[RS256]`.
 
 ```yaml
 oidc:
+  usernamePrefix: "oidc:"
   issuers:
   - issuer:
       url: https://accounts.google.com
@@ -42,21 +45,20 @@ oidc:
     claimMappings:
       username:
         claim: email
-        prefix: "google:"
   - issuer:
       url: https://login.example.com
       audiences: [kube-oidc-proxy]
     claimMappings:
       username:
         claim: sub
-        prefix: "example:"
       groups:
         claim: groups
         prefix: "example:"
 ```
 
-Give each issuer its own username and group prefix, so that a user or group of
-one issuer can never be mistaken for one of another in RBAC bindings.
+All issuers share the username prefix. Identical mapped usernames from different
+issuers represent the same Kubernetes user and receive the same LDAP lookup.
+Group prefixes can still distinguish groups from different issuers.
 
 When an issuer is served with a certificate from a private CA, add that CA as
 PEM encoded text to the issuer's `certificateAuthority`. Without one, the
@@ -64,6 +66,7 @@ host's root CAs are used.
 
 ```yaml
 oidc:
+  usernamePrefix: "oidc:"
   issuers:
   - issuer:
       url: https://login.example.com
@@ -93,7 +96,6 @@ oidc:
     claimMappings:
       username:
         claim: sub
-        prefix: "example:"
 ```
 
 An issuer's keys are normally fetched from it, through the `jwks_uri` of its
@@ -105,6 +107,7 @@ be set alongside.
 
 ```yaml
 oidc:
+  usernamePrefix: "oidc:"
   issuers:
   - issuer:
       url: https://login.example.com
@@ -118,7 +121,6 @@ oidc:
     claimMappings:
       username:
         claim: sub
-        prefix: "example:"
 ```
 
 With keys given, nothing notices the issuer rotating its keys: tokens signed

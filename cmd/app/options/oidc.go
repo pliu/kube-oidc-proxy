@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -51,7 +52,8 @@ type Issuer struct {
 type OIDCAuthenticationOptions struct {
 	ConfigFile string
 
-	issuers []Issuer
+	issuers        []Issuer
+	usernamePrefix string
 }
 
 func NewOIDCAuthenticationOptions(nfs *cliflag.NamedFlagSets) *OIDCAuthenticationOptions {
@@ -77,7 +79,7 @@ func (o *OIDCAuthenticationOptions) Issuers() ([]Issuer, error) {
 		return o.issuers, nil
 	}
 
-	issuers, err := loadIssuers(o.ConfigFile)
+	issuers, err := o.loadIssuers(o.ConfigFile)
 	if err != nil {
 		return nil, err
 	}
@@ -87,45 +89,27 @@ func (o *OIDCAuthenticationOptions) Issuers() ([]Issuer, error) {
 	return issuers, nil
 }
 
-// SharedUsernamePrefix returns the username prefix every trusted issuer puts
-// on its usernames. LDAP entries are keyed on raw usernames, so the proxy can
-// only look a user up in them when it knows which prefix to take off - with
-// issuers that prefix differently, users of different issuers who share a raw
-// username would be handed each other's directory groups.
-func (o *OIDCAuthenticationOptions) SharedUsernamePrefix() (string, error) {
-	issuers, err := o.Issuers()
-	if err != nil {
+// UsernamePrefix returns the configured prefix shared by every issuer.
+func (o *OIDCAuthenticationOptions) UsernamePrefix() (string, error) {
+	if _, err := o.Issuers(); err != nil {
 		return "", err
 	}
-
-	var prefix string
-	for i, issuer := range issuers {
-		var p string
-		if issuer.JWTAuthenticator.ClaimMappings.Username.Prefix != nil {
-			p = *issuer.JWTAuthenticator.ClaimMappings.Username.Prefix
-		}
-
-		if i > 0 && p != prefix {
-			return "", fmt.Errorf("LDAP group augmentation requires every issuer to use the same "+
-				"username prefix, got %q and %q", prefix, p)
-		}
-
-		prefix = p
-	}
-
-	return prefix, nil
+	return o.usernamePrefix, nil
 }
 
 // configFile is the file --oidc-config-file names.
 type configFile struct {
-	Issuers []configIssuer `json:"issuers"`
+	UsernamePrefix string         `json:"usernamePrefix,omitempty"`
+	Issuers        []configIssuer `json:"issuers"`
 }
 
 // configIssuer is a jwt entry of kube-apiserver's AuthenticationConfiguration
-// with the algorithms its tokens may be signed with, which kube-apiserver
-// takes from a flag instead, and optionally the keys to verify them with.
+// with a shared username prefix, allowed signing algorithms, and optional
+// verification keys.
 type configIssuer struct {
 	apiserverv1.JWTAuthenticator `json:",inline"`
+
+	ClaimMappings configClaimMappings `json:"claimMappings"`
 
 	SigningAlgs []string `json:"signingAlgs,omitempty"`
 
@@ -134,8 +118,15 @@ type configIssuer struct {
 	PublicKeys string `json:"publicKeys,omitempty"`
 }
 
+// configClaimMappings uses a claim or expression for usernames; the prefix
+// comes from configFile rather than individual issuers.
+type configClaimMappings struct {
+	apiserverv1.ClaimMappings `json:",inline"`
+	Username                  apiserverv1.ClaimOrExpression `json:"username"`
+}
+
 // loadIssuers reads the issuers out of the file --oidc-config-file names.
-func loadIssuers(path string) ([]Issuer, error) {
+func (o *OIDCAuthenticationOptions) loadIssuers(path string) ([]Issuer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read --oidc-config-file: %w", err)
@@ -164,7 +155,21 @@ func loadIssuers(path string) ([]Issuer, error) {
 	// same issuers, so every rule it holds its issuers to holds here too.
 	external := &apiserverv1.AuthenticationConfiguration{}
 	for _, issuer := range file.Issuers {
-		external.JWT = append(external.JWT, issuer.JWTAuthenticator)
+		jwt := issuer.JWTAuthenticator
+		jwt.ClaimMappings = issuer.ClaimMappings.ClaimMappings
+		jwt.ClaimMappings.Username = apiserverv1.PrefixedClaimOrExpression{
+			Claim:      issuer.ClaimMappings.Username.Claim,
+			Expression: issuer.ClaimMappings.Username.Expression,
+		}
+		username := &jwt.ClaimMappings.Username
+		if username.Claim != "" {
+			username.Prefix = &file.UsernamePrefix
+		} else if username.Expression != "" && file.UsernamePrefix != "" {
+			// JSON string literals safely escape the prefix for CEL as well.
+			prefix, _ := json.Marshal(file.UsernamePrefix)
+			username.Expression = string(prefix) + " + (" + username.Expression + ")"
+		}
+		external.JWT = append(external.JWT, jwt)
 	}
 
 	configScheme.Default(external)
@@ -231,6 +236,7 @@ func loadIssuers(path string) ([]Issuer, error) {
 		})
 	}
 
+	o.usernamePrefix = file.UsernamePrefix
 	return issuers, nil
 }
 

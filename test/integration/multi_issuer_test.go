@@ -99,7 +99,8 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 
 	// Each issuer is verified against its own CA, and B additionally requires
 	// a claim.
-	authnConfig := fmt.Sprintf(`issuers:
+	authnConfig := fmt.Sprintf(`usernamePrefix: "oidc:"
+issuers:
 - issuer:
     url: %s
     audiences: [client-a]
@@ -108,7 +109,6 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
   claimMappings:
     username:
       claim: email
-      prefix: "a:"
 - issuer:
     url: %s
     audiences: [client-b]
@@ -119,8 +119,7 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
     requiredValue: b
   claimMappings:
     username:
-      claim: email
-      prefix: "b:"
+      expression: claims.sub
 - issuer:
     url: %s
     audiences: [client-c]
@@ -130,7 +129,6 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
   claimMappings:
     username:
       claim: email
-      prefix: "c:"
 - issuer:
     url: %s
     audiences: [client-static]
@@ -139,7 +137,6 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
   claimMappings:
     username:
       claim: email
-      prefix: "static:"
 `, issuerA.url, indent(issuerA.ca, "      "), issuerB.url, indent(issuerB.ca, "      "),
 		issuerC.url, indent(issuerC.ca, "      "), staticURL, indent(staticSigner.CertBytes, "    "))
 	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
@@ -186,6 +183,7 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 
 		token, err := new(helper.Helper).SignToken(signer, []byte(fmt.Sprintf(`{
   "email": "alice@example.com",
+  "sub": "alice@example.com",
   "exp": %d,
   %s
 }`, time.Now().Add(10*time.Minute).Unix(), claims)))
@@ -219,19 +217,19 @@ func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 			signer:  issuerA.signer,
 			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-a"`, issuerA.url),
 			expCode: http.StatusOK,
-			expUser: "a:alice@example.com",
+			expUser: "oidc:alice@example.com",
 		},
 		"a token from the second issuer": {
 			signer:  issuerB.signer,
 			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-b", "tenant": "b"`, issuerB.url),
 			expCode: http.StatusOK,
-			expUser: "b:alice@example.com",
+			expUser: "oidc:alice@example.com",
 		},
 		"a token from an issuer with its keys in the file": {
 			signer:  staticSigner,
 			claims:  fmt.Sprintf(`"iss": %q, "aud": "client-static"`, staticURL),
 			expCode: http.StatusOK,
-			expUser: "static:alice@example.com",
+			expUser: "oidc:alice@example.com",
 		},
 		"a token naming the issuer with its keys in the file but signed by another's key": {
 			signer:  issuerA.signer,

@@ -38,7 +38,10 @@ tls:
 # These values needs to be set in overrides in order to get kube-oidc-proxy
 # working.
 oidc:
-  # Every issuer to trust. Each takes the fields of a jwt entry of
+  # Added to every mapped username and stripped for LDAP lookups.
+  usernamePrefix: ""
+  # Every issuer to trust. Username prefixes must be set above, rather than
+  # in claimMappings.username.prefix. Each takes the other fields of a jwt entry of
   # kube-apiserver's --authentication-config, signingAlgs (default [RS256]),
   # and optionally publicKeys to verify its tokens with instead of fetching
   # its keys. See the chart README for examples.

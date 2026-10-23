@@ -100,7 +100,8 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		close(stopComponents)
 	})
 
-	authnConfig := fmt.Sprintf(`issuers:
+	authnConfig := fmt.Sprintf(`usernamePrefix: "oidc:"
+issuers:
 - issuer:
     url: %s
     audiences: [%s]
@@ -109,7 +110,6 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
   claimMappings:
     username:
       claim: email
-      prefix: ""
     groups:
       claim: groups
       prefix: ""
@@ -279,8 +279,8 @@ func assertIdentity(t *testing.T, response *http.Response, groups ...string) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("proxy response status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
-	if got := response.Header.Get("Impersonate-User"); got != "alice@example.com" {
-		t.Errorf("API server received Impersonate-User %q, want %q", got, "alice@example.com")
+	if got := response.Header.Get("Impersonate-User"); got != "oidc:alice@example.com" {
+		t.Errorf("API server received Impersonate-User %q, want %q", got, "oidc:alice@example.com")
 	}
 
 	gotGroups := append([]string(nil), response.Header.Values("Impersonate-Group")...)

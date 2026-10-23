@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,13 +46,16 @@ func writeFile(t *testing.T, name, content string) string {
 	return path
 }
 
-const twoIssuers = `issuers:
+const twoIssuers = `usernamePrefix: "oidc:"
+issuers:
 - issuer:
     url: https://a.example.com
     audiences: [proxy-a]
   claimMappings:
     username:
       claim: email
+    groups:
+      claim: groups
       prefix: "a:"
 - issuer:
     url: https://b.example.com
@@ -63,6 +67,8 @@ const twoIssuers = `issuers:
   claimMappings:
     username:
       claim: sub
+    groups:
+      claim: groups
       prefix: "b:"
 `
 
@@ -96,6 +102,13 @@ func TestConfigFileTrustsEveryIssuer(t *testing.T) {
 		t.Errorf("expected issuer b to allow %v, got %v", exp, got)
 	}
 
+	for i, prefix := range []string{"a:", "b:"} {
+		got := issuers[i].JWTAuthenticator.ClaimMappings.Groups.Prefix
+		if got == nil || *got != prefix {
+			t.Errorf("issuer %d: expected group prefix %q, got %v", i, prefix, got)
+		}
+	}
+
 	exp := []apiserver.ClaimValidationRule{{Claim: "hd", RequiredValue: "example.com"}}
 	if got := issuers[1].JWTAuthenticator.ClaimValidationRules; !reflect.DeepEqual(got, exp) {
 		t.Errorf("expected claim validation rules %v, got %v", exp, got)
@@ -105,7 +118,7 @@ func TestConfigFileTrustsEveryIssuer(t *testing.T) {
 func TestConfigFileInvalid(t *testing.T) {
 	const (
 		issuerA  = "- issuer:\n    url: https://a.example.com\n    audiences: [a]\n"
-		username = "  claimMappings:\n    username:\n      claim: sub\n      prefix: \"\"\n"
+		username = "  claimMappings:\n    username:\n      claim: sub\n"
 	)
 
 	tests := map[string]struct {
@@ -131,10 +144,13 @@ func TestConfigFileInvalid(t *testing.T) {
 				"- issuer:\n    url: https://a.example.com\n    audiences: [b]\n" + username,
 			expErr: "Duplicate value",
 		},
-		// kube-apiserver requires the prefix be given whenever the claim is.
-		"username claim without a prefix": {
-			config: "issuers:\n" + issuerA + "  claimMappings:\n    username:\n      claim: sub\n",
-			expErr: "prefix",
+		"per issuer username prefix": {
+			config: "issuers:\n" + issuerA + username + "      prefix: \"a:\"\n",
+			expErr: `unknown field "prefix"`,
+		},
+		"empty per issuer username prefix": {
+			config: "issuers:\n" + issuerA + username + "      prefix: \"\"\n",
+			expErr: `unknown field "prefix"`,
 		},
 		"issuer without https": {
 			config: "issuers:\n- issuer:\n    url: http://a.example.com\n    audiences: [a]\n" + username,
@@ -178,7 +194,8 @@ func TestConfigFileInvalid(t *testing.T) {
 
 // The fields of an issuer are kube-apiserver's, CEL expressions included.
 func TestConfigFileExpressionMappings(t *testing.T) {
-	o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", `issuers:
+	o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", `usernamePrefix: "oidc:"
+issuers:
 - issuer:
     url: https://a.example.com
     audiences: [a]
@@ -195,7 +212,7 @@ func TestConfigFileExpressionMappings(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	if got, exp := issuers[0].JWTAuthenticator.ClaimMappings.Username.Expression, `"a:" + claims.sub`; got != exp {
+	if got, exp := issuers[0].JWTAuthenticator.ClaimMappings.Username.Expression, `"oidc:" + ("a:" + claims.sub)`; got != exp {
 		t.Errorf("expected username expression %q, got %q", exp, got)
 	}
 
@@ -211,24 +228,32 @@ func TestNoIssuer(t *testing.T) {
 	}
 }
 
-func TestSharedUsernamePrefix(t *testing.T) {
-	single := twoIssuers[:strings.Index(twoIssuers, "- issuer:\n    url: https://b.example.com")]
-	o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", single))
-	if prefix, err := o.SharedUsernamePrefix(); err != nil || prefix != "a:" {
-		t.Errorf("expected prefix %q, got %q (err=%v)", "a:", prefix, err)
+func TestUsernamePrefix(t *testing.T) {
+	for _, prefix := range []string{"", "oidc:", "quoted\"prefix:"} {
+		t.Run(prefix, func(t *testing.T) {
+			config := strings.Replace(twoIssuers, `usernamePrefix: "oidc:"`, "usernamePrefix: "+strconv.Quote(prefix), 1)
+			o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", config))
+			got, err := o.UsernamePrefix()
+			if err != nil || got != prefix {
+				t.Fatalf("expected prefix %q, got %q (err=%v)", prefix, got, err)
+			}
+			issuers, err := o.Issuers()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, issuer := range issuers {
+				got := issuer.JWTAuthenticator.ClaimMappings.Username.Prefix
+				if got == nil || *got != prefix {
+					t.Errorf("issuer %d: expected prefix %q, got %v", i, prefix, got)
+				}
+			}
+		})
 	}
 
-	// Issuers a: and b: prefix their usernames differently, so there is no
-	// one prefix to take off before a directory lookup.
-	o = parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", twoIssuers))
-	if _, err := o.SharedUsernamePrefix(); err == nil {
-		t.Error("expected an error for issuers with different username prefixes")
-	}
-
-	shared := strings.ReplaceAll(twoIssuers, `prefix: "b:"`, `prefix: "a:"`)
-	o = parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml", shared))
-	if prefix, err := o.SharedUsernamePrefix(); err != nil || prefix != "a:" {
-		t.Errorf("expected prefix %q, got %q (err=%v)", "a:", prefix, err)
+	o := parseOIDCFlags(t, "--oidc-config-file="+writeFile(t, "authn.yaml",
+		strings.Replace(twoIssuers, "usernamePrefix: \"oidc:\"\n", "", 1)))
+	if prefix, err := o.UsernamePrefix(); err != nil || prefix != "" {
+		t.Fatalf("expected default empty prefix, got %q (err=%v)", prefix, err)
 	}
 }
 
@@ -269,7 +294,7 @@ func indentBlock(s, prefix string) string {
 func publicKeysConfig(publicKeys, extra string) string {
 	return "issuers:\n- issuer:\n    url: https://a.example.com\n    audiences: [a]\n" + extra +
 		"  publicKeys: |\n" + indentBlock(publicKeys, "    ") + "\n" +
-		"  claimMappings:\n    username:\n      claim: sub\n      prefix: \"\"\n"
+		"  claimMappings:\n    username:\n      claim: sub\n"
 }
 
 func TestConfigFilePublicKeys(t *testing.T) {
