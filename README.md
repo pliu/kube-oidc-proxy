@@ -259,6 +259,18 @@ the probes rather than on the secure port.
 
 LDAP group augmentation adds [its own metrics](./docs/tasks/ldap-group-augmentation.md#observability-and-verification).
 
+## TODO
+
+- Support operator breakglass overrides of a user's groups during LDAP outages,
+  ideally through manual edits to the user's ConfigMap. Define how overrides
+  are marked, audited, expired or cleared, and reconciled when LDAP recovers.
+- Implement the LDAP refresh endpoint. It currently authenticates and authorizes
+  callers, then returns success without refreshing cached memberships.
+- Handle disabled LDAP user accounts explicitly, including cached memberships
+  and users present in multiple backends. Disabled accounts currently have no
+  dedicated check; filtering them out of LDAP searches alone does not deny
+  requests authenticated by OIDC.
+
 ## Development
 *NOTE*: building kube-oidc-proxy requires Go version 1.17 or higher.
 
