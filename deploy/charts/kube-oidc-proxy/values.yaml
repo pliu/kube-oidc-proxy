@@ -133,7 +133,7 @@ ldap:
   # write ConfigMaps in this namespace.
   cacheNamespace: ""
   # LDAP JSON settings, including backends, refreshInterval, lookupTimeout,
-  # lookupConcurrency and refreshConcurrency. The chart supplies cache.namespace.
+  # lookupConcurrency and refreshBatchSize. The chart supplies cache.namespace.
   # Mount bindPasswordFile/caFile with extraVolumes and extraVolumeMounts.
   config:
     backends: []

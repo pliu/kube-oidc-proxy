@@ -21,9 +21,7 @@ func TestResolveRequeriesAfterDirectoryOrBindIdentityChange(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			previous, client := userTestDirectory(t)
-			previous.resolver.backends[0].dial = func(string) (conn, error) {
-				return connWithUsers([]string{"Old"}, map[string][]string{"alice": {"Old"}}), nil
-			}
+			serveUsers(previous, map[string][]string{"alice": {"Old"}})
 			if _, err := previous.Resolve(context.Background(), "alice"); err != nil {
 				t.Fatal(err)
 			}
@@ -39,17 +37,13 @@ func TestResolveRequeriesAfterDirectoryOrBindIdentityChange(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(directory.cancel)
-			calls := 0
-			directory.resolver.backends[0].dial = func(string) (conn, error) {
-				calls++
-				return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
-			}
+			calls := serveUsers(directory, map[string][]string{"alice": {"New"}})
 			if _, err := directory.restoreUsers(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			groups, err := directory.Resolve(context.Background(), "alice")
-			if err != nil || calls != 1 || !reflect.DeepEqual(groups, []string{"New"}) {
-				t.Fatalf("old memberships reused: groups=%v calls=%d err=%v", groups, calls, err)
+			if err != nil || calls.Load() != 1 || !reflect.DeepEqual(groups, []string{"New"}) {
+				t.Fatalf("old memberships reused: groups=%v calls=%d err=%v", groups, calls.Load(), err)
 			}
 			saved, err := store.Get(context.Background(), "alice")
 			if err != nil || saved.Invalid != nil || saved.Record == nil || !reflect.DeepEqual(saved.Record.Groups, groups) {
@@ -72,14 +66,10 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(d.cancel)
-	var calls atomic.Int64
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		calls.Add(1)
-		return connWithUsers([]string{"PrefixedIdentity", "PlainIdentity"}, map[string][]string{
-			"oidc:alice": {"PrefixedIdentity"},
-			"alice":      {"PlainIdentity"},
-		}), nil
-	}
+	calls := serveUsers(d, map[string][]string{
+		"oidc:alice": {"PrefixedIdentity"},
+		"alice":      {"PlainIdentity"},
+	})
 	identities := []struct{ request, canonical, group string }{
 		{"oidc:oidc:Alice", "oidc:alice", "PrefixedIdentity"},
 		{"oidc:Alice", "alice", "PlainIdentity"},
@@ -124,11 +114,7 @@ func TestResolveKeepsRawUsernamePrefixDistinct(t *testing.T) {
 
 func TestResolvePersistsAndCacheHitDoesNoIO(t *testing.T) {
 	d, client := userTestDirectory(t)
-	var calls atomic.Int64
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		calls.Add(1)
-		return connWithUsers([]string{"Developers"}, map[string][]string{"alice": {"Developers"}}), nil
-	}
+	calls := serveUsers(d, map[string][]string{"alice": {"Developers"}})
 	groups, err := d.Resolve(context.Background(), "ALICE")
 	if err != nil || !reflect.DeepEqual(groups, []string{"Developers"}) {
 		t.Fatalf("%v %v", groups, err)
@@ -159,7 +145,7 @@ func TestResolveCoalescesAndCanceledWaiterDoesNotCancelOthers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	first := make(chan error, 1)
 	go func() { _, err := d.Resolve(ctx, "alice"); first <- err }()
-	<-entered
+	receive(t, entered)
 	const waiters = 12
 	var wg sync.WaitGroup
 	for i := 0; i < waiters; i++ {
@@ -172,7 +158,7 @@ func TestResolveCoalescesAndCanceledWaiterDoesNotCancelOthers(t *testing.T) {
 		}()
 	}
 	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
+	if err := receive(t, first); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	close(release)
@@ -204,7 +190,7 @@ func TestResolveIndependentUsersAndBackendFailure(t *testing.T) {
 	}
 	close(release)
 	for i := 0; i < 2; i++ {
-		if err := <-result; err == nil {
+		if err := receive(t, result); err == nil {
 			t.Fatal("partial result succeeded")
 		}
 	}
@@ -223,28 +209,26 @@ func TestCanceledRefreshWaiterDoesNotCancelSharedMiss(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	refresh := make(chan error, 1)
-	go func() { _, err := d.resolve(ctx, "alice", true); refresh <- err }()
-	<-entered
+	go func() { _, err := refreshOne(ctx, d, "alice"); refresh <- err }()
+	receive(t, entered)
 	miss := make(chan error, 1)
 	go func() { _, err := d.Resolve(context.Background(), "alice"); miss <- err }()
 	cancel()
-	if err := <-refresh; !errors.Is(err, context.Canceled) {
+	if err := receive(t, refresh); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	close(release)
-	if err := <-miss; err != nil {
+	if err := receive(t, miss); err != nil {
 		t.Fatalf("refresh waiter canceled shared work: %v", err)
 	}
 }
 
 func TestCollidingNamesNeverShareGroups(t *testing.T) {
 	d, _ := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"AtGroup", "DashGroup"}, map[string][]string{
-			"alice@example.net": {"AtGroup"},
-			"alice-example.net": {"DashGroup"},
-		}), nil
-	}
+	serveUsers(d, map[string][]string{
+		"alice@example.net": {"AtGroup"},
+		"alice-example.net": {"DashGroup"},
+	})
 	want := map[string]string{"alice@example.net": "AtGroup", "alice-example.net": "DashGroup"}
 	// Alternate so each lookup finds the other user's record under the shared name.
 	for i := 0; i < 3; i++ {

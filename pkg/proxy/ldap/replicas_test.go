@@ -15,11 +15,7 @@ import (
 
 func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 	first, _ := userTestDirectory(t)
-	second, err := NewUserDirectory(first.resolver.config, first.store, first.leadership)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(second.cancel)
+	second := newTestReplica(t, first)
 	// No watch is started: each replica must remain correct with arbitrarily
 	// delayed events, using only resource versions returned by the API.
 	for _, refresh := range []bool{false, true} {
@@ -50,7 +46,7 @@ func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 			}
 			results := []chan result{make(chan result, 1), make(chan result, 1)}
 			for i, d := range []*UserDirectory{first, second} {
-				go func() { e, err := d.resolve(context.Background(), "alice", refresh); results[i] <- result{e, err} }()
+				go func() { e, err := resolveOrRefresh(d, "alice", refresh); results[i] <- result{e, err} }()
 			}
 			for i := 0; i < 2; i++ {
 				select {
@@ -60,12 +56,12 @@ func TestReplicasRaceOnMissAndRefreshWithDelayedWatches(t *testing.T) {
 				}
 			}
 			close(releaseFirst)
-			winner := <-results[0]
+			winner := receive(t, results[0])
 			if winner.err != nil {
 				t.Fatal(winner.err)
 			}
 			close(releaseSecond)
-			loser := <-results[1]
+			loser := receive(t, results[1])
 			if loser.err != nil {
 				t.Fatal(loser.err)
 			}
@@ -98,7 +94,7 @@ func (s *interruptedStore) Watch(ctx context.Context, version string) (watch.Int
 }
 func TestInterruptedWatchRelistsAndRemovesDeletedUser(t *testing.T) {
 	d, client := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+	serveUsers(d, nil)
 	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -116,26 +112,16 @@ func TestInterruptedWatchRelistsAndRemovesDeletedUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	stream.Stop()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := d.cached("alice"); !ok {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("relist retained deleted record")
+	waitFor(t, "relist to remove deleted record", 3*time.Second, func() bool {
+		_, ok := d.cached("alice")
+		return !ok
+	})
 }
 
 func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	old, _ := userTestDirectory(t)
-	next, err := NewUserDirectory(old.resolver.config, old.store, old.leadership)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(next.cancel)
-	old.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Original"}, map[string][]string{"alice": {"Original"}}), nil
-	}
+	next := newTestReplica(t, old)
+	serveUsers(old, map[string][]string{"alice": {"Original"}})
 	if _, err := old.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -148,31 +134,21 @@ func TestLeadershipHandoverDiscardsOldLookup(t *testing.T) {
 	cycle, cancel := context.WithCancel(old.ctx)
 	done := make(chan error, 1)
 	go func() { done <- old.RefreshCached(cycle) }()
-	<-entered
+	receive(t, entered)
 	cancel()
-	next.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Current"}, map[string][]string{"alice": {"Current"}}), nil
-	}
-	if _, err := next.resolve(context.Background(), "alice", true); err != nil {
+	serveUsers(next, map[string][]string{"alice": {"Current"}})
+	if _, err := refreshOne(context.Background(), next, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
-	if err := <-done; err == nil {
+	if err := receive(t, done); err == nil {
 		t.Fatal("old leadership cycle did not cancel")
 	}
-	deadline := time.Now().Add(time.Second)
-	for {
+	waitFor(t, "old lookup to finish", time.Second, func() bool {
 		old.callsMu.Lock()
-		pending := len(old.calls)
-		old.callsMu.Unlock()
-		if pending == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("old lookup did not finish")
-		}
-		time.Sleep(time.Millisecond)
-	}
+		defer old.callsMu.Unlock()
+		return len(old.calls) == 0
+	})
 	saved, err := old.store.Get(context.Background(), "alice")
 	if err != nil || saved.Record.Groups[0] != "Current" {
 		t.Fatalf("handover regressed record: %+v %v", saved, err)

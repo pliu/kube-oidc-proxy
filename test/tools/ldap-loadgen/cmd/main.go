@@ -153,7 +153,7 @@ func run(ctx context.Context, o options) error {
 		return err
 	}
 	r.addHistogram("Leader refresh of all users", "full cycle", cycle.full)
-	r.addHistogram("Leader refresh of all users", "LDAP lookup per user and backend", cycle.perUser)
+	r.addHistogram("Leader refresh of all users", "LDAP lookup per batch and backend", cycle.perBatch)
 
 	rng := rand.New(rand.NewSource(1))
 	picks := make([]string, o.warmRequests)
@@ -351,7 +351,7 @@ func parallel(concurrency int, interval time.Duration, n int, fn func(int) error
 }
 
 type refreshCycle struct {
-	full, perUser histogram
+	full, perBatch histogram
 }
 
 // waitForFullRefresh returns the second refresh cycle to complete after every
@@ -372,8 +372,8 @@ func waitForFullRefresh(ctx context.Context, client *http.Client, o options, aft
 		switch done := m.histogram(fullRefreshMetric, nil).count - start; {
 		case done >= 2 && first != nil:
 			return &refreshCycle{
-				full:    m.histogram(fullRefreshMetric, nil).sub(first.histogram(fullRefreshMetric, nil)),
-				perUser: m.histogram(userRefreshMetric, asyncLabels).sub(first.histogram(userRefreshMetric, asyncLabels)),
+				full:     m.histogram(fullRefreshMetric, nil).sub(first.histogram(fullRefreshMetric, nil)),
+				perBatch: m.histogram(userRefreshMetric, asyncLabels).sub(first.histogram(userRefreshMetric, asyncLabels)),
 			}, nil
 		case done >= 2:
 			return nil, errors.New("two refresh cycles completed between scrapes; lower the scrape interval")

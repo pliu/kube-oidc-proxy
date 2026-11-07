@@ -47,7 +47,7 @@ func TestCancellationClosesBlockedLDAPWrite(t *testing.T) {
 				}
 				defer cancel()
 				done := make(chan error, 1)
-				go func() { _, err := d.searchUser(ctx, "alice", false); done <- err }()
+				go func() { _, err := d.searchUser(ctx, "alice"); done <- err }()
 				// Read one byte so a real request is being written, then stop
 				// reading to model a peer with a full receive window.
 				server.SetReadDeadline(time.Now().Add(time.Second))
@@ -216,7 +216,7 @@ func TestContextClosesBlockedLDAPOperations(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				done := make(chan error, 1)
-				go func() { _, err := d.searchUser(ctx, "alice", false); done <- err }()
+				go func() { _, err := d.searchUser(ctx, "alice"); done <- err }()
 				select {
 				case <-c.entered:
 				case <-time.After(time.Second):
@@ -252,7 +252,7 @@ func TestLateDialConnectionIsClosedWithoutBinding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := d.searchUser(ctx, "alice", false); done <- err }()
+	go func() { _, err := d.searchUser(ctx, "alice"); done <- err }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):

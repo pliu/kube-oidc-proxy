@@ -172,7 +172,7 @@ ldap:
   enabled: true
   config:
     lookupConcurrency: 8
-    refreshConcurrency: 4
+    refreshBatchSize: 100
     lookupTimeout: 1m
     refreshInterval: 1h
     backends:

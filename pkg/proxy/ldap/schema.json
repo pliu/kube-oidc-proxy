@@ -37,7 +37,7 @@
     "lookupTimeout": {
       "$ref": "#/$defs/duration",
       "default": "1m",
-      "description": "Total time for one admitted lookup, including Kubernetes reads, LDAP and persistence."
+      "description": "Total time for one admitted lookup, including Kubernetes reads, LDAP and persistence. For refresh, it bounds each user's Kubernetes read and write, and each batch's LDAP search."
     },
     "lookupConcurrency": {
       "type": "integer",
@@ -45,11 +45,12 @@
       "default": 8,
       "description": "Maximum concurrent distinct-user lookups started by requests per replica, including Kubernetes reads, LDAP and persistence. New identities are rejected when full; existing calls can still be joined. Each LDAP lookup queries all backends."
     },
-    "refreshConcurrency": {
+    "refreshBatchSize": {
       "type": "integer",
       "minimum": 1,
-      "default": 4,
-      "description": "Maximum concurrent lookups started by the leader's periodic refresh, counted separately from lookupConcurrency so a refresh cycle never exhausts request capacity."
+      "maximum": 500,
+      "default": 100,
+      "description": "Number of cached users the leader's refresh searches for together, with one user search per backend and user search base and each group resolved once per batch."
     }
   },
   "$defs": {

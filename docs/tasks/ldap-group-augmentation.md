@@ -33,7 +33,7 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
   "refreshInterval": "1h",
   "lookupTimeout": "1m",
   "lookupConcurrency": 8,
-  "refreshConcurrency": 4
+  "refreshBatchSize": 100
 }
 ```
 
@@ -42,9 +42,9 @@ The JSON configuration is validated against [the embedded schema](../../pkg/prox
 | `backends` | Required | Query every backend and union memberships. |
 | `cache.namespace` | Pod namespace | Namespace containing generated user ConfigMaps. Set explicitly outside Kubernetes. |
 | `refreshInterval` | `1h` | Interval between leader refresh cycles. |
-| `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. |
+| `lookupTimeout` | `1m` | Total shared lookup deadline, including Kubernetes reads, LDAP and persistence. For refresh, it bounds each user's Kubernetes read and write, and each batch's LDAP search. |
 | `lookupConcurrency` | `8` | Maximum concurrent distinct-user lookups started by requests **per replica**, including Kubernetes reads, LDAP and persistence. |
-| `refreshConcurrency` | `4` | Maximum concurrent lookups started by the leader's periodic refresh, counted separately from `lookupConcurrency`. |
+| `refreshBatchSize` | `100` | Cached users refreshed together in one batch, from 1 to 500. The leader refreshes one batch at a time. |
 | `refreshUsers` | Any authenticated user | Allowed callers of the currently stubbed refresh endpoint. |
 
 Each backend requires a unique `name`, one or more `urls`, `userSearchBases`, and
@@ -58,14 +58,14 @@ are stripped from the file. Passwords and CA files are loaded at startup.
 | `usernameAttribute` | `userPrincipalName` | Matches the OIDC username after removing its configured prefix, case insensitively. |
 | `groupFilter` | `(objectClass=group)` | Restricts membership group entries. |
 | `groupNameAttribute` | `cn` | Full emitted group name. |
-| `timeout` | `5m` | Backend operation deadline; also bounded by `lookupTimeout`. |
+| `timeout` | `15s` | Backend operation deadline; also bounded by `lookupTimeout`. |
 | `startTLS` | `false` | Upgrade an `ldap://` connection to TLS. |
 | `caFile` | System roots | PEM certificate bundle. |
 | `insecureSkipTLSVerify` | `false` | Disable TLS verification for testing. |
 
 Bound connections are pooled per backend and reused across lookups and refresh
 cycles, so most lookups skip the dial, TLS handshake and bind. A connection
-serves one lookup at a time; up to `lookupConcurrency` + `refreshConcurrency` of
+serves one lookup or refresh batch at a time; up to `lookupConcurrency` + 1 of
 them are kept idle per backend. Idle connections are checked every ten seconds
 and closed after a minute unused, which is below the idle timeouts of Active
 Directory and most load balancers, and after ten minutes open, so that a backend
@@ -97,8 +97,9 @@ DNs emitting the same group name within a backend also fail; targeted name
 searches check this even if only one of those groups appears in `memberOf`.
 Overlapping search bases returning the same DN are accepted. DN comparison
 preserves escaped-comma distinctions while allowing equivalent DN spellings.
-One lookup allows at most 1,000 direct group resolutions and 1,000 range follow-up
-requests. Exceeding either bound fails the lookup without truncating memberships.
+One user may hold at most 1,000 distinct groups under the group search bases,
+and each user entry allows at most 1,000 range follow-up requests. Exceeding
+either bound fails that user without truncating memberships.
 
 ## Persistence and replicas
 
@@ -159,23 +160,25 @@ users can progress concurrently. Canceling one request does not cancel shared
 miss work. Lookup deadlines and shutdown bound that work. Admission is limited
 by `lookupConcurrency` before any shared goroutine or external I/O starts. At
 capacity, new distinct-user lookups fail immediately (HTTP 503); memory hits and
-waiters joining admitted same-user work remain available. Refresh is admitted
-against its own `refreshConcurrency` limit, so a refresh cycle never takes
-capacity from request lookups; a user already being looked up by a request is
-joined rather than looked up twice. Refresh lookups that cannot be admitted are
-retried in the next cycle.
+waiters joining admitted same-user work remain available. The leader refreshes
+one batch at a time, admitted outside `lookupConcurrency`, so a refresh cycle
+never takes capacity from request lookups. Every user of a batch still has a shared call of
+their own: a request for a user being refreshed joins the batch, and a user
+already being looked up by a request is joined rather than searched in the
+batch. Refresh batches that cannot be admitted are retried in the next cycle.
 
 Across replicas, lookups may overlap and perform duplicate LDAP queries. There
 is no distributed single-flight lock. Create conflicts and resource-version
 update preconditions arbitrate writes. Each lookup captures the committed
 version **before** LDAP; a conflicting lookup discards its answer and reloads
 the winning record, without retrying the stale update. Watches eventually
-synchronize all replicas. With `N` replicas, request concurrency `C` and refresh
-concurrency `R`, up to `N × C + R` user LDAP lookups can run cluster-wide (only
-the leader refreshes); each queries all configured backends.
+synchronize all replicas. With `N` replicas and request concurrency `C`, up to
+`N × C` single-user LDAP lookups and one refresh batch can run cluster-wide
+(only the leader refreshes); each queries all configured backends.
 
-The elected leader snapshots only cached users each cycle, refreshing with
-bounded concurrency and committing each independently. Users added during a
+The elected leader snapshots only cached users each cycle, refreshing them in
+batches of `refreshBatchSize`, one batch after another, and committing each
+user independently. Users added during a
 cycle join the next one. The election library cancels a context when leadership
 ends; that event directly stops scheduling and waiting for the cycle. Shared in-flight
 lookups retain their independent timeout so another waiter is not canceled;
@@ -202,32 +205,36 @@ limits; an oversized record fails persistence and is never partially served.
 
 ### Refresh cost
 
-Refresh is not batched yet: each cached user is refreshed on their own, exactly
-as a miss would look them up, and the cost of a cycle grows with the number of
-cached users times the number of groups each holds. For every user and backend,
-a cycle currently makes:
+Refresh looks cached users up in batches of `refreshBatchSize`. A cycle starts
+with one Kubernetes List of every user's ConfigMap, before any LDAP search. Then
+for every batch and backend, it makes:
 
 - a pooled connection, so a new connection and bind only when none is idle;
-- one user search per user search base;
-- for each `memberOf` group under a group search base, one search to read the
-  group and one search per group search base to check its name is unique. These
-  are repeated for every user holding the group;
-- one Kubernetes read of the user's ConfigMap, and a write when the groups
-  changed or the record is an hour old.
+- one user search per user search base, matching every user of the batch with
+  one `(|(<usernameAttribute>=<user>)...)` filter;
+- for each distinct `memberOf` group under a group search base held by anyone
+  in the batch, one search to read the group and one search per group search
+  base to check its name is unique;
+- for each user, a Kubernetes write when the groups changed or the record is an
+  hour old.
 
-This still needs to be batched before refreshes scale to large user
-populations. The planned improvements are:
+A backend that cannot be searched fails every user of the batch; a user whose
+entries or groups are rejected fails alone, and the rest of the batch commits.
+Each user keeps the same limits and checks as a single lookup, so a batch gives
+the same memberships as looking each user up on their own.
 
-- Resolve each group, and check its name is unique, once per backend per cycle
-  rather than once per user.
-- For directories whose `memberOf` holds only direct memberships, such as
-  Active Directory, offer a per-backend option to find a user's groups with one
-  `(&<groupFilter>(member=<userDN>))` search per group search base. This is not
-  a general replacement for `memberOf`: FreeIPA's `memberOf` includes nested
-  groups, which a `member` search would drop.
+A possible further improvement: for directories whose `memberOf` holds only
+direct memberships, such as Active Directory, offer a per-backend option to find
+a user's groups with one `(&<groupFilter>(member=<userDN>))` search per group
+search base. This is not a general replacement for `memberOf`: FreeIPA's
+`memberOf` includes nested groups, which a `member` search would drop.
 
-The Kubernetes read is deliberate and should stay; see the comment in `lookup`
-for why the in-memory record cannot stand in for it.
+The List is deliberate and should stay; see the comments on `previous` and
+`listCommitted` in `resolve.go` for why the in-memory record cannot stand in for
+it, and why a record listed at the start of the cycle is fresh enough. A record
+committed by another replica after the List conflicts with the listed version,
+and the committed record is reloaded and kept. If the List fails, the cycle
+fails without searching LDAP and every user keeps their record.
 
 ## Deployment
 
@@ -279,7 +286,7 @@ Existing metrics now describe per-user work:
 | --- | --- |
 | `kube_oidc_proxy_ldap_last_refresh_success` | Last cached-user cycle succeeded for all users. |
 | `kube_oidc_proxy_ldap_full_refresh_duration_seconds` | Duration of a refresh cycle that reached every cached user, including cycles in which some users failed. Cycles cut short by leadership loss or shutdown are not recorded. |
-| `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend,trigger}` | Duration of a successful refresh of one user against one backend. `trigger` is `realtime` when a request from a user with no cached record waits on it, and `async` for the leader's refresh cycle. |
+| `kube_oidc_proxy_ldap_backend_refresh_duration_seconds{backend,trigger}` | Duration of a successful search of one backend: for one user when `trigger` is `realtime`, a request from a user with no cached record waiting on it, and for one batch of users when `trigger` is `async`, the leader's refresh cycle. |
 | `kube_oidc_proxy_ldap_backend_connections_total{backend}` | Connections opened and bound to a backend. With connections pooled, it rises with lookups only when none is idle. |
 | `kube_oidc_proxy_ldap_backend_connections_closed_total{backend,reason}` | Connections to a backend closed. `reason` is `idle` or `lifetime` when the pool retired it, `closed_by_server` when the directory or something between had already closed it, `failed` when the connection failed during a lookup, `canceled` when a lookup using it was canceled or timed out, `pool_full` when no idle slot was free, and `shutdown` when the proxy stopped. Subtracted from `backend_connections_total`, it gives the connections open. |
 | `kube_oidc_proxy_ldap_user_refresh_failures_total{source}` | Failed refreshes of one user. `source` is `ldap` when a backend failed or returned groups that cannot be cached, and `kubernetes` when reading or writing the cache ConfigMap failed. Lookups refused for lack of capacity and lookups cut short by shutdown are not counted. |

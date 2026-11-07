@@ -39,19 +39,24 @@ const (
 	DefaultGroupFilter        = "(objectClass=group)"
 	DefaultGroupNameAttribute = "cn"
 	DefaultRefreshInterval    = time.Hour
-	DefaultTimeout            = time.Minute * 5
+	DefaultTimeout            = time.Second * 15
 	DefaultLookupTimeout      = time.Minute
 	DefaultLookupConcurrency  = 8
-	DefaultRefreshConcurrency = 4
+	DefaultRefreshBatchSize   = 100
+
+	// MaxRefreshBatchSize bounds the users named in one search filter. Each
+	// adds a clause to the filter, and directories limit the size of a request.
+	MaxRefreshBatchSize = 500
 )
 
 // Config is the decoded contents of an LDAP configuration file.
 type Config struct {
 	LookupTimeout     *Duration `json:"lookupTimeout,omitempty"`
 	LookupConcurrency int       `json:"lookupConcurrency,omitempty"`
-	// RefreshConcurrency bounds the leader's periodic refresh separately, so
-	// that a refresh cycle cannot take the capacity request lookups rely on.
-	RefreshConcurrency int `json:"refreshConcurrency,omitempty"`
+	// RefreshBatchSize is how many cached users one refresh lookup searches
+	// for together. The leader refreshes one batch at a time, outside the
+	// capacity request lookups rely on.
+	RefreshBatchSize int `json:"refreshBatchSize,omitempty"`
 	// Backends are queried for each uncached user. Results from
 	// every backend are merged, so a user held in more than one
 	// directory ends up with the union of their groups.
@@ -242,8 +247,8 @@ func (c *Config) SetDefaults() {
 	if c.LookupConcurrency == 0 {
 		c.LookupConcurrency = DefaultLookupConcurrency
 	}
-	if c.RefreshConcurrency == 0 {
-		c.RefreshConcurrency = DefaultRefreshConcurrency
+	if c.RefreshBatchSize == 0 {
+		c.RefreshBatchSize = DefaultRefreshBatchSize
 	}
 	if c.RefreshInterval == nil {
 		c.RefreshInterval = NewDuration(DefaultRefreshInterval)
@@ -287,8 +292,8 @@ func (c *Config) Validate() error {
 	if c.LookupConcurrency < 1 {
 		errs = append(errs, errors.New("lookupConcurrency must be positive"))
 	}
-	if c.RefreshConcurrency < 1 {
-		errs = append(errs, errors.New("refreshConcurrency must be positive"))
+	if c.RefreshBatchSize < 1 || c.RefreshBatchSize > MaxRefreshBatchSize {
+		errs = append(errs, fmt.Errorf("refreshBatchSize must be between 1 and %d", MaxRefreshBatchSize))
 	}
 
 	if len(c.Backends) == 0 {

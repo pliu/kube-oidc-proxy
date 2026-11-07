@@ -60,9 +60,9 @@ func newResolver(config *Config) (*resolver, error) {
 
 	backends := make([]*backend, 0, len(config.Backends))
 	for _, backendConfig := range config.Backends {
-		// Every lookup and refresh in flight can hold a connection to each
-		// backend, and each can return it to be reused.
-		poolSize := config.LookupConcurrency + config.RefreshConcurrency
+		// Every lookup in flight, and the one refresh batch, can hold a
+		// connection to each backend, and each can return it to be reused.
+		poolSize := config.LookupConcurrency + 1
 		if !poolConnections {
 			poolSize = 0
 		}

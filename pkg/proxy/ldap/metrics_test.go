@@ -24,9 +24,7 @@ func sampleCount(t *testing.T, o prometheus.Observer) uint64 {
 
 func TestRefreshDurationMetrics(t *testing.T) {
 	d, _ := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}}), nil
-	}
+	serveUsers(d, map[string][]string{"alice": {"Admins"}})
 
 	backend := d.resolver.backends[0].config.Name
 	realtime := backendRefreshDuration.WithLabelValues(backend, triggerRealtime)
@@ -86,9 +84,7 @@ func TestUserRefreshFailuresAreCountedBySource(t *testing.T) {
 		}
 	}
 
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}, "carol": {"Admins"}}), nil
-	}
+	serveUsers(d, map[string][]string{"alice": {"Admins"}, "carol": {"Admins"}})
 	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}

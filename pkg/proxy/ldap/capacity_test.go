@@ -63,7 +63,7 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 			t.Cleanup(unblock)
 			store := &gatedLookupStore{UserStore: d.store, gateGet: stage == "read", entered: make(chan string, 8), release: release}
 			d.store = store
-			d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+			serveUsers(d, nil)
 			d.apply(userTestEntry(t, d, "1000", "CachedGroup"), false)
 			results := make(chan error, 2)
 			for _, key := range []string{"bob", "carol"} {
@@ -122,7 +122,6 @@ func TestLookupAdmissionBoundsReadAndPersistence(t *testing.T) {
 func TestRefreshHasSeparateCapacity(t *testing.T) {
 	d, _ := userTestDirectory(t)
 	d.resolver.config.LookupConcurrency = 1
-	d.resolver.config.RefreshConcurrency = 1
 	release := make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
@@ -130,7 +129,7 @@ func TestRefreshHasSeparateCapacity(t *testing.T) {
 	// Lookups of absent users block at persistence, holding their slot.
 	store := &gatedLookupStore{UserStore: d.store, entered: make(chan string, 4), release: release}
 	d.store = store
-	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+	serveUsers(d, nil)
 	entered := func(what string) {
 		t.Helper()
 		select {
@@ -148,9 +147,9 @@ func TestRefreshHasSeparateCapacity(t *testing.T) {
 	}
 
 	// Full request capacity must not hold up refresh, and the reverse.
-	go func() { _, err := d.resolve(context.Background(), "dave", true); results <- err }()
+	go func() { _, err := refreshOne(context.Background(), d, "dave"); results <- err }()
 	entered("refresh lookup with request capacity full")
-	if _, err := d.resolve(context.Background(), "erin", true); !errors.Is(err, ErrLookupCapacity) {
+	if _, err := refreshOne(context.Background(), d, "erin"); !errors.Is(err, ErrLookupCapacity) {
 		t.Fatalf("refresh limit not enforced: %v", err)
 	}
 
@@ -168,7 +167,7 @@ func TestRefreshHasSeparateCapacity(t *testing.T) {
 	if _, err := d.Resolve(context.Background(), "later"); err != nil {
 		t.Fatalf("request capacity was not released: %v", err)
 	}
-	if _, err := d.resolve(context.Background(), "later-refresh", true); err != nil {
+	if _, err := refreshOne(context.Background(), d, "later-refresh"); err != nil {
 		t.Fatalf("refresh capacity was not released: %v", err)
 	}
 }

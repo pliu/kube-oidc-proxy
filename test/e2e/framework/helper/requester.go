@@ -3,7 +3,7 @@ package helper
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 )
 
@@ -19,14 +19,15 @@ func (h *Helper) NewRequester(transport http.RoundTripper, token string) *Reques
 		transport: transport,
 	}
 
-	r.client = http.DefaultClient
-	r.client.Transport = r
+	r.client = &http.Client{Transport: r}
 
 	return r
 }
 
 func (r *Requester) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.token))
+	// A RoundTripper must not modify the caller's request.
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", fmt.Sprintf("bearer %s", r.token))
 	return r.transport.RoundTrip(req)
 }
 
@@ -35,8 +36,9 @@ func (r *Requester) Get(target string) ([]byte, *http.Response, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, nil, err
 	}

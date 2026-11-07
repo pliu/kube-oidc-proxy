@@ -43,9 +43,9 @@ const (
 var users = envInt("KUBE_OIDC_PROXY_E2E_LDAP_USERS", 1000)
 
 // The proxy's Kubernetes client limits. Its LDAP cache reads and writes
-// ConfigMaps through this client, so they bound how fast new users and
-// refresh cycles go; client-go's own defaults of 5 and 10 make a refresh of
-// 1,000 users take over three minutes.
+// ConfigMaps through this client, so they bound how fast new users are
+// stored, and how fast a refresh cycle rewrites the records it changed or
+// that are an hour old; a cycle reads every record with one List.
 var (
 	kubeClientQPS   = envInt("KUBE_OIDC_PROXY_E2E_KUBE_CLIENT_QPS", 50)
 	kubeClientBurst = envInt("KUBE_OIDC_PROXY_E2E_KUBE_CLIENT_BURST", 100)

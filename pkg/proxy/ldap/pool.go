@@ -38,9 +38,9 @@ type pooledConn struct {
 // used by one lookup at a time: cancellation unblocks LDAP operations by
 // closing their connection, which would cut off any other lookup sharing it.
 //
-// Only idle connections are capped. Those in use are already bounded by the
-// lookup and refresh concurrency limits, as each lookup holds one connection
-// to each backend.
+// Only idle connections are capped. Those in use are already bounded by
+// lookupConcurrency plus the one refresh batch, as each lookup or batch holds
+// one connection to each backend.
 type connPool struct {
 	backend string
 

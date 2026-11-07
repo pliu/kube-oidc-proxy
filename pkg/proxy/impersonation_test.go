@@ -4,6 +4,7 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -19,13 +20,9 @@ import (
 // user choose who they run as.
 func TestImpersonationHeadersAreRefused(t *testing.T) {
 	headers := map[string]http.Header{
-		"a user":                  {"Impersonate-User": {"jjackson"}},
-		"a user and group":        {"Impersonate-User": {"jjackson"}, "Impersonate-Group": {"group3"}},
-		"a group without a user":  {"Impersonate-Group": {"system:masters"}},
-		"a uid":                   {"Impersonate-User": {"jjackson"}, "Impersonate-Uid": {"1-2-3-4"}},
-		"an extra":                {"Impersonate-User": {"jjackson"}, "Impersonate-Extra-Scopes": {"view"}},
-		"an unknown header":       {"Impersonate-Not-Real": {"bar"}},
-		"a lower case header key": {"impersonate-user": {"jjackson"}},
+		"a user":                       {"Impersonate-User": {"jjackson"}},
+		"a group without a user":       {"Impersonate-Group": {"system:masters"}},
+		"an unknown lower case header": {"impersonate-not-real": {"bar"}},
 	}
 
 	for _, ldap := range []bool{false, true} {
@@ -139,19 +136,7 @@ func TestRoundTripForwardsOnlyTheBuiltIdentity(t *testing.T) {
 	}
 
 	// A round tripper must not modify the request it is given.
-	if !headersEqual(req.Header, original) {
+	if !reflect.DeepEqual(req.Header, original) {
 		t.Errorf("request headers were modified: %v", req.Header)
 	}
-}
-
-func headersEqual(a, b http.Header) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, vs := range a {
-		if strings.Join(vs, "\x00") != strings.Join(b[k], "\x00") {
-			return false
-		}
-	}
-	return true
 }

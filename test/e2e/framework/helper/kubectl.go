@@ -5,18 +5,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 )
 
 type Kubectl struct {
 	namespace  string
 	kubectl    string
 	kubeconfig string
-}
-
-func (k *Kubectl) Describe(resources ...string) error {
-	resourceNames := strings.Join(resources, ",")
-	return k.Run("describe", resourceNames)
 }
 
 func (k *Kubectl) DescribeResource(resource, name string) error {
@@ -40,7 +34,7 @@ func (k *Kubectl) RunWithStdout(stdout io.Writer, args ...string) error {
 	if k.namespace == "" {
 		baseArgs = append(baseArgs, "--all-namespaces")
 	} else {
-		baseArgs = []string{"--namespace", k.namespace}
+		baseArgs = append(baseArgs, "--namespace", k.namespace)
 	}
 	args = append(baseArgs, args...)
 	cmd := exec.Command(k.kubectl, args...)

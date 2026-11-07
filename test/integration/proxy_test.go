@@ -3,48 +3,33 @@ package integration
 
 import (
 	"bufio"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"io"
-	corev1 "k8s.io/api/core/v1"
-	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sigs.k8s.io/yaml"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/jetstack/kube-oidc-proxy/cmd/app"
+	corev1 "k8s.io/api/core/v1"
+	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
+	"sigs.k8s.io/yaml"
+
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy"
-	"github.com/jetstack/kube-oidc-proxy/pkg/util"
+	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/ldap/cache"
 	"github.com/jetstack/kube-oidc-proxy/test/e2e/framework/helper"
 	fakeapiserver "github.com/jetstack/kube-oidc-proxy/test/tools/fake-apiserver/pkg/server"
-	"github.com/jetstack/kube-oidc-proxy/test/tools/issuer/pkg/issuer"
-	testutil "github.com/jetstack/kube-oidc-proxy/test/util"
 )
 
 func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	testDir := t.TempDir()
-	bundle, err := testutil.NewTLSSelfSignedCertKey("127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil)
-	if err != nil {
-		t.Fatalf("failed to create test certificates: %s", err)
-	}
-
-	certPath := writeFile(t, testDir, "tls.crt", bundle.CertBytes)
-	keyPath := writeFile(t, testDir, "tls.key", bundle.KeyBytes)
-
-	stopComponents := make(chan struct{})
+	bundle, certPath, keyPath := testCertificates(t, testDir)
+	stopComponents := componentStop(t)
 	apiHandler, err := fakeapiserver.New(keyPath, certPath, stopComponents)
 	if err != nil {
 		t.Fatalf("failed to create mock API server: %s", err)
@@ -53,16 +38,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 	apiServer := httptest.NewServer(persistence.wrap(apiHandler))
 	t.Cleanup(apiServer.Close)
 
-	oidcServer := httptest.NewUnstartedServer(nil)
-	issuerURL := "https://" + oidcServer.Listener.Addr().String()
-	oidcHandler, err := issuer.New(issuerURL, keyPath, certPath, stopComponents)
-	if err != nil {
-		t.Fatalf("failed to create mock OIDC issuer: %s", err)
-	}
-	oidcServer.Config.Handler = oidcHandler
-	oidcServer.StartTLS()
-	t.Cleanup(oidcServer.Close)
-	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: oidcServer.Certificate().Raw})
+	oidc := startIssuer(t, testDir, "oidc", stopComponents)
 
 	primaryLDAP := newMockLDAPServer(t, "platform-admins", "all-staff")
 	secondaryLDAP := newMockLDAPServer(t, "engineering", "all-staff")
@@ -90,16 +66,7 @@ func TestJWTAuthenticationWithLDAPGroupsIsForwardedToAPIServer(t *testing.T) {
 		secondaryLDAP.URL(), bindDN, bindPassword, userBase, groupBase)
 	ldapConfigPath := writeFile(t, testDir, "ldap.json", []byte(ldapConfig))
 
-	proxyPort := freePort(t)
-	readinessPort := freePort(t)
 	clientID := "kube-oidc-proxy-integration"
-	proxyStop := make(chan struct{})
-	var stopOnce sync.Once
-	t.Cleanup(func() {
-		stopOnce.Do(func() { close(proxyStop) })
-		close(stopComponents)
-	})
-
 	authnConfig := fmt.Sprintf(`usernamePrefix: "oidc:"
 issuers:
 - issuer:
@@ -113,30 +80,17 @@ issuers:
     groups:
       claim: groups
       prefix: ""
-`, oidcServer.URL, clientID, indent(issuerCA, "      "))
+`, oidc.url, clientID, indent(oidc.ca, "      "))
 	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
 
 	auditPath := filepath.Join(testDir, "audit.log")
 	policy := writeFile(t, testDir, "audit-policy.yaml", []byte("apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Metadata\n"))
-	command := app.NewRunCommand(proxyStop)
-	command.SetArgs([]string{
-		"--server=" + apiServer.URL,
-		"--bind-address=127.0.0.1",
-		"--secure-port=" + proxyPort,
-		"--tls-cert-file=" + certPath,
-		"--tls-private-key-file=" + keyPath,
-		"--readiness-probe-port=" + readinessPort,
-		"--oidc-config-file=" + authnConfigPath,
-		"--leader-elect-resource-namespace=proxy",
-		"--ldap-config-file=" + ldapConfigPath,
-		"--audit-policy-file=" + policy, "--audit-log-path=" + auditPath, "--audit-log-mode=blocking",
+	proxyServer := startTestProxy(t, testProxyConfig{
+		apiURL: apiServer.URL, certPath: certPath, keyPath: keyPath, ca: bundle.CertBytes,
+		authnConfigPath: authnConfigPath,
+		extraArgs: []string{"--ldap-config-file=" + ldapConfigPath,
+			"--audit-policy-file=" + policy, "--audit-log-path=" + auditPath, "--audit-log-mode=blocking"},
 	})
-
-	commandErr := make(chan error, 1)
-	go func() { commandErr <- command.Execute() }()
-
-	waitForReady(t, "http://127.0.0.1:"+readinessPort+"/ready", commandErr)
-	waitForLeader(t, apiServer.URL)
 	primaryLDAP.AssertRequests(t, 0, 0, 0)
 	secondaryLDAP.AssertRequests(t, 0, 0, 0)
 
@@ -146,32 +100,22 @@ issuers:
   "email": "alice@example.com",
   "groups": ["jwt-only-group"],
   "exp": %d
-}`, oidcServer.URL, clientID, time.Now().Add(10*time.Minute).Unix()))
-	token, err := new(helper.Helper).SignToken(bundle, tokenPayload)
+}`, oidc.url, clientID, time.Now().Add(10*time.Minute).Unix()))
+	token, err := new(helper.Helper).SignToken(oidc.signer, tokenPayload)
 	if err != nil {
 		t.Fatalf("failed to sign JWT: %s", err)
 	}
 
-	rootCAs := x509.NewCertPool()
-	if !rootCAs.AppendCertsFromPEM(bundle.CertBytes) {
-		t.Fatal("failed to trust proxy certificate")
-	}
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}},
-	}
-
-	proxyURL := "https://127.0.0.1:" + proxyPort
 	request := func(method, path string) *http.Response {
 		t.Helper()
 
-		req, err := http.NewRequest(method, proxyURL+path, nil)
+		req, err := http.NewRequest(method, proxyServer.url+path, nil)
 		if err != nil {
 			t.Fatalf("failed to create proxy request: %s", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		response, err := client.Do(req)
+		response, err := proxyServer.client.Do(req)
 		if err != nil {
 			t.Fatalf("request through proxy failed: %s", err)
 		}
@@ -262,15 +206,7 @@ issuers:
 	if !matched {
 		t.Fatal("no audit event for forwarded request")
 	}
-	stopOnce.Do(func() { close(proxyStop) })
-	select {
-	case err := <-commandErr:
-		if err != nil {
-			t.Fatalf("proxy stopped with an error: %s", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("proxy did not stop within 10s")
-	}
+	proxyServer.stop()
 }
 
 func assertIdentity(t *testing.T, response *http.Response, groups ...string) {
@@ -292,48 +228,4 @@ func assertIdentity(t *testing.T, response *http.Response, groups ...string) {
 	if strings.Contains(strings.Join(gotGroups, ","), "jwt-only-group") {
 		t.Errorf("API server received a group from the JWT instead of LDAP: %v", gotGroups)
 	}
-}
-
-func writeFile(t *testing.T, dir, name string, data []byte) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("failed to write %s: %s", name, err)
-	}
-	return path
-}
-
-func freePort(t *testing.T) string {
-	t.Helper()
-	port, err := util.FreePort()
-	if err != nil {
-		t.Fatalf("failed to find a free port: %s", err)
-	}
-	return port
-}
-
-func waitForReady(t *testing.T, readyURL string, commandErr <-chan error) {
-	t.Helper()
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-commandErr:
-			t.Fatalf("proxy exited before becoming ready: %v", err)
-		default:
-		}
-
-		response, err := http.Get(readyURL)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, response.Body)
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				return
-			}
-		}
-
-		time.Sleep(25 * time.Millisecond)
-	}
-
-	t.Fatalf("proxy did not become ready at %s within 15s", readyURL)
 }

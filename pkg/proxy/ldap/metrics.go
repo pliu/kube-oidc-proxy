@@ -27,11 +27,12 @@ var (
 		Buckets:   fullRefreshBuckets,
 	})
 
-	// backendRefreshDuration covers one user's refresh against one backend.
+	// backendRefreshDuration covers one search of one backend: for one user on
+	// a request's miss, and for a batch of users in the refresh cycle.
 	backendRefreshDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Name:      "backend_refresh_duration_seconds",
-		Help:      "Duration of a successful refresh of one user against one LDAP backend, by trigger: realtime for a request from a user with no cached record, async for the leader's refresh cycle.",
+		Help:      "Duration of a successful search of one LDAP backend, by trigger: realtime for one user, a request with no cached record, async for one batch of users in the leader's refresh cycle.",
 		Buckets:   backendRefreshBuckets,
 	}, []string{"backend", "trigger"})
 

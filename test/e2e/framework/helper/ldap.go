@@ -195,33 +195,10 @@ func (h *Helper) DeployLDAPProxy(ns *corev1.Namespace, config LDAPProxyConfig) (
 		return nil, nil, nil, err
 	}
 
-	cnt := corev1.Container{
-		Name:            kind.ProxyImageName,
-		Image:           kind.ProxyImageName,
-		ImagePullPolicy: corev1.PullNever,
-		Args: append([]string{
-			"kube-oidc-proxy",
-			"--secure-port=6443",
-			"--tls-cert-file=/tls/cert.pem",
-			"--tls-private-key-file=/tls/key.pem",
-			"--oidc-config-file=/oidc/authn.yaml",
-			"--ldap-config-file=/ldap/ldap.json",
-			// Quiet enough that logging does not weigh on the latency measured.
-			"--v=1",
-		}, config.ExtraArgs...),
-		VolumeMounts: []corev1.VolumeMount{
-			{MountPath: "/tls", Name: "tls", ReadOnly: true},
-			{MountPath: "/oidc", Name: "oidc", ReadOnly: true},
-			{MountPath: "/ldap", Name: "ldap", ReadOnly: true},
-		},
-		Ports: []corev1.ContainerPort{{ContainerPort: 6443}, {ContainerPort: 8080}},
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/ready", Port: intstr.FromInt(8080)},
-			},
-			PeriodSeconds: 2,
-		},
-	}
+	// Quiet enough that logging does not weigh on the latency measured.
+	cnt := proxyContainer(1, append([]string{"--ldap-config-file=/ldap/ldap.json"}, config.ExtraArgs...)...)
+	cnt.VolumeMounts = append(cnt.VolumeMounts, corev1.VolumeMount{MountPath: "/ldap", Name: "ldap", ReadOnly: true})
+	cnt.ReadinessProbe.PeriodSeconds = 2
 
 	volumes := []corev1.Volume{
 		{Name: "oidc", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "oidc-config"}}},

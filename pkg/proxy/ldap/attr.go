@@ -179,10 +179,7 @@ func (b *backend) memberOfDNs(c conn, entry *goldap.Entry) ([]string, error) {
 func (b *backend) searchMemberOfRange(c conn, dn string, from int) (memberOfChunk, error) {
 	attribute := fmt.Sprintf("%s;%s%d-*", memberOfAttribute, rangeOption, from)
 
-	req := goldap.NewSearchRequest(dn, goldap.ScopeBaseObject, goldap.NeverDerefAliases,
-		0, b.timeLimit(), false, "(objectClass=*)", []string{attribute}, nil)
-
-	res, err := c.Search(req)
+	res, err := c.Search(b.searchRequest(dn, goldap.ScopeBaseObject, 0, "(objectClass=*)", attribute))
 	if err != nil {
 		return memberOfChunk{}, fmt.Errorf("failed to read %q of %q: %s", attribute, dn, err)
 	}

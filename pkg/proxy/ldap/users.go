@@ -27,16 +27,18 @@ type UserDirectory struct {
 	leadership func() context.Context
 	callsMu    sync.Mutex
 	calls      map[string]*userCall
-	// lookups and refreshes count the calls each kind started, admitted
-	// against lookupConcurrency and refreshConcurrency respectively.
-	lookups, refreshes int
-	resolver           *resolver
-	store              cache.UserStore
-	mu                 sync.RWMutex
-	users              map[string]userCell // keyed by deterministic object name, including tombstones
-	synced             atomic.Bool
-	ctx                context.Context
-	cancel             context.CancelFunc
+	// lookups counts the request lookups started, admitted against
+	// lookupConcurrency. refreshing is set while a refresh batch runs; there
+	// is only ever one.
+	lookups    int
+	refreshing bool
+	resolver   *resolver
+	store      cache.UserStore
+	mu         sync.RWMutex
+	users      map[string]userCell // keyed by deterministic object name, including tombstones
+	synced     atomic.Bool
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewUserDirectory refreshes cached users periodically only during the live

@@ -22,49 +22,9 @@ import (
 
 func (h *Helper) DeployProxy(ns *corev1.Namespace, issuerURL *url.URL, clientID string,
 	oidcKeyBundle *util.KeyBundle, extraVolumes []corev1.Volume, extraArgs ...string) (*util.KeyBundle, *url.URL, error) {
-	cnt := corev1.Container{
-		Name:            kind.ProxyImageName,
-		Image:           kind.ProxyImageName,
-		ImagePullPolicy: corev1.PullNever,
-		Args: append([]string{
-			"kube-oidc-proxy",
-			"--secure-port=6443",
-			"--tls-cert-file=/tls/cert.pem",
-			"--tls-private-key-file=/tls/key.pem",
-			"--oidc-config-file=/oidc/authn.yaml",
-			"--v=10",
-		}, extraArgs...),
-		VolumeMounts: []corev1.VolumeMount{
-			corev1.VolumeMount{
-				MountPath: "/tls",
-				Name:      "tls",
-				ReadOnly:  true,
-			},
-			corev1.VolumeMount{
-				MountPath: "/oidc",
-				Name:      "oidc",
-				ReadOnly:  true,
-			},
-		},
-		Ports: []corev1.ContainerPort{
-			corev1.ContainerPort{
-				ContainerPort: 6443,
-			},
-			corev1.ContainerPort{
-				ContainerPort: 8080,
-			},
-		},
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/ready",
-					Port: intstr.FromInt(8080),
-				},
-			},
-			InitialDelaySeconds: 1,
-			PeriodSeconds:       3,
-		},
-	}
+	cnt := proxyContainer(10, extraArgs...)
+	cnt.ReadinessProbe.InitialDelaySeconds = 1
+	cnt.ReadinessProbe.PeriodSeconds = 3
 
 	for _, v := range extraVolumes {
 		cnt.VolumeMounts = append(cnt.VolumeMounts, corev1.VolumeMount{
@@ -592,4 +552,22 @@ func nodePort(serviceType corev1.ServiceType) int32 {
 func (h *Helper) appURL(ns, serviceName, port string) (string, string) {
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, ns)
 	return host, fmt.Sprintf("https://%s:%s", host, port)
+}
+
+// proxyContainer holds the serving configuration common to the proxy suites.
+func proxyContainer(verbosity int, extraArgs ...string) corev1.Container {
+	return corev1.Container{
+		Name: kind.ProxyImageName, Image: kind.ProxyImageName, ImagePullPolicy: corev1.PullNever,
+		Args: append([]string{"kube-oidc-proxy", "--secure-port=6443",
+			"--tls-cert-file=/tls/cert.pem", "--tls-private-key-file=/tls/key.pem",
+			"--oidc-config-file=/oidc/authn.yaml", fmt.Sprintf("--v=%d", verbosity)}, extraArgs...),
+		VolumeMounts: []corev1.VolumeMount{
+			{MountPath: "/tls", Name: "tls", ReadOnly: true},
+			{MountPath: "/oidc", Name: "oidc", ReadOnly: true},
+		},
+		Ports: []corev1.ContainerPort{{ContainerPort: 6443}, {ContainerPort: 8080}},
+		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{Path: "/ready", Port: intstr.FromInt(8080)},
+		}},
+	}
 }

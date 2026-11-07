@@ -2,79 +2,23 @@
 package integration
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/jetstack/kube-oidc-proxy/cmd/app"
 	"github.com/jetstack/kube-oidc-proxy/test/e2e/framework/helper"
 	fakeapiserver "github.com/jetstack/kube-oidc-proxy/test/tools/fake-apiserver/pkg/server"
-	"github.com/jetstack/kube-oidc-proxy/test/tools/issuer/pkg/issuer"
 	testutil "github.com/jetstack/kube-oidc-proxy/test/util"
 )
 
-type testIssuer struct {
-	url    string
-	ca     []byte
-	signer *testutil.KeyBundle
-}
-
-// startIssuer serves an OIDC issuer over TLS whose tokens are signed by a key
-// of its own.
-func startIssuer(t *testing.T, dir, name string, stopCh <-chan struct{}) *testIssuer {
-	t.Helper()
-
-	signer, err := testutil.NewTLSSelfSignedCertKey("127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil)
-	if err != nil {
-		t.Fatalf("failed to create signing key for issuer %s: %s", name, err)
-	}
-
-	server := httptest.NewUnstartedServer(nil)
-	url := "https://" + server.Listener.Addr().String()
-	handler, err := issuer.New(url,
-		writeFile(t, dir, name+"-signer.key", signer.KeyBytes),
-		writeFile(t, dir, name+"-signer.crt", signer.CertBytes),
-		stopCh)
-	if err != nil {
-		t.Fatalf("failed to create mock OIDC issuer %s: %s", name, err)
-	}
-	server.Config.Handler = handler
-	server.StartTLS()
-	t.Cleanup(server.Close)
-
-	return &testIssuer{
-		url:    url,
-		ca:     pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}),
-		signer: signer,
-	}
-}
-
-// indent prefixes every line of a PEM bundle so it nests in a YAML block
-// scalar.
-func indent(pemBytes []byte, prefix string) string {
-	return prefix + strings.ReplaceAll(strings.TrimSpace(string(pemBytes)), "\n", "\n"+prefix)
-}
-
 func TestConfigFileTrustsEveryListedIssuer(t *testing.T) {
 	testDir := t.TempDir()
-	bundle, err := testutil.NewTLSSelfSignedCertKey("127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil)
-	if err != nil {
-		t.Fatalf("failed to create test certificates: %s", err)
-	}
-
-	certPath := writeFile(t, testDir, "tls.crt", bundle.CertBytes)
-	keyPath := writeFile(t, testDir, "tls.key", bundle.KeyBytes)
-
-	stopComponents := make(chan struct{})
+	bundle, certPath, keyPath := testCertificates(t, testDir)
+	stopComponents := componentStop(t)
 	apiHandler, err := fakeapiserver.New(keyPath, certPath, stopComponents)
 	if err != nil {
 		t.Fatalf("failed to create mock API server: %s", err)
@@ -141,42 +85,10 @@ issuers:
 		issuerC.url, indent(issuerC.ca, "      "), staticURL, indent(staticSigner.CertBytes, "    "))
 	authnConfigPath := writeFile(t, testDir, "authn.yaml", []byte(authnConfig))
 
-	proxyPort := freePort(t)
-	readinessPort := freePort(t)
-	proxyStop := make(chan struct{})
-	var stopOnce sync.Once
-	t.Cleanup(func() {
-		stopOnce.Do(func() { close(proxyStop) })
-		close(stopComponents)
+	proxyServer := startTestProxy(t, testProxyConfig{
+		apiURL: apiServer.URL, certPath: certPath, keyPath: keyPath, ca: bundle.CertBytes,
+		authnConfigPath: authnConfigPath,
 	})
-
-	command := app.NewRunCommand(proxyStop)
-	command.SetArgs([]string{
-		"--server=" + apiServer.URL,
-		"--bind-address=127.0.0.1",
-		"--secure-port=" + proxyPort,
-		"--tls-cert-file=" + certPath,
-		"--tls-private-key-file=" + keyPath,
-		"--readiness-probe-port=" + readinessPort,
-		"--oidc-config-file=" + authnConfigPath,
-		"--leader-elect-resource-namespace=proxy",
-	})
-
-	commandErr := make(chan error, 1)
-	go func() { commandErr <- command.Execute() }()
-
-	// Ready only once every issuer's keys have been fetched.
-	waitForReady(t, "http://127.0.0.1:"+readinessPort+"/ready", commandErr)
-	waitForLeader(t, apiServer.URL)
-
-	rootCAs := x509.NewCertPool()
-	if !rootCAs.AppendCertsFromPEM(bundle.CertBytes) {
-		t.Fatal("failed to trust proxy certificate")
-	}
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}},
-	}
 
 	request := func(signer *testutil.KeyBundle, claims string) *http.Response {
 		t.Helper()
@@ -192,13 +104,13 @@ issuers:
 		}
 
 		req, err := http.NewRequest(http.MethodGet,
-			"https://127.0.0.1:"+proxyPort+"/api/v1/namespaces/default/pods?limit=1", nil)
+			proxyServer.url+"/api/v1/namespaces/default/pods?limit=1", nil)
 		if err != nil {
 			t.Fatalf("failed to create proxy request: %s", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		response, err := client.Do(req)
+		response, err := proxyServer.client.Do(req)
 		if err != nil {
 			t.Fatalf("request through proxy failed: %s", err)
 		}
@@ -280,13 +192,5 @@ issuers:
 		})
 	}
 
-	stopOnce.Do(func() { close(proxyStop) })
-	select {
-	case err := <-commandErr:
-		if err != nil {
-			t.Fatalf("proxy stopped with an error: %s", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("proxy did not stop within 10s")
-	}
+	proxyServer.stop()
 }

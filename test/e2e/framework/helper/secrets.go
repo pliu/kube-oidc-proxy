@@ -3,7 +3,6 @@ package helper
 
 import (
 	"context"
-	"fmt"
 
 	v1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -38,8 +37,6 @@ func (h *Helper) GetServiceAccountSecret(ns, name string) (*corev1.Secret, error
 		if err != nil {
 			return nil, err
 		}
-
-		fmt.Printf("TOKEN!!!!! : %v\n", serviceAccountToken.Status.Token)
 
 		secretToReturn := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{

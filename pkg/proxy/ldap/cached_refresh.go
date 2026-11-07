@@ -4,7 +4,8 @@ package ldap
 import (
 	"context"
 	"errors"
-	"sync"
+	"fmt"
+	"slices"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -43,13 +44,12 @@ func (d *UserDirectory) refreshWhileLeader(term context.Context) error {
 	return d.RefreshCached(cycle)
 }
 
-// RefreshCached snapshots only known users. Each record commits independently;
-// a failed user retains its previous entry while other users can advance.
-//
-// TODO: batch the cycle. Every user is looked up on their own, with a new
-// connection per backend and every group resolved and checked for uniqueness
-// again for each user holding it. See "Refresh cost" in
-// docs/tasks/ldap-group-augmentation.md for the planned improvements.
+// RefreshCached snapshots only known users and refreshes them in batches of
+// refreshBatchSize, one batch after another. Every user's
+// committed record is read with one List before any LDAP search. A batch finds
+// its users with one search per backend and user search base, and resolves
+// each group they hold once. Each record still commits independently; a
+// failed user retains its previous entry while other users can advance.
 func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 	start := time.Now()
 	d.mu.RLock()
@@ -60,37 +60,28 @@ func (d *UserDirectory) RefreshCached(ctx context.Context) error {
 		}
 	}
 	d.mu.RUnlock()
-	jobs := make(chan string)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var failures []error
-	for i := 0; i < d.resolver.config.RefreshConcurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for key := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				_, err := d.resolve(ctx, key, true)
-				if err != nil {
-					mu.Lock()
-					failures = append(failures, err)
-					mu.Unlock()
-				}
-			}
-		}()
+	// Sorted so that a cycle's batches do not depend on map order.
+	slices.Sort(keys)
+	listed, err := d.listCommitted(ctx)
+	if err != nil {
+		// Every user's refresh failed on the read it depends on.
+		for range keys {
+			d.failed(failureKubernetes, err)
+		}
+		lastRefreshSuccess.Set(0)
+		return fmt.Errorf("list cached users: %w", err)
 	}
-send:
-	for _, key := range keys {
-		select {
-		case <-ctx.Done():
-			break send
-		case jobs <- key:
+	var failures []error
+	for batch := range slices.Chunk(keys, d.resolver.config.RefreshBatchSize) {
+		if ctx.Err() != nil {
+			break
+		}
+		for _, result := range d.refreshBatch(ctx, batch, listed) {
+			if result.err != nil {
+				failures = append(failures, result.err)
+			}
 		}
 	}
-	close(jobs)
-	wg.Wait()
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err())
 	} else {

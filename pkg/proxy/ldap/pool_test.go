@@ -95,7 +95,7 @@ func (p *pooledBackend) advance(d time.Duration) { p.clock.Add(int64(d)) }
 func (p *pooledBackend) lookup(t *testing.T) {
 	t.Helper()
 
-	groups, err := p.searchUser(context.Background(), "alice", false)
+	groups, err := p.searchUser(context.Background(), "alice")
 	if err != nil {
 		t.Fatalf("lookup failed: %s", err)
 	}
@@ -154,7 +154,7 @@ func TestFailureOnFreshConnectionIsNotRetriedOrPooled(t *testing.T) {
 	first.searchErr = goldap.NewError(goldap.ErrorNetwork, errors.New("connection reset by peer"))
 	p := newPooledBackend(t, 2, first, second)
 
-	if _, err := p.searchUser(context.Background(), "alice", false); err == nil {
+	if _, err := p.searchUser(context.Background(), "alice"); err == nil {
 		t.Fatal("expected the lookup to fail")
 	}
 	if p.dials.Load() != 1 {
@@ -178,10 +178,10 @@ func TestLookupFailingOnSoundConnectionKeepsItPooled(t *testing.T) {
 		},
 		"lookup rejects what it found": func(c *poolConn) func() {
 			// A second entry holding alice's name makes her identity ambiguous.
-			users := c.entries["OU=Users,DC=example,DC=net"]
-			c.entries["OU=Users,DC=example,DC=net"] = append(users,
-				entry("CN=alice2,OU=Users,DC=example,DC=net", map[string][]string{"userPrincipalName": {"alice"}}))
-			return func() { c.entries["OU=Users,DC=example,DC=net"] = users }
+			users := c.entries[usersBase]
+			c.entries[usersBase] = append(users,
+				entry(userDN("alice2"), map[string][]string{"userPrincipalName": {"alice"}}))
+			return func() { c.entries[usersBase] = users }
 		},
 	}
 
@@ -192,7 +192,7 @@ func TestLookupFailingOnSoundConnectionKeepsItPooled(t *testing.T) {
 			p.lookup(t)
 
 			undo := fail(c)
-			if _, err := p.searchUser(context.Background(), "alice", false); err == nil {
+			if _, err := p.searchUser(context.Background(), "alice"); err == nil {
 				t.Fatal("expected the lookup to fail")
 			}
 			if p.dials.Load() != 1 {
@@ -240,7 +240,7 @@ func TestCanceledLookupClosesPooledConnection(t *testing.T) {
 	c.block.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, err := p.searchUser(ctx, "alice", false); done <- err }()
+	go func() { _, err := p.searchUser(ctx, "alice"); done <- err }()
 	cancel()
 
 	select {
@@ -462,7 +462,7 @@ func TestPoolCountsClosedConnectionsByReason(t *testing.T) {
 			c.block.Store(true)
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			if _, err := p.searchUser(ctx, "alice", false); !errors.Is(err, context.Canceled) {
+			if _, err := p.searchUser(ctx, "alice"); !errors.Is(err, context.Canceled) {
 				t.Fatalf("expected the lookup to be canceled, got %v", err)
 			}
 			return c

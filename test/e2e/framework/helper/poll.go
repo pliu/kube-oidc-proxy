@@ -4,8 +4,6 @@ package helper
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 	"time"
 
@@ -134,29 +132,4 @@ func (h *Helper) WaitForDeploymentToDelete(namespace, name string, timeout time.
 	}
 
 	return nil
-}
-
-func (h *Helper) WaitForUrlToBeReady(url *url.URL, timeout time.Duration) error {
-	log.Infof("Waiting for URL %s to be ready", url)
-
-	err := wait.PollImmediate(time.Second*2, timeout, func() (bool, error) {
-		host := url.Host
-		port := url.Port()
-		tocheck := host
-
-		if port != "" {
-			tocheck = tocheck + ":" + port
-		}
-
-		con, err := net.DialTimeout("tcp", tocheck, timeout)
-		if err != nil {
-			return false, nil
-		} else {
-			con.Close()
-			return true, nil
-		}
-
-	})
-
-	return err
 }

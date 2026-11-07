@@ -17,9 +17,7 @@ import (
 
 func TestPersistenceFailureDoesNotPublish(t *testing.T) {
 	d, client := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Admins"}, map[string][]string{"alice": {"Admins"}}), nil
-	}
+	serveUsers(d, map[string][]string{"alice": {"Admins"}})
 	client.PrependReactor("create", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) { return true, nil, errors.New("API unavailable") })
 	if _, err := d.Resolve(context.Background(), "alice"); err == nil {
 		t.Fatal("unpersisted result served")
@@ -48,9 +46,7 @@ func TestConflictDiscardsLookupAndReloadsWinner(t *testing.T) {
 
 func TestRefreshFailureKeepsOldAndOtherUsersAdvance(t *testing.T) {
 	d, client := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"Old"}, map[string][]string{"alice": {"Old"}, "bob": {"Old"}}), nil
-	}
+	serveUsers(d, map[string][]string{"alice": {"Old"}, "bob": {"Old"}})
 	for _, key := range []string{"alice", "bob"} {
 		if _, err := d.Resolve(context.Background(), key); err != nil {
 			t.Fatal(err)
@@ -63,9 +59,7 @@ func TestRefreshFailureKeepsOldAndOtherUsersAdvance(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}, "bob": {"New"}}), nil
-	}
+	serveUsers(d, map[string][]string{"alice": {"New"}, "bob": {"New"}})
 	if err := d.RefreshCached(context.Background()); err == nil {
 		t.Fatal("failure not reported")
 	}
@@ -88,7 +82,7 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 			if _, err := client.CoreV1().ConfigMaps("proxy").Create(context.Background(), cm, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+			serveUsers(d, nil)
 			groups, err := d.Resolve(context.Background(), "alice")
 			if managed && (err != nil || len(groups) != 0) {
 				t.Fatalf("repair failed: %v %v", groups, err)
@@ -102,12 +96,12 @@ func TestInvalidRecordCanBeRepairedAndUnmanagedRecordCannot(t *testing.T) {
 
 func TestUnchangedRefreshAvoidsWrite(t *testing.T) {
 	d, client := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+	serveUsers(d, nil)
 	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
 	count := len(client.Actions())
-	if _, err := d.resolve(context.Background(), "alice", true); err != nil {
+	if _, err := refreshOne(context.Background(), d, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.Actions()) != count+1 {
@@ -123,7 +117,7 @@ func TestCanceledDialReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := d.resolver.searchUser(ctx, "alice", false); err == nil {
+	if _, err := d.resolver.searchUser(ctx, "alice"); err == nil {
 		t.Fatal("canceled lookup succeeded")
 	}
 	if time.Since(start) > time.Second {
@@ -140,14 +134,14 @@ func TestCanceledLookupNeverDials(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := d.resolver.searchUser(ctx, "alice", false); !errors.Is(err, context.Canceled) {
+	if _, err := d.resolver.searchUser(ctx, "alice"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
 
 func TestUpdateConflictIsNotRetried(t *testing.T) {
 	d, client := userTestDirectory(t)
-	d.resolver.backends[0].dial = func(string) (conn, error) { return connWithUsers(nil, nil), nil }
+	serveUsers(d, nil)
 	if _, err := d.Resolve(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +150,8 @@ func TestUpdateConflictIsNotRetried(t *testing.T) {
 		attempts++
 		return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), "alice", errors.New("changed"))
 	})
-	d.resolver.backends[0].dial = func(string) (conn, error) {
-		return connWithUsers([]string{"New"}, map[string][]string{"alice": {"New"}}), nil
-	}
-	result, err := d.resolve(context.Background(), "alice", true)
+	serveUsers(d, map[string][]string{"alice": {"New"}})
+	result, err := refreshOne(context.Background(), d, "alice")
 	if err != nil || attempts != 1 || len(result.Record.Groups) != 0 {
 		t.Fatalf("%+v %v attempts=%d", result, err, attempts)
 	}
